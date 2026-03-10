@@ -118,6 +118,9 @@ scripts/
 .github/
   workflows/
     build.yml          — CI: compile on Linux (CUDA 12.8/12.6) + Windows (MSVC)
+
+GUIDE.md               — Deep-dive: ZKP math, NTT, finite fields, GPU optimization
+LICENSE                — MIT License
 ```
 
 ---
@@ -151,7 +154,7 @@ scripts/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-All phases complete. Current version: **v1.0.0**
+All phases complete. Current version: **v1.0.0** (tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
 
 ---
 

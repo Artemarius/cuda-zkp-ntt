@@ -153,6 +153,7 @@ cuda-zkp-ntt/
 ├── CMakeLists.txt
 ├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization
+├── LICENSE                    # MIT License
 └── README.md
 ```
 
