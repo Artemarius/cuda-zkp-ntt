@@ -12,6 +12,12 @@
 #include <vector>
 #include <cassert>
 
+// Forward declarations from ntt_optimized.cu (linked via separable compilation)
+extern void ntt_forward_optimized_montgomery(
+    FpElement* d_data, size_t n, const FpElement* d_twiddles, cudaStream_t stream);
+extern void ntt_inverse_optimized_montgomery(
+    FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
+
 // ─── Internal Twiddle Cache ──────────────────────────────────────────────────
 // Twiddles are computed on CPU (using ff_ref) and uploaded to device.
 // Forward: twiddles[k] = omega_n^k  for k = 0..n/2-1
@@ -210,9 +216,17 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             break;
         }
-        case NTTMode::OPTIMIZED:
-            fprintf(stderr, "ntt_forward(OPTIMIZED): stub — not yet implemented\n");
+        case NTTMode::OPTIMIZED: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles(n);
+            uint32_t N = static_cast<uint32_t>(n);
+            uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
+
+            ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
+            ntt_forward_optimized_montgomery(d_data, n, s_d_fwd_twiddles, stream);
+            ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             break;
+        }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_forward(ASYNC): stub — not yet implemented\n");
             break;
@@ -237,9 +251,17 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             break;
         }
-        case NTTMode::OPTIMIZED:
-            fprintf(stderr, "ntt_inverse(OPTIMIZED): stub — not yet implemented\n");
+        case NTTMode::OPTIMIZED: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles(n);
+            uint32_t N = static_cast<uint32_t>(n);
+            uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
+
+            ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
+            ntt_inverse_optimized_montgomery(d_data, n, s_d_inv_twiddles, s_n_inv, stream);
+            ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             break;
+        }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_inverse(ASYNC): stub — not yet implemented\n");
             break;

@@ -601,10 +601,19 @@ void test_ff_sqr_soa_gpu() {
 
 // ─── Phase 4: NTT Correctness Tests ──────────────────────────────────────────
 
+static const char* mode_name(NTTMode m) {
+    switch (m) {
+        case NTTMode::NAIVE:     return "NAIVE";
+        case NTTMode::OPTIMIZED: return "OPTIMIZED";
+        case NTTMode::ASYNC:     return "ASYNC";
+        default:                 return "UNKNOWN";
+    }
+}
+
 // Forward NTT: GPU result vs CPU reference
-void test_ntt_forward_gpu(int log_n) {
+void test_ntt_forward_gpu(int log_n, NTTMode mode = NTTMode::NAIVE) {
     size_t n = static_cast<size_t>(1) << log_n;
-    printf("test_ntt_forward_gpu (n=2^%d=%zu)...\n", log_n, n);
+    printf("test_ntt_forward_gpu [%s] (n=2^%d=%zu)...\n", mode_name(mode), log_n, n);
 
     // Generate test data in standard form (small deterministic values)
     std::vector<FpElement> h_data(n);
@@ -628,7 +637,7 @@ void test_ntt_forward_gpu(int log_n) {
     CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
     CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
 
-    ntt_forward(d_data, n, NTTMode::NAIVE);
+    ntt_forward(d_data, n, mode);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<FpElement> h_result(n);
@@ -643,7 +652,7 @@ void test_ntt_forward_gpu(int log_n) {
 
     TEST_ASSERT(pass_count == static_cast<int>(n),
         "NTT forward GPU vs CPU mismatch");
-    printf("  NTT forward (n=2^%d): %d/%zu matched\n", log_n, pass_count, n);
+    printf("  NTT forward [%s] (n=2^%d): %d/%zu matched\n", mode_name(mode), log_n, pass_count, n);
 
     if (pass_count != static_cast<int>(n) && n <= 1024) {
         // Print first few mismatches for debugging
@@ -666,9 +675,9 @@ void test_ntt_forward_gpu(int log_n) {
 }
 
 // Roundtrip test: INTT(NTT(x)) == x
-void test_ntt_roundtrip_gpu(int log_n) {
+void test_ntt_roundtrip_gpu(int log_n, NTTMode mode = NTTMode::NAIVE) {
     size_t n = static_cast<size_t>(1) << log_n;
-    printf("test_ntt_roundtrip_gpu (n=2^%d=%zu)...\n", log_n, n);
+    printf("test_ntt_roundtrip_gpu [%s] (n=2^%d=%zu)...\n", mode_name(mode), log_n, n);
 
     // Generate test data in standard form
     std::vector<FpElement> h_original(n);
@@ -682,8 +691,8 @@ void test_ntt_roundtrip_gpu(int log_n) {
     CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
     CUDA_CHECK(cudaMemcpy(d_data, h_original.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
 
-    ntt_forward(d_data, n, NTTMode::NAIVE);
-    ntt_inverse(d_data, n, NTTMode::NAIVE);
+    ntt_forward(d_data, n, mode);
+    ntt_inverse(d_data, n, mode);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<FpElement> h_result(n);
@@ -697,7 +706,7 @@ void test_ntt_roundtrip_gpu(int log_n) {
 
     TEST_ASSERT(pass_count == static_cast<int>(n),
         "NTT roundtrip mismatch");
-    printf("  NTT roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass_count, n);
+    printf("  NTT roundtrip [%s] (n=2^%d): %d/%zu matched\n", mode_name(mode), log_n, pass_count, n);
 
     if (pass_count != static_cast<int>(n) && n <= 1024) {
         int printed = 0;
@@ -746,16 +755,28 @@ int main() {
     test_ff_sqr_soa_gpu();
 
     // Phase 4: NTT correctness tests (GPU NTT vs CPU DFT reference)
-    test_ntt_forward_gpu(10);  // 2^10 = 1024
-    test_ntt_forward_gpu(12);  // 2^12 = 4096
-    test_ntt_forward_gpu(15);  // 2^15 = 32768
-    test_ntt_forward_gpu(17);  // 2^17 = 131072
-    test_ntt_forward_gpu(20);  // 2^20 = 1048576
-    test_ntt_roundtrip_gpu(10);
-    test_ntt_roundtrip_gpu(12);
-    test_ntt_roundtrip_gpu(15);
-    test_ntt_roundtrip_gpu(17);
-    test_ntt_roundtrip_gpu(20);
+    test_ntt_forward_gpu(10, NTTMode::NAIVE);  // 2^10 = 1024
+    test_ntt_forward_gpu(12, NTTMode::NAIVE);  // 2^12 = 4096
+    test_ntt_forward_gpu(15, NTTMode::NAIVE);  // 2^15 = 32768
+    test_ntt_forward_gpu(17, NTTMode::NAIVE);  // 2^17 = 131072
+    test_ntt_forward_gpu(20, NTTMode::NAIVE);  // 2^20 = 1048576
+    test_ntt_roundtrip_gpu(10, NTTMode::NAIVE);
+    test_ntt_roundtrip_gpu(12, NTTMode::NAIVE);
+    test_ntt_roundtrip_gpu(15, NTTMode::NAIVE);
+    test_ntt_roundtrip_gpu(17, NTTMode::NAIVE);
+    test_ntt_roundtrip_gpu(20, NTTMode::NAIVE);
+
+    // Phase 5: Optimized shared-memory NTT correctness tests
+    test_ntt_forward_gpu(10, NTTMode::OPTIMIZED);
+    test_ntt_forward_gpu(12, NTTMode::OPTIMIZED);
+    test_ntt_forward_gpu(15, NTTMode::OPTIMIZED);
+    test_ntt_forward_gpu(17, NTTMode::OPTIMIZED);
+    test_ntt_forward_gpu(20, NTTMode::OPTIMIZED);
+    test_ntt_roundtrip_gpu(10, NTTMode::OPTIMIZED);
+    test_ntt_roundtrip_gpu(12, NTTMode::OPTIMIZED);
+    test_ntt_roundtrip_gpu(15, NTTMode::OPTIMIZED);
+    test_ntt_roundtrip_gpu(17, NTTMode::OPTIMIZED);
+    test_ntt_roundtrip_gpu(20, NTTMode::OPTIMIZED);
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

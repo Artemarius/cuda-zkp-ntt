@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 5 — Optimized Shared-Memory NTT** (next up; Phase 4 complete)
+Current phase: **Phase 6 — Async Pipeline NTT** (next up; Phase 5 complete)
 
 ---
 
