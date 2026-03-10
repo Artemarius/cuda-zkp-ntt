@@ -8,6 +8,16 @@
 
 ---
 
+## Highlights
+
+- **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT (Direction A)
+- **Memory-bound to compute-bound transformation**: fused radix-256 kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
+- **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
+- **49 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- BLS12-381 scalar field, 255-bit Montgomery arithmetic, production-grade modulus
+
+---
+
 ## Motivation
 
 Recent performance studies ([ZKProphet, IEEE IISWC 2025](https://arxiv.org/abs/2509.22684)) reveal a striking bottleneck in GPU-accelerated Zero-Knowledge Proof generation: while Multi-Scalar Multiplication (MSM) has been optimized to ~800× over CPU, the **Number-Theoretic Transform (NTT)** lags at only ~50× — and now accounts for up to **91% of end-to-end proof generation time**.
@@ -67,6 +77,11 @@ Key implementation choices:
 *RTX 3060 Laptop GPU, Release build, 5-rep mean.*
 *Pipeline speedup limited at 2²² by DMA interference (memory controller contention).*
 
+<p align="center">
+  <img src="results/charts/ntt_compute_comparison.png" width="48%" alt="NTT compute latency comparison">
+  <img src="results/charts/async_pipeline_comparison.png" width="48%" alt="Async pipeline speedup">
+</p>
+
 **Nsight Compute Kernel Profile (2^20 elements):**
 
 | Metric | FF_mul (isolated) | NTT Naive Butterfly | NTT Fused (radix-256) |
@@ -79,6 +94,22 @@ Key implementation choices:
 | DRAM Throughput | 305 GB/s | 260 GB/s | ~50 GB/s (shared mem) |
 
 The fused radix-256 kernel transforms the workload from memory-bound to **compute-bound** — data lives in shared memory across 8 butterfly stages, eliminating global memory round-trips and saturating the integer ALU pipe.
+
+**Direction B — SASS Instruction Reduction (cuobjdump, sm_86 Release):**
+
+| FF Operation | Baseline SASS | Branchless v2 | Reduction | Technique |
+|---|---|---|---|---|
+| `ff_add` | 127 | 55 | **-57%** | PTX carry chain + LOP3 MUX, enables 128-bit vectorized loads |
+| `ff_sub` | 94 | 55 | **-41%** | `sub.cc` chain + `lop3.b32` replaces ISETP+SEL comparison |
+| `ff_mul` | 571 | 527 | **-8%** | Branchless conditional reduction (CIOS loop unchanged) |
+| `ff_sqr` | 563 | 511 | **-9%** | Same as ff_mul (sqr = mul(a, a)) |
+
+*Throughput unchanged in isolated microbenchmarks (memory-bound at 92% DRAM). Instruction-level gains realized inside the compute-bound fused NTT kernel.*
+
+<p align="center">
+  <img src="results/charts/kernel_profile_comparison.png" width="48%" alt="Kernel bottleneck analysis">
+  <img src="results/charts/sass_instruction_reduction.png" width="48%" alt="SASS instruction reduction">
+</p>
 
 See [`results/analysis.md`](results/analysis.md) for the full annotated analysis with Nsight Compute screenshots.
 
@@ -110,8 +141,11 @@ cuda-zkp-ntt/
 │   └── README.md              # Profiling methodology
 ├── results/
 │   ├── screenshots/           # Nsight Compute roofline + warp analysis
+│   ├── charts/                # Generated benchmark comparison charts
 │   ├── data/                  # Raw benchmark CSV output
 │   └── analysis.md            # Annotated performance analysis
+├── scripts/
+│   └── plot_benchmarks.py     # Generate charts from benchmark data
 ├── CMakeLists.txt
 ├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization
@@ -128,19 +162,21 @@ cuda-zkp-ntt/
 - C++17-capable compiler (GCC 11+ / MSVC 2022 / Clang 14+)
 - Python 3.8+ (for profiling scripts, optional)
 
-### Linux / WSL2
 ```bash
-git clone https://github.com/YOUR_USERNAME/cuda-zkp-ntt
+git clone https://github.com/Artemarius/cuda-zkp-ntt
 cd cuda-zkp-ntt
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
 ```
 
-### Windows (Visual Studio 2022)
+### Linux / WSL2
 ```bash
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### Windows (MSVC 2022)
+```bash
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build --config Release
 ```
 
 ### Running Tests

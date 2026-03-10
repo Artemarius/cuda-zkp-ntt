@@ -1,7 +1,7 @@
 # Performance Analysis
 ## cuda-zkp-ntt — RTX 3060 (Ampere sm_86, CUDA 12.8)
 
-*Populate this file as profiling runs are completed. Each section references a specific screenshot in `screenshots/` and connects findings to the ZKProphet paper analysis.*
+*Each section references a specific screenshot in `screenshots/` and connects findings to the ZKProphet paper analysis.*
 
 ---
 

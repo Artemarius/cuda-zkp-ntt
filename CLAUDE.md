@@ -108,8 +108,12 @@ profiling/
 
 results/
   screenshots/        — Nsight Compute roofline, warp stall charts (PNG)
+  charts/             — Generated benchmark comparison charts (matplotlib)
   data/               — Benchmark CSV files
   analysis.md         — Annotated interpretation of profiling results
+
+scripts/
+  plot_benchmarks.py  — Generate benchmark bar charts from measured data
 ```
 
 ---
@@ -143,7 +147,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 7 — Profiling & Results** (complete)
+Current phase: **Phase 8 — Polish & Portfolio Presentation** (in progress)
 
 ---
 

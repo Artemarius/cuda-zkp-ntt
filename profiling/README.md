@@ -106,6 +106,6 @@ cuobjdump --dump-sass build/Release/zkp_ntt_core.lib | grep -c "INSTRUCTION" # c
 ## Output
 
 - `.ncu-rep` files: gitignored (large binaries), stored in `results/data/`
-- PNG screenshots: `results/screenshots/` (11 total)
+- PNG screenshots: `results/screenshots/` (10 Nsight Compute captures)
 - CSV data: `results/data/`
 - Analysis: `results/analysis.md` (annotated findings with ZKProphet references)
