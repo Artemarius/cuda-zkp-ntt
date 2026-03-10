@@ -1,19 +1,25 @@
 // src/ntt_optimized.cu
-// Optimized shared-memory NTT: fuses 8 butterfly stages per kernel launch.
-// Phase 5: reduces global memory round-trips vs naive (one launch per stage).
+// Optimized NTT: fused warp-shuffle + shared-memory inner kernel, cooperative
+// groups outer kernel fusion. v1.1.0 combines all three optimization directions.
 //
 // Strategy (Cooley-Tukey, after bit-reverse):
-//   1. Fused inner kernel: stages 0..7 in shared memory (1 launch, radix-256)
-//   2. Outer stages: stages 8..log_n-1 via global-memory butterfly kernel
+//   1. Fused inner kernel: stages 0..K-1 (K=8/9/10 selected by NTT size)
+//      - Stages 0-4: warp-level __shfl_xor_sync (no shared memory / barriers)
+//      - Stages 5..K-1: shared memory + __syncthreads() (cross-warp)
+//   2. Outer stages: stages K..log_n-1 via cooperative groups fused kernel
+//      (multiple stages per launch with grid.sync() global barrier)
 //
-// For n=2^22: 1 fused + 14 outer = 15 launches (vs 22 naive).
-// Each fused block processes 256 elements (8 KB shared memory, 128 threads).
-// Measured speedup: ~14% at 2^22, ~16% at 2^18..2^20.
+// K selection: K=10 for n >= 2^10, K=9 for n=2^9, K=8 for n=2^8.
+//
+// Launch count for n=2^22:
+//   v1.0: 1 bit-reverse + 1 fused(K=8) + 14 outer = 16
+//   v1.1: 1 bit-reverse + 1 fused(K=10) + 2 cooperative outer = 4
 
 #include "ntt.cuh"
 #include "ff_arithmetic.cuh"
 #include "cuda_utils.cuh"
 
+#include <cooperative_groups.h>
 #include <cstdio>
 #include <cassert>
 
@@ -32,72 +38,190 @@ extern __global__ void ntt_butterfly_kernel(
 extern __global__ void ntt_scale_kernel(
     FpElement* data, FpElement scalar, uint32_t n);
 
-// ─── Fused Shared-Memory Butterfly Kernel ───────────────────────────────────
-// Fuses 8 radix-2 butterfly stages into a single kernel launch.
-// Each block processes 256 contiguous elements using shared memory.
-// 128 threads: one butterfly pair per thread per stage.
-//
-// Within a single stage, each shared memory location is accessed by exactly
-// one thread (butterfly pairs are disjoint), so no intra-stage races.
-// __syncthreads() between stages ensures inter-stage visibility.
-//
-// Twiddle access: twiddles[j * stride] from global memory. The same twiddles
-// are used by all blocks at the same stage, so L1/L2 cache is effective
-// (only 255 unique twiddles across all 8 stages, ~8 KB total).
+// ─── Fused Kernel Launchers (from ntt_fused_kernels.cu) ─────────────────────
+// Compiled without RDC to avoid template symbol resolution bugs on MSVC+CUDA 12.8.
+// Linked as plain host functions.
 
-static constexpr int FUSED_K = 8;
+extern void launch_fused_k8(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream);
+extern void launch_fused_k9(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream);
+extern void launch_fused_k10(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream);
 
-template <int K>
-__global__ void ntt_fused_stages_kernel(
+// ─── Fused Multi-Stage Outer Kernel (Cooperative Groups) ─────────────────────
+// Processes multiple consecutive outer butterfly stages in a single kernel launch.
+// Uses cooperative groups grid.sync() for global barrier between stages.
+// Launched with cudaLaunchCooperativeKernel; grid size limited to device occupancy.
+// Each block + its threads process multiple butterfly pairs via a strided loop.
+
+__global__ void ntt_outer_fused_kernel(
     FpElement* __restrict__ data,
     const FpElement* __restrict__ twiddles,
-    uint32_t n
+    uint32_t n,
+    int start_stage,
+    int end_stage
 ) {
-    constexpr int ELEMS   = 1 << K;       // 256 elements per block
-    constexpr int THREADS = ELEMS >> 1;    // 128 threads per block
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
-    __shared__ FpElement sdata[ELEMS];
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+    const uint32_t num_butterflies = n >> 1;  // n/2 butterfly pairs per stage
 
-    const uint32_t boff = blockIdx.x * ELEMS;
-    const uint32_t t = threadIdx.x;
-
-    // Coalesced load: each thread loads 2 elements
-    sdata[t]           = data[boff + t];
-    sdata[t + THREADS] = data[boff + t + THREADS];
-    __syncthreads();
-
-    // K butterfly stages in shared memory
-    #pragma unroll
-    for (int s = 0; s < K; ++s) {
+    for (int s = start_stage; s < end_stage; ++s) {
         const uint32_t half   = 1u << s;
-        const uint32_t stride = n >> (s + 1);   // N / 2^(s+1)
+        const uint32_t stride = n / (2u * half);
 
-        const uint32_t group   = t >> s;         // t / half
-        const uint32_t j       = t & (half - 1); // t % half
-        const uint32_t idx_top = (group << (s + 1)) + j;
-        const uint32_t idx_bot = idx_top + half;
+        // Strided loop: each thread handles multiple butterfly pairs
+        for (uint32_t tid = global_tid; tid < num_butterflies; tid += total_threads) {
+            uint32_t group   = tid / half;
+            uint32_t j       = tid % half;
+            uint32_t idx_top = group * (2u * half) + j;
+            uint32_t idx_bot = idx_top + half;
+            uint32_t tw_idx  = j * stride;
 
-        FpElement w = twiddles[j * stride];
-        FpElement u = sdata[idx_top];
-        FpElement v = ff_mul(sdata[idx_bot], w);
-        sdata[idx_top] = ff_add(u, v);
-        sdata[idx_bot] = ff_sub(u, v);
-        __syncthreads();
+            FpElement u = data[idx_top];
+            FpElement v = ff_mul(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add(u, v);
+            data[idx_bot] = ff_sub(u, v);
+        }
+
+        // Global barrier between stages (all blocks must complete before next stage)
+        if (s + 1 < end_stage) {
+            grid.sync();
+        }
     }
-
-    // Coalesced store
-    data[boff + t]           = sdata[t];
-    data[boff + t + THREADS] = sdata[t + THREADS];
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 static constexpr uint32_t OPT_BLOCK = 256;
 
+// Max outer stages per cooperative launch. 7 stages per launch means
+// 14 outer stages (K=8) -> 2 launches, 12 outer stages (K=10) -> 2 launches.
+static constexpr int MAX_STAGES_PER_COOP_LAUNCH = 7;
+
 static __host__ int log2_of(size_t n) {
     int r = 0;
     while (n > 1) { n >>= 1; ++r; }
     return r;
+}
+
+// Select the best fused K for the given NTT size.
+static __host__ int select_fused_k(int log_n) {
+    if (log_n >= 10) return 10;
+    if (log_n >= 9)  return 9;
+    return 8;
+}
+
+// Launch the fused kernel for the selected K value.
+static __host__ void launch_fused(
+    int k, FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream
+) {
+    switch (k) {
+        case 10: launch_fused_k10(d_data, d_twiddles, n, num_blocks, stream); break;
+        case 9:  launch_fused_k9(d_data, d_twiddles, n, num_blocks, stream); break;
+        default: launch_fused_k8(d_data, d_twiddles, n, num_blocks, stream); break;
+    }
+}
+
+// ─── Cooperative Launch Helpers ──────────────────────────────────────────────
+
+static int s_coop_max_blocks = 0;
+
+static __host__ int get_coop_max_blocks() {
+    if (s_coop_max_blocks > 0) return s_coop_max_blocks;
+
+    int num_blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_fused_kernel,
+        OPT_BLOCK,
+        0
+    ));
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks = num_blocks_per_sm * prop.multiProcessorCount;
+
+    if (!prop.cooperativeLaunch) {
+        fprintf(stderr, "WARNING: Device does not support cooperative launch. "
+                        "Falling back to per-stage kernels.\n");
+        s_coop_max_blocks = 0;
+    }
+
+    return s_coop_max_blocks;
+}
+
+static __host__ bool launch_outer_fused(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int start_stage, int end_stage, cudaStream_t stream
+) {
+    int max_blocks = get_coop_max_blocks();
+    if (max_blocks <= 0) return false;
+
+    uint32_t needed_blocks = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(max_blocks) < needed_blocks)
+                         ? static_cast<uint32_t>(max_blocks)
+                         : needed_blocks;
+
+    int ss = start_stage;
+    int se = end_stage;
+    void* args[] = {
+        &d_data, &d_twiddles, &n, &ss, &se
+    };
+
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (void*)ntt_outer_fused_kernel,
+        dim3(grid_size), dim3(OPT_BLOCK),
+        args, 0, stream
+    );
+
+    return (err == cudaSuccess);
+}
+
+// ─── Outer Stage Dispatch ───────────────────────────────────────────────────
+
+static __host__ void dispatch_outer_stages(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t N, int outer_start, int outer_end,
+    uint32_t grid_half, cudaStream_t stream
+) {
+    bool coop_ok = (get_coop_max_blocks() > 0);
+
+    if (coop_ok) {
+        for (int s = outer_start; s < outer_end; ) {
+            int batch_end = s + MAX_STAGES_PER_COOP_LAUNCH;
+            if (batch_end > outer_end) batch_end = outer_end;
+
+            bool ok = launch_outer_fused(d_data, d_twiddles, N, s, batch_end, stream);
+
+            if (!ok) {
+                for (int ss = s; ss < outer_end; ++ss) {
+                    uint32_t half   = 1u << ss;
+                    uint32_t stride = N / (2u * half);
+                    ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                        d_data, d_twiddles, N, half, stride);
+                }
+                break;
+            }
+            s = batch_end;
+        }
+    } else {
+        for (int s = outer_start; s < outer_end; ++s) {
+            uint32_t half   = 1u << s;
+            uint32_t stride = N / (2u * half);
+            ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                d_data, d_twiddles, N, half, stride);
+        }
+    }
 }
 
 // ─── Forward NTT (Montgomery domain, in-place) ─────────────────────────────
@@ -114,22 +238,17 @@ void ntt_forward_optimized_montgomery(
     // Step 1: Bit-reverse permutation
     ntt_bit_reverse_kernel<<<grid, OPT_BLOCK, 0, stream>>>(d_data, N, log_n);
 
-    // Step 2: Fused inner stages (0..7) in shared memory
-    if (log_n >= FUSED_K) {
-        constexpr int ELEMS   = 1 << FUSED_K;
-        constexpr int THREADS = ELEMS >> 1;
-        const uint32_t num_blocks = N / ELEMS;
+    // Step 2: Select and launch fused inner stages
+    const int fused_k = select_fused_k(log_n);
 
-        ntt_fused_stages_kernel<FUSED_K>
-            <<<num_blocks, THREADS, 0, stream>>>(d_data, d_twiddles, N);
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = N / elems;
 
-        // Step 3: Outer stages (8..log_n-1) via global butterfly kernel
-        for (int s = FUSED_K; s < log_n; ++s) {
-            uint32_t half   = 1u << s;
-            uint32_t stride = N / (2u * half);
-            ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
-                d_data, d_twiddles, N, half, stride);
-        }
+        launch_fused(fused_k, d_data, d_twiddles, N, num_blocks, stream);
+
+        // Step 3: Outer stages via cooperative grouped launches
+        dispatch_outer_stages(d_data, d_twiddles, N, fused_k, log_n, grid_half, stream);
     } else {
         // Small NTT (n < 256): naive per-stage fallback
         for (int s = 0; s < log_n; ++s) {
@@ -155,22 +274,17 @@ void ntt_inverse_optimized_montgomery(
     // Step 1: Bit-reverse permutation
     ntt_bit_reverse_kernel<<<grid, OPT_BLOCK, 0, stream>>>(d_data, N, log_n);
 
-    // Step 2: Fused inner stages
-    if (log_n >= FUSED_K) {
-        constexpr int ELEMS   = 1 << FUSED_K;
-        constexpr int THREADS = ELEMS >> 1;
-        const uint32_t num_blocks = N / ELEMS;
+    // Step 2: Select and launch fused inner stages
+    const int fused_k = select_fused_k(log_n);
 
-        ntt_fused_stages_kernel<FUSED_K>
-            <<<num_blocks, THREADS, 0, stream>>>(d_data, d_inv_twiddles, N);
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = N / elems;
 
-        // Step 3: Outer stages
-        for (int s = FUSED_K; s < log_n; ++s) {
-            uint32_t half   = 1u << s;
-            uint32_t stride = N / (2u * half);
-            ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
-                d_data, d_inv_twiddles, N, half, stride);
-        }
+        launch_fused(fused_k, d_data, d_inv_twiddles, N, num_blocks, stream);
+
+        // Step 3: Outer stages via cooperative grouped launches
+        dispatch_outer_stages(d_data, d_inv_twiddles, N, fused_k, log_n, grid_half, stream);
     } else {
         for (int s = 0; s < log_n; ++s) {
             uint32_t half   = 1u << s;

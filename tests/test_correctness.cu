@@ -861,6 +861,16 @@ int main() {
     test_ntt_roundtrip_gpu(17, NTTMode::OPTIMIZED);
     test_ntt_roundtrip_gpu(20, NTTMode::OPTIMIZED);
 
+    // v1.1.0: Larger fused kernel tests (K=8, K=9, K=10 paths)
+    test_ntt_forward_gpu(8, NTTMode::OPTIMIZED);    // K=8 path (256 elems)
+    test_ntt_roundtrip_gpu(8, NTTMode::OPTIMIZED);
+    test_ntt_forward_gpu(9, NTTMode::OPTIMIZED);    // K=9 path (512 elems)
+    test_ntt_roundtrip_gpu(9, NTTMode::OPTIMIZED);
+
+    // v1.1.0: Large-scale test (K=10 + cooperative outer fusion)
+    test_ntt_forward_gpu(22, NTTMode::OPTIMIZED);   // K=10 + 12 outer -> 2 coop launches
+    test_ntt_roundtrip_gpu(22, NTTMode::OPTIMIZED);
+
     // Phase 6: Async pipeline NTT correctness tests
     test_async_pipeline_forward(10, 4);  // 4 batches of 2^10
     test_async_pipeline_forward(15, 4);  // 4 batches of 2^15

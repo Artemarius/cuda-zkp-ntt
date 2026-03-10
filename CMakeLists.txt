@@ -45,6 +45,18 @@ FetchContent_MakeAvailable(benchmark)
 # ─── Include Directories ──────────────────────────────────────────────────────
 include_directories(include)
 
+# ─── Fused NTT Kernels (NO RDC) ──────────────────────────────────────────────
+# Compiled WITHOUT separable compilation to work around the MSVC+CUDA 12.8
+# RDC template symbol resolution bug for __global__ template functions with K>=9.
+# All device functions (ff_mul, ff_add, ff_sub) are __device__ __forceinline__
+# in the header, so they get inlined — no cross-TU device linkage needed.
+add_library(ntt_fused_lib STATIC
+    src/ntt_fused_kernels.cu
+)
+set_target_properties(ntt_fused_lib PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
 # ─── Core Library ─────────────────────────────────────────────────────────────
 # Finite-field arithmetic and NTT kernels compiled as a static library
 add_library(zkp_ntt_core STATIC
@@ -56,6 +68,8 @@ add_library(zkp_ntt_core STATIC
 set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+# Link fused kernel library (compiled without RDC)
+target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib)
 # ntt_naive.cu uses ff_reference.h for CPU-side twiddle computation
 target_include_directories(zkp_ntt_core PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
