@@ -87,7 +87,8 @@ include/
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
   ntt_naive.cu        — Radix-2 NTT, no optimization (correctness baseline)
-  ntt_optimized.cu    — Radix-256 shared-memory NTT
+  ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer fusion
+  ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC TU)
   ntt_async.cu        — Double-buffered async pipeline NTT
   benchmark.cu        — Main benchmark entry point
 
@@ -141,12 +142,16 @@ LICENSE                — MIT License
 - Batch size: tunable (one NTT per batch)
 - Ordering: H2D(k+1) overlaps with NTT_compute(k) and D2H(k-1)
 
-### NTT (Cooley-Tukey, radix-256)
-- Combines 8 radix-2 stages into one shared-memory kernel launch
+### NTT (Cooley-Tukey, fused radix-1024 + cooperative outer stages)
+- Fused inner kernel: K=10 (512 threads, 1024 elements, 32 KB shmem per block)
+  - Stages 0-4: `__shfl_xor_sync` warp shuffles (no shmem, no barriers)
+  - Stages 5-9: shared memory + `__syncthreads()` (cross-warp)
+- K selection: K=10 for n>=2^10, K=9 for n=2^9, K=8 for n=2^8
+- Fused kernels compiled in separate TU without RDC (MSVC+CUDA 12.8 workaround)
+- Outer stages: cooperative groups `grid.sync()` persistent-thread kernel
+  - Up to 7 stages per cooperative launch (14 outer stages -> 2 launches)
 - Twiddle factors: precomputed table in global memory, cached in L1
-- Thread mapping: 1 thread per butterfly pair within a block (128 threads)
-- Block size: 128 threads / 256 elements (8 KB shared memory per block)
-- Remaining stages (8..log_n-1) use per-stage global butterfly kernel
+- For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
 ---
 
@@ -154,7 +159,7 @@ LICENSE                — MIT License
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-All phases complete. Current version: **v1.0.0** (tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
+All phases complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
 
 ---
 

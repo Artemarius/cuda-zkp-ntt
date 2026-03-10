@@ -12,9 +12,10 @@
 ## Highlights
 
 - **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT (Direction A)
-- **Memory-bound to compute-bound transformation**: fused radix-256 kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
+- **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
+- **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
 - **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
-- **49 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **55 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - BLS12-381 scalar field, 255-bit Montgomery arithmetic, production-grade modulus
 
 ---
@@ -64,8 +65,9 @@ Key implementation choices:
 
 | Implementation | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² | vs. Naive |
 |---|---|---|---|---|
-| Naive GPU NTT (radix-2) | 1.85 ms | 7.13 ms | 31.2 ms | 1.0x |
-| Radix-256 shared-mem NTT | 1.54 ms | 5.99 ms | 26.5 ms | **1.18x** |
+| Naive GPU NTT (radix-2) | 1.34 ms | 5.86 ms | 26.1 ms | 1.0x |
+| v1.0 Radix-256 shared-mem (K=8, 15 launches) | 1.54 ms | 5.99 ms | 26.5 ms | **1.18x** |
+| v1.1 Fused radix-1024 + coop outer (K=10, 4 launches) | 1.23 ms | 5.52 ms | 25.2 ms | **1.09x** |
 
 **Async Pipeline (end-to-end including H2D + compute + D2H, 8 batches, pinned memory):**
 
@@ -128,7 +130,8 @@ cuda-zkp-ntt/
 ├── src/
 │   ├── ff_mul.cu              # Montgomery multiplication kernels
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
-│   ├── ntt_optimized.cu       # Radix-256 NTT: 8 fused stages in shared memory
+│   ├── ntt_optimized.cu       # NTT host dispatch: K selection + cooperative outer fusion
+│   ├── ntt_fused_kernels.cu   # Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC)
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
