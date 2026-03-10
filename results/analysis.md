@@ -23,21 +23,23 @@ Per-SM metrics (latency, stall breakdown, instruction mix) are **directly compar
 
 ### 1.1 Speed of Light Analysis
 
-**Screenshots**: `screenshots/Screenshot_151.png` (GPU Speed of Light + Memory Workload)
-**Method**: Nsight Compute `--set full`, ff_mul_throughput_kernel, 2^20 elements
+**Screenshots**: `screenshots/roofline_ff_mul_baseline.png` (GPU Speed of Light + Roofline)
+**Method**: Nsight Compute 2025.1.1 `--set full`, ff_mul_throughput_kernel, 2^20 elements
 
 | Metric | Value |
 |---|---|
-| Compute (SM) Throughput | 64.30% |
-| Memory Throughput | **91.04%** (DRAM-bound) |
-| L1/TEX Throughput | 55.90% |
-| L2 Cache Throughput | 50.55% |
-| SM Frequency | 899.89 MHz |
-| Duration | 338.05 us |
-| Memory Throughput | 304.10 GB/s |
+| Compute (SM) Throughput | 64.15% |
+| Memory Throughput | **92.08%** (DRAM-bound) |
+| L1/TEX Throughput | 55.47% |
+| L2 Cache Throughput | 51.47% |
+| DRAM Throughput | 92.08% |
+| SM Frequency | 899.85 MHz |
+| Duration | 333.41 us |
+| Elapsed Cycles | 300,024 |
+| Memory Throughput | 304.93 GB/s |
 | FP32 / FP64 utilization | 0% / 0% (pure integer) |
 
-**Key finding**: The kernel is **memory-bound** (91% DRAM vs 64% compute), despite being a compute-heavy integer kernel. This is caused by severe memory access inefficiency (see Section 1.4).
+**Key finding**: The kernel is **memory-bound** (92% DRAM vs 64% compute), despite being a compute-heavy integer kernel. This is caused by severe memory access inefficiency (see Section 1.4).
 
 **ZKProphet comparison**: ZKProphet reports FF_mul reaching ~60% of INT32 ceiling on A40. Our 64% compute throughput on RTX 3060 is consistent — the kernel is well-optimized computationally, but memory access patterns dominate wall-clock time.
 
@@ -45,8 +47,8 @@ Per-SM metrics (latency, stall breakdown, instruction mix) are **directly compar
 
 ### 1.2 Scheduler & Warp Statistics
 
-**Screenshot**: `screenshots/Screenshot_152.png` (Scheduler + Warp State + Instruction Statistics)
-**Method**: Nsight Compute `--set full`
+**Screenshot**: `screenshots/warp_stalls_ff_mul_baseline.png` (Warp State Statistics)
+**Method**: Nsight Compute 2025.1.1 `--set full`
 
 | Metric | RTX 3060 | ZKProphet A40 |
 |---|---|---|
@@ -55,15 +57,23 @@ Per-SM metrics (latency, stall breakdown, instruction mix) are **directly compar
 | No Eligible % | **52.43%** | - |
 | One or More Eligible % | 47.57% | - |
 | Issue rate | 1 inst / 2.1 cycles | - |
-| Warp Cycles Per Issued Inst | 20.97 | ~6.2 |
+| Warp Cycles Per Issued Inst | 21.48 | ~6.2 |
 | Avg Active Threads Per Warp | 32.00 | - |
 | Not Predicated Off Threads | 31.88 | - |
 
-**Interpretation**: Over half the cycles have zero eligible warps — warps are stalled waiting on memory, not on IMAD latency (which would show as `Stall_Math_Throttle`). The 20.97 cycles per issued instruction is much higher than ZKProphet's ~6.2, suggesting our memory access pattern is the dominant bottleneck, not compute latency.
+**Interpretation**: Over half the cycles have zero eligible warps — warps are stalled waiting on memory, not on IMAD latency (which would show as `Stall_Math_Throttle`). The 21.48 cycles per issued instruction is much higher than ZKProphet's ~6.2, suggesting our memory access pattern is the dominant bottleneck, not compute latency.
+
+**Top warp stall reasons (ff_mul baseline)**:
+1. **Stall Long Scoreboard** (~7.5 cycles) — waiting on global memory loads
+2. **Stall LG Throttle** (~4.5 cycles) — L1/global memory pipeline saturated
+3. **Stall Math Pipe Throttle** (~2.5 cycles) — integer ALU backpressure
+4. **Stall Not Selected** (~2.2 cycles) — scheduler chose another warp
+5. **Stall Dispatch Stall** (~2.0 cycles) — instruction dispatch bottleneck
+6. **Stall Wait** (~1.5 cycles) — fixed-latency dependency
 
 ### 1.3 Occupancy & Launch Configuration
 
-**Screenshot**: `screenshots/Screenshot_153.png` (Occupancy + Source Counters)
+**Screenshot**: `screenshots/Screenshot_153.png` (Occupancy + Source Counters), `screenshots/roofline_ff_mul_baseline.png`
 
 | Metric | Value |
 |---|---|
@@ -165,7 +175,39 @@ The CIOS Montgomery loop (ff_mul core) is identical between variants — nvcc al
 
 V2 ff_add achieves **57% instruction count reduction** — the most dramatic improvement. The branchless PTX also changed register allocation patterns, allowing nvcc to merge 16 individual 32-bit loads into 4 × 128-bit vectorized loads (`LDG.E.128.CONSTANT`).
 
-### 2.4 Microbenchmark Throughput (4M Elements, RTX 3060)
+### 2.4 Nsight Compute: FF_mul Baseline vs V2
+
+**Screenshots**: `screenshots/roofline_ff_mul_baseline.png`, `screenshots/roofline_ff_mul_v2.png`
+**Method**: Nsight Compute 2025.1.1 `--set full`, 2^20 elements
+
+| Metric | Baseline | V2 Branchless | Delta |
+|---|---|---|---|
+| Compute (SM) Throughput | 64.15% | 65.47% | +1.32 pp |
+| Memory Throughput | 92.08% | 90.92% | -1.16 pp |
+| Duration | 333.41 us | 340.29 us | +2.1% |
+| Executed IPC | 1.87 | 1.85 | -1.1% |
+| SM Busy | 65.48% | 65.92% | +0.7% |
+| Issue Slots Busy | 46.89% | 46.38% | -1.1% |
+| ALU pipe (highest) | 44.5% | 44.4% | -0.2% |
+| Memory Throughput | 304.93 GB/s | 301.07 GB/s | -1.3% |
+
+Both variants hit the same DRAM bandwidth ceiling (~92%). The v2 kernel is marginally slower (+2.1% duration) — the branchless reduction path has slightly different instruction scheduling that doesn't help when memory-bound. This confirms the Phase 3 finding: instruction optimizations are invisible in isolated FF microbenchmarks.
+
+### 2.5 Nsight Compute: FF_add Instruction Comparison
+
+**Screenshot**: `screenshots/instruction_mix_ff_add_comparison.png`
+
+| Metric | Baseline | V2 Branchless | Delta |
+|---|---|---|---|
+| Branch Instructions | 262,144 | 65,536 | **-75% (4× fewer)** |
+| Branch Instructions Ratio | 0.12% | 0.04% | -67% |
+| Branch Efficiency | 100% | 100% | unchanged |
+| Excessive L2 Sectors | 83% | 83% | unchanged (AoS) |
+| Est. Speedup (coalescing) | 80.54% | 80.54% | unchanged |
+
+The v2 branchless PTX eliminates 75% of branch instructions (comparison/predication replaced by LOP3 MUX), but since the kernel is memory-bound, this doesn't translate to throughput improvement. The memory access pattern (83% excessive sectors from AoS layout) remains the dominant bottleneck for both variants.
+
+### 2.6 Microbenchmark Throughput (4M Elements, RTX 3060)
 
 | Operation | Baseline (Gops/s) | V2 Branchless | SoA | V2 vs Baseline |
 |---|---|---|---|---|
@@ -174,7 +216,7 @@ V2 ff_add achieves **57% instruction count reduction** — the most dramatic imp
 | ff_mul | 2.48 | 2.45 | 2.54 | -1.2% |
 | ff_sqr | 3.27 | 3.20 | 3.04 | -2.1% |
 
-### 2.5 Why No Throughput Improvement Despite Fewer Instructions
+### 2.7 Why No Throughput Improvement Despite Fewer Instructions
 
 The isolated FF microbenchmark is **memory-bound** (91% DRAM throughput, Section 1.1). Each thread loads 2 FpElements (64 bytes) and stores 1 (32 bytes) — the kernel's compute intensity is too low for instruction-level optimizations to be visible:
 
@@ -188,11 +230,11 @@ The isolated FF microbenchmark is **memory-bound** (91% DRAM throughput, Section
 - ff_add is called once per butterfly (57% fewer instructions directly reduces cycle count)
 - The branchless reduction avoids any warp divergence regardless of input distribution
 
-### 2.6 AoS vs SoA Memory Layout
+### 2.8 AoS vs SoA Memory Layout
 
 **Finding**: No throughput difference. The `__align__(32)` attribute on `FpElement` causes nvcc to generate 256-bit (`LDG.E.CONSTANT.SYS [addr], desc[UR4][R2]`) vectorized loads for the AoS layout, achieving the same coalescing as explicit SoA. The "83% excessive sectors" metric from Phase 2 ncu was measuring L2→L1 sector utilization, not DRAM access patterns — the GPU's L1 cache line fills serve adjacent elements.
 
-### 2.7 Branch Efficiency
+### 2.9 Branch Efficiency
 
 | Operation | Our Baseline | ZKProphet A40 |
 |---|---|---|
@@ -226,7 +268,61 @@ This means our branchless v2 variants don't improve branch efficiency (already p
 
 **Block tuning attempted**: K=8 (128 threads, radix-256), K=9 (256 threads), K=10 (512 threads). K≥9 failed due to CUDA RDC template instantiation bug ("named symbol not found"). Non-template workaround for K=10 was ~2% slower than template K=8 (no loop unrolling). K=8 is the production configuration.
 
-### 3.2 NTT Time Breakdown
+### 3.2 NTT Fused Kernel Profile (ntt_fused_stages_kernel)
+
+**Screenshot**: `screenshots/roofline_ntt_optimized_2e20.png` (Speed of Light + Roofline)
+**Method**: Nsight Compute 2025.1.1 `--set full --kernel-name ntt_fused_stages_kernel`, 2^20 elements
+
+| Metric | Fused (Optimized) | Naive Butterfly | Comparison |
+|---|---|---|---|
+| Compute (SM) Throughput | **69.23%** | 45.14% | +24 pp |
+| Memory Throughput | 54.74% | **78.61%** | -24 pp |
+| DRAM Throughput | 15.65% | 78.61% | Fused avoids DRAM |
+| L1/TEX Throughput | 55.16% | 79.90% | |
+| L2 Throughput | 11.92% | 53.18% | |
+| Duration | 1.29 ms | 256.42 us | 8 stages fused |
+| SM Busy | **69.76%** | 45.96% | |
+| Issue Slots Busy | **60.94%** | 39.68% | |
+| Executed IPC | **2.41** | 1.56 | 55% more IPC |
+| ALU pipe utilization | **67.3%** | 41.5% | |
+
+**Key finding**: The fused radix-256 kernel is **compute-bound** (69% compute vs 55% memory), a dramatic shift from both the naive NTT butterfly (memory-bound at 79%) and the isolated FF microbenchmark (memory-bound at 92%). This validates the Phase 3 prediction: instruction-level optimizations matter inside the NTT kernel where data lives in shared memory and the compute-to-memory ratio is high.
+
+**ncu classification**: "High Compute Throughput — compute is more heavily utilized than memory." ALU pipe (67.3%) is the highest-utilized pipeline, confirming integer arithmetic (IMAD/IADD3) dominance.
+
+**Warp Stall Comparison (fused kernel vs FF baseline)**:
+
+**Screenshot**: `screenshots/warp_stalls_ntt_optimized.png`
+
+| Stall Reason | Fused NTT Kernel | FF_mul Baseline | Interpretation |
+|---|---|---|---|
+| Math Pipe Throttle | **~3.5 (1st)** | ~2.5 (3rd) | ALU saturated — compute-bound |
+| Not Selected | ~3.3 (2nd) | ~2.2 (4th) | High occupancy, scheduler contention |
+| Dispatch Stall | ~2.5 (3rd) | ~2.0 (5th) | Instruction issue pressure |
+| Barrier | **~2.0 (4th)** | 0 | `__syncthreads()` between stages |
+| Wait | ~1.8 (5th) | ~1.5 (6th) | Fixed-latency dependencies |
+| Long Scoreboard | **~0.4** | **~7.5 (1st)** | Shared mem eliminates DRAM waits |
+| LG Throttle | **~0** | **~4.5 (2nd)** | No global mem pressure |
+
+The stall profile transformation tells the optimization story clearly:
+- **FF_mul baseline**: dominated by Long Scoreboard + LG Throttle (memory stalls)
+- **Fused NTT kernel**: dominated by Math Pipe Throttle + Not Selected (compute stalls)
+- The Barrier stall (~2.0 cycles) is the cost of `__syncthreads()` between the 8 fused butterfly stages — an acceptable overhead for eliminating 8 global memory round-trips.
+
+### 3.3 NTT Naive vs Optimized Comparison
+
+**Screenshot**: `screenshots/ntt_naive_vs_optimized_comparison.png`
+**Method**: ncu baseline comparison — `ntt_butterfly_kernel` (naive) vs `ntt_fused_stages_kernel` (optimized)
+
+Per-kernel comparison (single invocation):
+- **Naive butterfly** (1 of 20 stages): 256.42 us, 2048 blocks × 256 threads, memory-bound
+- **Fused kernel** (8 stages): 1.29 ms, 4096 blocks × 128 threads, compute-bound
+
+The naive kernel launches 20 separate butterfly invocations for 2^20, each doing one stage with global memory reads/writes. The fused kernel does 8 stages with data in shared memory (8 KB/block), then the remaining 12 stages use global memory butterfly kernels. Net effect: 15 launches vs 20 launches, with the fused launch doing 8× more compute per byte of DRAM traffic.
+
+**Memory throughput shift**: The naive butterfly achieves 260 GB/s memory throughput (+402% vs fused) — it's essentially a memory streaming kernel. The fused kernel achieves only 15.65% DRAM throughput because data stays in shared memory for 8 stages.
+
+### 3.4 NTT Time Breakdown
 
 For optimized radix-256 NTT at scale 2²²:
 - Kernel compute time (on-device): 21.9 ms
@@ -301,21 +397,38 @@ This is consistent with known CUDA behavior: the overlap benefit depends on whet
 
 ## Key Findings Summary
 
-*(Phases 2-6 complete, Phase 7 TBD)*
-
-1. **FF_mul instruction mix**: ALU pipe 44.8% (integer-dominated, IMAD+IADD3 ~85%) — ZKProphet: 70.8% IMAD
+1. **FF_mul instruction mix**: ALU pipe 44.5% (integer-dominated, IMAD+IADD3 ~85%) — ZKProphet: 70.8% IMAD
 2. **FF_mul throughput**: 2.48 Gops/s at 4M elements on RTX 3060
-3. **FF_mul bottleneck**: DRAM at 91% (memory-bound, 52% cycles with zero eligible warps)
+3. **FF_mul bottleneck**: DRAM at 92% (memory-bound, 52% cycles with zero eligible warps)
 4. **FF_add branch efficiency**: **100%** (ZKProphet: 52.5% — our nvcc generates predicated code)
 5. **Achieved occupancy**: 83.9% (38 registers/thread)
 6. **Branchless v2 SASS reduction**: ff_add -57%, ff_sub -41%, ff_mul -8%, ff_sqr -9%
-7. **Branchless v2 throughput**: No improvement in isolated microbench (memory-bound) — gains expected inside NTT kernels
+7. **Branchless v2 ncu comparison**: Identical throughput profile (both hit 92% DRAM ceiling). v2 eliminates 75% of branch instructions in ff_add — invisible when memory-bound.
 8. **AoS vs SoA**: No difference — `__align__(32)` FpElement already generates vectorized loads
 9. **Radix-256 NTT speedup**: **1.18-1.20×** for sizes ≥ 2^16 (fusing 8 stages in shared memory)
-10. **Radix-256 architecture**: 128 threads, 256 elements per block, 8 KB shmem. K=8 is optimal (K≥9 blocked by CUDA RDC template bug; bank conflict padding adds overhead)
-11. **NTT transfer vs compute ratio**: Transfer 66% of total serial time (42ms transfer vs 22ms compute at 2²²) — confirms ZKProphet: transfer >> compute
-12. **Pipeline latency improvement**: 1.66× at 2¹⁸, 1.33× at 2²⁰, 1.07× at 2²² (pinned memory, 8 batches). DMA interference limits overlap at large sizes.
-13. **Combined optimization vs bellperson**: Not directly measured (no bellperson build). Radix-256 + pipeline gives ~1.18× NTT compute + up to 1.66× end-to-end at transfer-dominated sizes.
+10. **Fused NTT kernel is compute-bound**: 69% compute vs 55% memory (vs FF baseline: 64% compute vs 92% memory). Math Pipe Throttle is the top stall reason — ALU saturated at 67.3%.
+11. **Stall profile transformation**: FF_mul dominated by Long Scoreboard (memory waits); fused NTT dominated by Math Pipe Throttle (ALU saturation). Shared memory eliminates global memory stalls.
+12. **NTT IPC improvement**: Fused kernel achieves IPC 2.41 vs naive butterfly 1.56 (+55%). Issue slots busy 61% vs 40%.
+13. **NTT transfer vs compute ratio**: Transfer 66% of total serial time (42ms transfer vs 22ms compute at 2²²) — confirms ZKProphet: transfer >> compute
+14. **Pipeline latency improvement**: 1.66× at 2¹⁸, 1.33× at 2²⁰, 1.07× at 2²² (pinned memory, 8 batches). DMA interference limits overlap at large sizes.
+15. **Combined optimization vs bellperson**: Not directly measured (no bellperson build). Radix-256 + pipeline gives ~1.18× NTT compute + up to 1.66× end-to-end at transfer-dominated sizes.
+
+---
+
+## Screenshot Index
+
+| File | Content | Section |
+|---|---|---|
+| `Screenshot_151.png` | FF_mul baseline: Speed of Light + Memory (Phase 2) | 1.1 |
+| `Screenshot_152.png` | FF_mul baseline: Scheduler + Warp State (Phase 2) | 1.2 |
+| `Screenshot_153.png` | FF_mul baseline: Occupancy + Source Counters (Phase 2) | 1.3, 1.4 |
+| `roofline_ff_mul_baseline.png` | FF_mul baseline: Speed of Light + Roofline (Phase 7) | 1.1 |
+| `warp_stalls_ff_mul_baseline.png` | FF_mul baseline: Warp State Statistics (Phase 7) | 1.2 |
+| `roofline_ff_mul_v2.png` | FF_mul v2 branchless: Speed of Light + Roofline | 2.4 |
+| `instruction_mix_ff_add_comparison.png` | FF_add baseline vs v2: Source Counters comparison | 2.5 |
+| `roofline_ntt_optimized_2e20.png` | NTT fused kernel: Speed of Light + Roofline | 3.2 |
+| `warp_stalls_ntt_optimized.png` | NTT fused kernel: Warp State Statistics | 3.2 |
+| `ntt_naive_vs_optimized_comparison.png` | NTT naive vs optimized: baseline comparison | 3.3 |
 
 ---
 

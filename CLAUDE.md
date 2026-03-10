@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 7 — Profiling & Results** (next up; Phase 6 complete)
+Current phase: **Phase 7 — Profiling & Results** (complete)
 
 ---
 

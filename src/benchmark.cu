@@ -3,6 +3,7 @@
 // Supports FF arithmetic profiling (Phase 2) and NTT profiling (Phase 7).
 
 #include "ntt.cuh"
+#include "pipeline.cuh"
 #include "ff_arithmetic.cuh"
 #include "cuda_utils.cuh"
 #include <cstdio>
@@ -197,9 +198,70 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_bw));
     } else if (strncmp(mode_str, "ff_", 3) == 0) {
         profile_ff(mode_str, n);
+    } else if (strcmp(mode_str, "naive") == 0 ||
+               strcmp(mode_str, "optimized") == 0) {
+        // ─── Single NTT Profiling (Phase 7) ─────────────────────────────
+        NTTMode ntt_mode = (strcmp(mode_str, "naive") == 0)
+                               ? NTTMode::NAIVE
+                               : NTTMode::OPTIMIZED;
+
+        size_t bytes = (size_t)n * sizeof(FpElement);
+
+        // Deterministic nonzero host data
+        FpElement* h_data = (FpElement*)malloc(bytes);
+        for (uint32_t i = 0; i < n; ++i)
+            for (int j = 0; j < 8; ++j)
+                h_data[i].limbs[j] = i * 8 + j + 1;
+
+        FpElement* d_data;
+        CUDA_CHECK(cudaMalloc(&d_data, bytes));
+        CUDA_CHECK(cudaMemcpy(d_data, h_data, bytes, cudaMemcpyHostToDevice));
+
+        // Warmup (initializes twiddle cache)
+        ntt_forward(d_data, n, ntt_mode);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Re-upload fresh data for profiled run
+        CUDA_CHECK(cudaMemcpy(d_data, h_data, bytes, cudaMemcpyHostToDevice));
+
+        printf("Launching NTT forward (%s): n=2^%d = %u elements\n",
+               mode_str, log_size, n);
+        ntt_forward(d_data, n, ntt_mode);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("Done.\n");
+
+        CUDA_CHECK(cudaFree(d_data));
+        free(h_data);
+
+    } else if (strcmp(mode_str, "async") == 0) {
+        // ─── Async Pipeline Profiling (Phase 7) ─────────────────────────
+        int num_batches = 8;
+        size_t total_n = (size_t)n * num_batches;
+        size_t total_bytes = total_n * sizeof(FpElement);
+
+        FpElement *h_in, *h_out;
+        CUDA_CHECK(cudaMallocHost(&h_in,  total_bytes));
+        CUDA_CHECK(cudaMallocHost(&h_out, total_bytes));
+
+        // Fill with deterministic data
+        for (size_t i = 0; i < total_n; ++i)
+            for (int j = 0; j < 8; ++j)
+                h_in[i].limbs[j] = (uint32_t)((i * 8 + j + 1) & 0xFFFFFFFF);
+
+        printf("Launching async pipeline: %d batches x 2^%d = %zu elements\n",
+               num_batches, log_size, total_n);
+
+        AsyncNTTPipeline pipeline(n);
+        pipeline.process_pinned(h_in, h_out, total_n, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("Done.\n");
+
+        CUDA_CHECK(cudaFreeHost(h_in));
+        CUDA_CHECK(cudaFreeHost(h_out));
     } else {
-        // NTT modes — Phase 7
-        printf("NTT profiling not yet implemented (Phase 7).\n");
+        fprintf(stderr, "Unknown mode: %s\n", mode_str);
+        print_usage(argv[0]);
+        return 1;
     }
 
     return 0;

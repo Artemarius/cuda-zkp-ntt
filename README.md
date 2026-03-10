@@ -64,8 +64,23 @@ Key implementation choices:
 | Sequential (1-stream) | 49.4 ms | 188 ms | 579 ms |
 | **Speedup** | **1.66x** | **1.33x** | **1.07x** |
 
-*RTX 3060 Laptop GPU, Release build, 5-rep mean. Phase 6 complete.*
+*RTX 3060 Laptop GPU, Release build, 5-rep mean.*
 *Pipeline speedup limited at 2²² by DMA interference (memory controller contention).*
+
+**Nsight Compute Kernel Profile (2^20 elements):**
+
+| Metric | FF_mul (isolated) | NTT Naive Butterfly | NTT Fused (radix-256) |
+|---|---|---|---|
+| Bottleneck | **Memory (92% DRAM)** | **Memory (79%)** | **Compute (69%)** |
+| Compute Throughput | 64% | 45% | **69%** |
+| ALU Pipe Utilization | 44.5% | 41.5% | **67.3%** |
+| Executed IPC | 1.87 | 1.56 | **2.41** |
+| Top Warp Stall | Long Scoreboard (mem) | LG Throttle (mem) | **Math Pipe Throttle** |
+| DRAM Throughput | 305 GB/s | 260 GB/s | ~50 GB/s (shared mem) |
+
+The fused radix-256 kernel transforms the workload from memory-bound to **compute-bound** — data lives in shared memory across 8 butterfly stages, eliminating global memory round-trips and saturating the integer ALU pipe.
+
+See [`results/analysis.md`](results/analysis.md) for the full annotated analysis with Nsight Compute screenshots.
 
 ---
 
