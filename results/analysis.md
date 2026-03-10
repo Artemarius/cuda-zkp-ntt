@@ -210,19 +210,27 @@ This means our branchless v2 variants don't improve branch efficiency (already p
 
 ### 3.1 Naive Radix-2 vs Radix-256 NTT
 
-| Variant | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ |
-|---|---|---|---|
-| Radix-2 (naive) | TBD ms | TBD ms | TBD ms |
-| Radix-256 (shared mem) | TBD ms | TBD ms | TBD ms |
-| Speedup | TBD× | TBD× | TBD× |
+**Method**: Google Benchmark, cudaEvent_t timing, 5-repetition mean, Release build.
 
-**Expected finding**: Radix-256 reduces global memory round-trips, improving L1 hit rate and reducing bandwidth pressure. Should be faster for all scales.
+| Variant | Scale 2¹⁵ | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² |
+|---|---|---|---|---|
+| Radix-2 (naive) | 0.169 ms | 1.85 ms | 7.13 ms | 31.2 ms |
+| Radix-256 (shared mem) | 0.212 ms | 1.54 ms | 5.99 ms | 26.5 ms |
+| Speedup | 0.80× | **1.20×** | **1.19×** | **1.18×** |
+
+**Architecture**: Radix-256 fuses 8 Cooley-Tukey butterfly stages into a single shared-memory kernel (128 threads, 256 elements, 8 KB shmem per block). For n=2^22, this reduces total kernel launches from 22 to 15 (1 fused + 14 outer).
+
+**Why ~18% not ~36%**: Fusing 8 of 22 stages eliminates ~36% of global memory round-trips. But the fused kernel has lower occupancy (4 warps/block vs the naive kernel's 8 warps/block at 256 threads), and each butterfly stage is compute-dominated by ff_mul (~500 SASS instructions). The fused kernel also has 8-way shared memory bank conflicts from 32-byte FpElement stride (padding was tested but added overhead).
+
+**Small-size regression at 2^15**: With only 15 butterfly stages, the fused kernel's overhead (shared memory allocation, 8 consecutive syncthreads barriers) outweighs the savings from 8 fewer global memory passes.
+
+**Block tuning attempted**: K=8 (128 threads, radix-256), K=9 (256 threads), K=10 (512 threads). K≥9 failed due to CUDA RDC template instantiation bug ("named symbol not found"). Non-template workaround for K=10 was ~2% slower than template K=8 (no loop unrolling). K=8 is the production configuration.
 
 ### 3.2 NTT Time Breakdown
 
 For optimized radix-256 NTT at scale 2²²:
-- Kernel compute time: TBD ms
-- CPU→GPU transfer time: TBD ms
+- Kernel compute time (on-device): 26.5 ms
+- CPU→GPU transfer time: TBD ms (Phase 6 will measure)
 - Transfer % of total: TBD %
 
 **ZKProphet reference** (Fig. 7): NTT transfer time >> compute time (unlike MSM, where they are overlapped). This motivates Direction A.
@@ -281,7 +289,7 @@ At scale 2²², expected transfer time ~Xms, compute ~Yms (from Section 3.2). If
 
 ## Key Findings Summary
 
-*(Phases 2-3 complete, Phases 4-7 TBD)*
+*(Phases 2-5 complete, Phases 6-7 TBD)*
 
 1. **FF_mul instruction mix**: ALU pipe 44.8% (integer-dominated, IMAD+IADD3 ~85%) — ZKProphet: 70.8% IMAD
 2. **FF_mul throughput**: 2.48 Gops/s at 4M elements on RTX 3060
@@ -291,9 +299,11 @@ At scale 2²², expected transfer time ~Xms, compute ~Yms (from Section 3.2). If
 6. **Branchless v2 SASS reduction**: ff_add -57%, ff_sub -41%, ff_mul -8%, ff_sqr -9%
 7. **Branchless v2 throughput**: No improvement in isolated microbench (memory-bound) — gains expected inside NTT kernels
 8. **AoS vs SoA**: No difference — `__align__(32)` FpElement already generates vectorized loads
-9. **NTT transfer vs compute ratio**: TBD (ZKProphet: transfer >> compute)
-10. **Pipeline latency improvement**: TBD× at scale 2²²
-11. **Combined optimization vs bellperson**: TBD×
+9. **Radix-256 NTT speedup**: **1.18-1.20×** for sizes ≥ 2^16 (fusing 8 stages in shared memory)
+10. **Radix-256 architecture**: 128 threads, 256 elements per block, 8 KB shmem. K=8 is optimal (K≥9 blocked by CUDA RDC template bug; bank conflict padding adds overhead)
+11. **NTT transfer vs compute ratio**: TBD (ZKProphet: transfer >> compute)
+12. **Pipeline latency improvement**: TBD× at scale 2²²
+13. **Combined optimization vs bellperson**: TBD×
 
 ---
 

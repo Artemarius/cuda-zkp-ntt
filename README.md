@@ -51,15 +51,15 @@ Key implementation choices:
 > Profiling conducted on NVIDIA RTX 3060 Laptop GPU (Ampere, 30 SMs, CUDA 12.8).
 > Reference baseline: bellperson NTT (radix-256 Cooley-Tukey).
 
-| Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs. Baseline |
+| Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs. Naive |
 |---|---|---|---|---|
-| bellperson (reference) | — | — | — | 1.0× |
-| Naive GPU NTT (radix-2) | 5.94 ms | 26.3 ms | | |
-| + FF_mul optimization | | | | |
+| bellperson (reference) | — | — | — | — |
+| Naive GPU NTT (radix-2) | 7.13 ms | 31.2 ms | | 1.0× |
+| Radix-256 shared-mem NTT | 5.99 ms | 26.5 ms | | **1.18×** |
 | + Async pipeline | | | | |
 | **cuda-zkp-ntt (full)** | | | | |
 
-*Phase 4 baseline numbers from RTX 3060. Remaining cells populated as optimizations land.*
+*RTX 3060 Laptop GPU, Release build, 5-repetition mean. Phase 5 complete.*
 
 ---
 
@@ -75,7 +75,7 @@ cuda-zkp-ntt/
 ├── src/
 │   ├── ff_mul.cu              # Montgomery multiplication kernels
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
-│   ├── ntt_optimized.cu       # Radix-256 NTT with shared memory twiddles
+│   ├── ntt_optimized.cu       # Radix-256 NTT: 8 fused stages in shared memory
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/

@@ -133,9 +133,9 @@ results/
 ### NTT (Cooley-Tukey, radix-256)
 - Combines 8 radix-2 stages into one shared-memory kernel launch
 - Twiddle factors: precomputed table in global memory, cached in L1
-- Thread mapping: 1 thread per butterfly pair within a block
-- Block size: 128 or 256 threads (tune per SM occupancy)
-- Shared memory usage: 2 × blockDim elements × sizeof(FpElement)
+- Thread mapping: 1 thread per butterfly pair within a block (128 threads)
+- Block size: 128 threads / 256 elements (8 KB shared memory per block)
+- Remaining stages (8..log_n-1) use per-stage global butterfly kernel
 
 ---
 
