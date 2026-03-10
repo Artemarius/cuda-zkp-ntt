@@ -10,64 +10,113 @@
 | Property | This System | ZKProphet (A40) |
 |---|---|---|
 | GPU | RTX 3060 | NVIDIA A40 |
-| SMs | 28 | 84 |
+| SMs | 30 | 84 |
 | INT32/cycle/SM | 64 (4 SMSPs × 16) | 64 (same Ampere) |
 | DRAM BW | ~360 GB/s | ~696 GB/s |
 | VRAM | 6 GB | 48 GB |
 
-Per-SM metrics (latency, stall breakdown, instruction mix) are **directly comparable**. Absolute throughput scales with SM count: RTX 3060 should be ~3× slower on total throughput but match on per-SM microarchitecture metrics.
+Per-SM metrics (latency, stall breakdown, instruction mix) are **directly comparable**. Absolute throughput scales with SM count: RTX 3060 should be ~2.8× slower on total throughput but match on per-SM microarchitecture metrics.
 
 ---
 
 ## Section 1 — Finite Field Baseline (Direction B Motivation)
 
-### 1.1 Roofline Analysis
+### 1.1 Speed of Light Analysis
 
-**Screenshot**: `screenshots/roofline_ff_baseline.png`
-**Method**: Nsight Compute roofline section, integer instruction weighting (IMAD = 2, other = 1)
+**Screenshots**: `screenshots/Screenshot_151.png` (GPU Speed of Light + Memory Workload)
+**Method**: Nsight Compute `--set full`, ff_mul_throughput_kernel, 2^20 elements
 
-| Kernel | Arithmetic Intensity | Performance | % of INT32 Ceiling |
-|---|---|---|---|
-| ff_add_kernel | TBD | TBD | TBD |
-| ff_mul_kernel (naive) | TBD | TBD | TBD |
-| ff_mul_kernel (CIOS) | TBD | TBD | TBD |
+| Metric | Value |
+|---|---|
+| Compute (SM) Throughput | 64.30% |
+| Memory Throughput | **91.04%** (DRAM-bound) |
+| L1/TEX Throughput | 55.90% |
+| L2 Cache Throughput | 50.55% |
+| SM Frequency | 899.89 MHz |
+| Duration | 338.05 us |
+| Memory Throughput | 304.10 GB/s |
+| FP32 / FP64 utilization | 0% / 0% (pure integer) |
 
-**ZKProphet reference** (A40): FF_mul reaches 60% of INT32 ceiling, FF_add reaches 40%.
+**Key finding**: The kernel is **memory-bound** (91% DRAM vs 64% compute), despite being a compute-heavy integer kernel. This is caused by severe memory access inefficiency (see Section 1.4).
 
-**Expected finding**: Our RTX 3060 numbers should closely match, as roofline % is independent of SM count.
+**ZKProphet comparison**: ZKProphet reports FF_mul reaching ~60% of INT32 ceiling on A40. Our 64% compute throughput on RTX 3060 is consistent — the kernel is well-optimized computationally, but memory access patterns dominate wall-clock time.
 
 ---
 
-### 1.2 Warp Stall Breakdown (FF_mul Baseline)
+### 1.2 Scheduler & Warp Statistics
 
-**Screenshot**: `screenshots/warp_stalls_ff_mul.png`
-**Method**: `collect_metrics.sh` → warp stall metrics for naive FF_mul kernel
+**Screenshot**: `screenshots/Screenshot_152.png` (Scheduler + Warp State + Instruction Statistics)
+**Method**: Nsight Compute `--set full`
 
-| Stall Source | Cycles (RTX 3060) | ZKProphet A40 |
+| Metric | RTX 3060 | ZKProphet A40 |
 |---|---|---|
-| Stall Wait | TBD | ~4 cycles |
-| Selected | TBD | ~1 cycle |
-| Stall Math Throttle | TBD | ~0.5 cycles (small at 2 warps/SMSP) |
-| Stall Not Selected | TBD | ~0.7 cycles |
-| Stall Other | TBD | small |
-| **Total** | TBD | **~6.2 cycles** |
+| Active Warps / Scheduler | 9.98 / 12 | - |
+| Eligible Warps / Cycle | 1.46 | - |
+| No Eligible % | **52.43%** | - |
+| One or More Eligible % | 47.57% | - |
+| Issue rate | 1 inst / 2.1 cycles | - |
+| Warp Cycles Per Issued Inst | 20.97 | ~6.2 |
+| Avg Active Threads Per Warp | 32.00 | - |
+| Not Predicated Off Threads | 31.88 | - |
 
-**Interpretation**: The dominant stall is `Stall_Wait` — the 4-cycle IMAD instruction latency. This is a fixed architectural constant; it cannot be reduced by adding more warps. The latency per FF_mul in cycles should be ~2660 (matching ZKProphet Table IV for GPU).
+**Interpretation**: Over half the cycles have zero eligible warps — warps are stalled waiting on memory, not on IMAD latency (which would show as `Stall_Math_Throttle`). The 20.97 cycles per issued instruction is much higher than ZKProphet's ~6.2, suggesting our memory access pattern is the dominant bottleneck, not compute latency.
+
+### 1.3 Occupancy & Launch Configuration
+
+**Screenshot**: `screenshots/Screenshot_153.png` (Occupancy + Source Counters)
+
+| Metric | Value |
+|---|---|
+| Theoretical Occupancy | 100% (48 warps/SM) |
+| Achieved Occupancy | **83.91%** (40.28 warps/SM) |
+| Registers / Thread | **38** |
+| Block Limit (registers) | 6 blocks/SM |
+| Block Limit (warps) | 6 blocks/SM |
+| Waves Per SM | 22.76 |
+| Branch Efficiency | **100%** |
+| Divergent Branches | 0.03 |
+
+Occupancy is good (84%). Register usage (38/thread) is the limiter. Branch efficiency is effectively perfect — the conditional reduction in ff_add/ff_sub/ff_mul does not cause divergence.
+
+### 1.4 Memory Access Pattern (Critical Finding)
+
+**Screenshot**: `screenshots/Screenshot_153.png` (Source Counters — L2 Excessive Sectors)
+
+| Metric | Value |
+|---|---|
+| Global Load utilization | **4 / 32 bytes per sector (12.5%)** |
+| Global Store utilization | 16 / 32 bytes per sector (50%) |
+| Excessive sectors | **15,728,640 / 18,874,368 (83%)** |
+| L1/TEX Hit Rate | 81.54% |
+| L2 Hit Rate | 39.18% |
+| Est. Speedup from fixing | **80.48%** (ncu estimate) |
+
+All hotspots point to `ff_arithmetic.cuh:191` (inside ff_mul CIOS inner loops). Each thread accesses `a[tid].limbs[j]`, meaning adjacent threads hit addresses 32 bytes apart instead of 4 bytes. This is the **Array-of-Structures (AoS) stride problem**.
+
+With 256 threads per block, each warp of 32 threads accessing `limbs[0]` touches 32 × 32 = 1024 bytes across 32 cache lines, but a coalesced access would only need 32 × 4 = 128 bytes (4 cache lines). This 8× amplification explains why the kernel is memory-bound despite being compute-intensive.
+
+**Implication for Phase 3**: Before pursuing IADD3 instruction optimization, addressing the memory access pattern (SoA layout, shared-memory transpose, or vectorized loads) could yield a much larger speedup — ncu estimates 80% potential improvement from fixing coalescing alone.
 
 ---
 
-### 1.3 Instruction Mix
+### 1.5 Instruction Mix (Baseline)
 
-**Screenshot**: `screenshots/inst_mix_before_after.png`
+**Screenshots**: `screenshots/Screenshot_151.png`, `screenshots/Screenshot_152.png`
 
-| Kernel | IMAD % | IADD3 % | SHF % | Branch Eff. |
-|---|---|---|---|---|
-| ff_mul naive | TBD | TBD | TBD | TBD |
-| ff_mul CIOS PTX | TBD | TBD | TBD | TBD |
-| ff_add naive | TBD | TBD | TBD | TBD |
-| ff_add branchless | TBD | TBD | TBD | TBD |
+| Metric | Value | ZKProphet A40 |
+|---|---|---|
+| Highest pipe | **ALU 44.8%** | IMAD-dominated |
+| FP32 | 0% | 0% |
+| FP64 | 0% | 0% |
+| SM Busy | 65.89% | - |
+| Issue Slots Busy | 47.18% | - |
+| Executed IPC (active) | 1.88 | - |
+| Branch Efficiency | 100% | 52.5% (FF_add) |
+
+The ALU (integer) pipe at 44.8% confirms an IMAD-dominated workload, consistent with ZKProphet's finding that FF_mul is 70.8% IMAD instructions. Notably, our branch efficiency (100%) is significantly better than ZKProphet's 52.5% for FF_add — likely because nvcc generates predicated code for our conditional reduction rather than true branches.
 
 **ZKProphet reference**: FF_mul is 70.8% IMAD. FF_add branch efficiency = 52.5%.
+Detailed SASS-level instruction mix breakdown deferred to Phase 3 (requires `--section InstructionStats` with individual opcode counters).
 
 ---
 
@@ -174,15 +223,16 @@ At scale 2²², expected transfer time ~Xms, compute ~Yms (from Section 3.2). If
 
 ## Key Findings Summary
 
-*(Populate after profiling is complete)*
+*(Partially populated — Phase 2 baseline complete, Phases 3-7 TBD)*
 
-1. **FF_mul instruction mix**: TBD% IMAD (ZKProphet: 70.8%)
-2. **Cycles per FF_mul**: TBD (ZKProphet: 2656 on A40)
-3. **FF_add branch efficiency**: TBD% (ZKProphet: 52.5%)
-4. **Branchless FF_add improvement**: TBDcycles → TBD cycles
-5. **NTT transfer vs compute ratio**: TBD (ZKProphet: transfer >> compute)
-6. **Pipeline latency improvement**: TBD× at scale 2²²
-7. **Combined optimization vs bellperson**: TBD×
+1. **FF_mul instruction mix**: ALU pipe 44.8% (integer-dominated, IMAD) — ZKProphet: 70.8% IMAD
+2. **FF_mul throughput**: 2.9 Gops/s at 4M elements on RTX 3060
+3. **FF_mul bottleneck**: DRAM at 91% (memory-bound due to 83% excessive sectors from AoS access)
+4. **FF_add branch efficiency**: **100%** (ZKProphet: 52.5% — our nvcc generates predicated code)
+5. **Achieved occupancy**: 83.9% (38 registers/thread)
+6. **NTT transfer vs compute ratio**: TBD (ZKProphet: transfer >> compute)
+7. **Pipeline latency improvement**: TBD× at scale 2²²
+8. **Combined optimization vs bellperson**: TBD×
 
 ---
 

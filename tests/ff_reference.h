@@ -1,10 +1,9 @@
 // tests/ff_reference.h
 // CPU-only reference implementation of BLS12-381 scalar field arithmetic
-// Plain C++17, no CUDA. Uses 4 × uint64_t limbs for simpler carry handling.
+// Plain C++17, no CUDA. Uses 4 x uint64_t limbs for simpler carry handling.
 // Used as the correctness oracle for GPU implementations.
 //
-// NOTE: Requires __uint128_t (GCC / Clang). Not available on MSVC.
-// This is acceptable since tests build on WSL2 (GCC 11).
+// Portable: uses unsigned __int128 on GCC/Clang, MSVC intrinsics on MSVC.
 
 #pragma once
 #include <cstdint>
@@ -13,11 +12,81 @@
 #include <vector>
 #include <cassert>
 
+// ─── 128-bit Arithmetic Portability Layer ────────────────────────────────────
+
+#ifdef _MSC_VER
+#include <intrin.h>
+
+namespace ff_ref {
+namespace detail {
+
+struct u128 {
+    uint64_t lo, hi;
+
+    u128() : lo(0), hi(0) {}
+    u128(uint64_t v) : lo(v), hi(0) {}
+    u128(uint64_t lo_, uint64_t hi_) : lo(lo_), hi(hi_) {}
+
+    explicit operator uint64_t() const { return lo; }
+    explicit operator bool() const { return lo || hi; }
+};
+
+inline u128 operator+(u128 a, u128 b) {
+    u128 r;
+    unsigned char c = _addcarry_u64(0, a.lo, b.lo, &r.lo);
+    _addcarry_u64(c, a.hi, b.hi, &r.hi);
+    return r;
+}
+
+inline u128& operator+=(u128& a, u128 b) { a = a + b; return a; }
+
+inline u128 operator-(u128 a, u128 b) {
+    u128 r;
+    unsigned char borrow = _subborrow_u64(0, a.lo, b.lo, &r.lo);
+    _subborrow_u64(borrow, a.hi, b.hi, &r.hi);
+    return r;
+}
+
+inline u128 operator*(u128 a, u128 b) {
+    u128 r;
+    r.lo = _umul128(a.lo, b.lo, &r.hi);
+    r.hi += a.hi * b.lo + a.lo * b.hi;  // cross terms (mod 2^128)
+    return r;
+}
+
+inline u128 operator>>(u128 a, int n) {
+    if (n == 64) return u128(a.hi, 0);
+    if (n == 0) return a;
+    return u128((a.lo >> n) | (a.hi << (64 - n)), a.hi >> n);
+}
+
+inline u128& operator>>=(u128& a, int n) { a = a >> n; return a; }
+
+inline u128 operator&(u128 a, uint64_t mask) {
+    return u128(a.lo & mask, 0);
+}
+
+} // namespace detail
+
+using uint128_t = detail::u128;
+
+} // namespace ff_ref
+
+#else // GCC / Clang
+
+namespace ff_ref {
+using uint128_t = unsigned __int128;
+} // namespace ff_ref
+
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 namespace ff_ref {
 
-// ─── BLS12-381 Scalar Field Constants (4 × uint64_t, little-endian) ─────────
+// ─── BLS12-381 Scalar Field Constants (4 x uint64_t, little-endian) ─────────
 //
-// Derived from 8 × uint32_t little-endian representation:
+// Derived from 8 x uint32_t little-endian representation:
 //   {0x00000001, 0xffffffff, 0xfffe5bfe, 0x53bda402,
 //    0x09a1d805, 0x3339d808, 0x299d7d48, 0x73eda753}
 //
@@ -63,7 +132,7 @@ struct FpRef {
     bool operator==(const FpRef& o) const { return limbs == o.limbs; }
     bool operator!=(const FpRef& o) const { return limbs != o.limbs; }
 
-    // Convert from 8 × uint32_t (GPU format) to 4 × uint64_t
+    // Convert from 8 x uint32_t (GPU format) to 4 x uint64_t
     static FpRef from_u32(const uint32_t w[8]) {
         FpRef r;
         for (int i = 0; i < 4; ++i)
@@ -71,7 +140,7 @@ struct FpRef {
         return r;
     }
 
-    // Convert to 8 × uint32_t (GPU format)
+    // Convert to 8 x uint32_t (GPU format)
     void to_u32(uint32_t w[8]) const {
         for (int i = 0; i < 4; ++i) {
             w[2*i]   = static_cast<uint32_t>(limbs[i]);
@@ -94,16 +163,16 @@ inline bool geq(const std::array<uint64_t, 4>& a, const std::array<uint64_t, 4>&
 
 inline FpRef fp_add(const FpRef& a, const FpRef& b) {
     FpRef r;
-    unsigned __int128 carry = 0;
+    uint128_t carry = 0;
     for (int i = 0; i < 4; ++i) {
-        carry += static_cast<unsigned __int128>(a.limbs[i]) + b.limbs[i];
+        carry += uint128_t(a.limbs[i]) + b.limbs[i];
         r.limbs[i] = static_cast<uint64_t>(carry);
         carry >>= 64;
     }
     if (carry || geq(r.limbs, MOD)) {
-        unsigned __int128 borrow = 0;
+        uint128_t borrow = 0;
         for (int i = 0; i < 4; ++i) {
-            borrow = static_cast<unsigned __int128>(r.limbs[i]) - MOD[i] - borrow;
+            borrow = uint128_t(r.limbs[i]) - MOD[i] - borrow;
             r.limbs[i] = static_cast<uint64_t>(borrow);
             borrow = (borrow >> 64) & 1;
         }
@@ -115,16 +184,16 @@ inline FpRef fp_add(const FpRef& a, const FpRef& b) {
 
 inline FpRef fp_sub(const FpRef& a, const FpRef& b) {
     FpRef r;
-    unsigned __int128 borrow = 0;
+    uint128_t borrow = 0;
     for (int i = 0; i < 4; ++i) {
-        borrow = static_cast<unsigned __int128>(a.limbs[i]) - b.limbs[i] - borrow;
+        borrow = uint128_t(a.limbs[i]) - b.limbs[i] - borrow;
         r.limbs[i] = static_cast<uint64_t>(borrow);
         borrow = (borrow >> 64) & 1;
     }
     if (borrow) {
-        unsigned __int128 carry = 0;
+        uint128_t carry = 0;
         for (int i = 0; i < 4; ++i) {
-            carry += static_cast<unsigned __int128>(r.limbs[i]) + MOD[i];
+            carry += uint128_t(r.limbs[i]) + MOD[i];
             r.limbs[i] = static_cast<uint64_t>(carry);
             carry >>= 64;
         }
@@ -141,9 +210,9 @@ inline FpRef fp_mul(const FpRef& a, const FpRef& b) {
 
     for (int i = 0; i < 4; ++i) {
         // T += a * b[i]
-        unsigned __int128 carry = 0;
+        uint128_t carry = 0;
         for (int j = 0; j < 4; ++j) {
-            carry += static_cast<unsigned __int128>(a.limbs[j]) * b.limbs[i] + T[j];
+            carry += uint128_t(a.limbs[j]) * b.limbs[i] + T[j];
             T[j] = static_cast<uint64_t>(carry);
             carry >>= 64;
         }
@@ -153,13 +222,11 @@ inline FpRef fp_mul(const FpRef& a, const FpRef& b) {
         uint64_t m = T[0] * P_INV64;
 
         // T = (T + m * p) >> 64
-        carry = static_cast<unsigned __int128>(T[0]) +
-                static_cast<unsigned __int128>(m) * MOD[0];
+        carry = uint128_t(T[0]) + uint128_t(m) * MOD[0];
         carry >>= 64;
 
         for (int j = 1; j < 4; ++j) {
-            carry += static_cast<unsigned __int128>(T[j]) +
-                     static_cast<unsigned __int128>(m) * MOD[j];
+            carry += uint128_t(T[j]) + uint128_t(m) * MOD[j];
             T[j-1] = static_cast<uint64_t>(carry);
             carry >>= 64;
         }
@@ -172,9 +239,9 @@ inline FpRef fp_mul(const FpRef& a, const FpRef& b) {
     for (int i = 0; i < 4; ++i) r.limbs[i] = T[i];
 
     if (T[4] || geq(r.limbs, MOD)) {
-        unsigned __int128 borrow = 0;
+        uint128_t borrow = 0;
         for (int i = 0; i < 4; ++i) {
-            borrow = static_cast<unsigned __int128>(r.limbs[i]) - MOD[i] - borrow;
+            borrow = uint128_t(r.limbs[i]) - MOD[i] - borrow;
             r.limbs[i] = static_cast<uint64_t>(borrow);
             borrow = (borrow >> 64) & 1;
         }
@@ -347,7 +414,7 @@ inline void ntt_inverse_reference(std::vector<FpRef>& data, size_t n) {
         data[i] = fp_mul(data[i], n_inv);
 }
 
-// Naive DFT O(n^2) — for small-n cross-validation against Cooley-Tukey.
+// Naive DFT O(n^2) -- for small-n cross-validation against Cooley-Tukey.
 // data: n elements in Montgomery form.  Returns new vector (not in-place).
 inline std::vector<FpRef> dft_naive(const std::vector<FpRef>& data, size_t n) {
     assert(data.size() >= n);

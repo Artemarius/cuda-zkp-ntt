@@ -71,12 +71,18 @@ add_executable(bench_ntt
     benchmarks/bench_ntt.cu
 )
 target_link_libraries(bench_ntt PRIVATE zkp_ntt_core benchmark::benchmark)
+set_target_properties(bench_ntt PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
 # ─── Finite-Field Microbenchmark ──────────────────────────────────────────────
 add_executable(ff_microbench
     benchmarks/ff_microbench.cu
 )
 target_link_libraries(ff_microbench PRIVATE zkp_ntt_core benchmark::benchmark)
+set_target_properties(ff_microbench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
 # ─── Clean Profiling Binary ───────────────────────────────────────────────────
 # Minimal binary with command-line mode/size args for Nsight Compute
@@ -84,6 +90,9 @@ add_executable(ntt_profile
     src/benchmark.cu
 )
 target_link_libraries(ntt_profile PRIVATE zkp_ntt_core)
+set_target_properties(ntt_profile PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
 # ─── Print Configuration Summary ──────────────────────────────────────────────
 message(STATUS "")

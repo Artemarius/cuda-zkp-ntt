@@ -1,6 +1,6 @@
 // src/benchmark.cu
 // Minimal profiling binary for Nsight Compute / Nsight Systems
-// Phase 1: stub with device query. Profiling modes added in Phase 7.
+// Supports FF arithmetic profiling (Phase 2) and NTT profiling (Phase 7).
 
 #include "ntt.cuh"
 #include "ff_arithmetic.cuh"
@@ -9,15 +9,96 @@
 #include <cstdlib>
 #include <cstring>
 
+// Kernel declarations from ff_mul.cu
+extern __global__ void ff_mul_throughput_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_add_throughput_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_sub_throughput_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_sqr_throughput_kernel(
+    const FpElement* __restrict__ a,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
 static void print_usage(const char* prog) {
-    fprintf(stderr, "Usage: %s [--mode naive|optimized|async] [--size N]\n", prog);
-    fprintf(stderr, "  --mode   NTT variant to profile (default: naive)\n");
-    fprintf(stderr, "  --size   log2 of NTT size, e.g. 20 for 2^20 (default: 20)\n");
+    fprintf(stderr, "Usage: %s --mode <mode> [--size N]\n", prog);
+    fprintf(stderr, "  --mode   ff_mul | ff_add | ff_sub | ff_sqr | naive | optimized | async\n");
+    fprintf(stderr, "  --size   log2 of element count (default: 20)\n");
+}
+
+// ─── FF Profiling (Phase 2) ─────────────────────────────────────────────────
+
+static void profile_ff(const char* mode, uint32_t n) {
+    size_t bytes = (size_t)n * sizeof(FpElement);
+
+    // Host data: deterministic nonzero pattern
+    FpElement* h_a = (FpElement*)malloc(bytes);
+    FpElement* h_b = (FpElement*)malloc(bytes);
+    for (uint32_t i = 0; i < n; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            h_a[i].limbs[j] = i * 8 + j + 1;
+            h_b[i].limbs[j] = (i + 1) * 8 + j + 3;
+        }
+    }
+
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+
+    // Warmup (not profiled by ncu --launch-skip)
+    if (strcmp(mode, "ff_mul") == 0) {
+        ff_mul_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_add") == 0) {
+        ff_add_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_sub") == 0) {
+        ff_sub_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_sqr") == 0) {
+        ff_sqr_throughput_kernel<<<blocks, threads>>>(d_a, d_out, n);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Profiled kernel launch
+    printf("Launching %s kernel: %d blocks x %d threads, %u elements\n", mode, blocks, threads, n);
+    if (strcmp(mode, "ff_mul") == 0) {
+        ff_mul_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_add") == 0) {
+        ff_add_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_sub") == 0) {
+        ff_sub_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+    } else if (strcmp(mode, "ff_sqr") == 0) {
+        ff_sqr_throughput_kernel<<<blocks, threads>>>(d_a, d_out, n);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("Done.\n");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+    free(h_a);
+    free(h_b);
 }
 
 int main(int argc, char** argv) {
-    // Parse command line
-    const char* mode_str = "naive";
+    const char* mode_str = "ff_mul";
     int log_size = 20;
 
     for (int i = 1; i < argc; ++i) {
@@ -31,21 +112,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Print device info
     int device;
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
+    uint32_t n = 1u << log_size;
     printf("=== ntt_profile ===\n");
     printf("Device: %s (SM %d.%d)\n", prop.name, prop.major, prop.minor);
     printf("SMs: %d, VRAM: %zu MB\n", prop.multiProcessorCount,
            prop.totalGlobalMem / (1024 * 1024));
-    printf("Mode: %s, Size: 2^%d = %u elements\n", mode_str, log_size, 1u << log_size);
+    printf("Mode: %s, Size: 2^%d = %u elements\n", mode_str, log_size, n);
     printf("\n");
 
-    // TODO: Phase 7 — allocate, run NTT, measure
-    printf("Profiling stub — implement in Phase 7.\n");
+    if (strncmp(mode_str, "ff_", 3) == 0) {
+        profile_ff(mode_str, n);
+    } else {
+        // NTT modes — Phase 7
+        printf("NTT profiling not yet implemented (Phase 7).\n");
+    }
 
     return 0;
 }

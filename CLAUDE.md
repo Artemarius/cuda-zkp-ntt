@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 2 — Finite Field Foundation** (Phase 1 complete)
+Current phase: **Phase 3 — Direction B: IADD3-Path FF_mul** (Phase 2 complete)
 
 ---
 
