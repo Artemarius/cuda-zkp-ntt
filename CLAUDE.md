@@ -85,7 +85,7 @@ include/
   pipeline.cuh        — AsyncNTTPipeline class interface
 
 src/
-  ff_mul.cu           — Montgomery multiplication CUDA kernels
+  ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
   ntt_naive.cu        — Radix-2 NTT, no optimization (correctness baseline)
   ntt_optimized.cu    — Radix-256 shared-memory NTT
   ntt_async.cu        — Double-buffered async pipeline NTT
@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 3 — Direction B: IADD3-Path FF_mul** (Phase 2 complete)
+Current phase: **Phase 3 — Direction B: IADD3-Path FF_mul** (in progress, SoA + branchless done)
 
 ---
 

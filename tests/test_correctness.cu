@@ -19,6 +19,18 @@ extern __global__ void ff_add_throughput_kernel(const FpElement* __restrict__ a,
 extern __global__ void ff_sub_throughput_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sqr_throughput_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
 
+// SoA kernel declarations
+extern __global__ void ff_add_soa_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, uint32_t* __restrict__ out, uint32_t n);
+extern __global__ void ff_sub_soa_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, uint32_t* __restrict__ out, uint32_t n);
+extern __global__ void ff_mul_soa_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, uint32_t* __restrict__ out, uint32_t n);
+extern __global__ void ff_sqr_soa_kernel(const uint32_t* __restrict__ a, uint32_t* __restrict__ out, uint32_t n);
+
+// v2 (branchless) kernel declarations
+extern __global__ void ff_mul_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_add_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_sub_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_sqr_v2_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
+
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
 static int tests_run = 0;
@@ -302,6 +314,291 @@ void test_ff_sqr_gpu() {
     CUDA_CHECK(cudaFree(d_out));
 }
 
+// ─── Phase 3: v2 (branchless) Kernel Correctness Tests ──────────────────────
+
+// Generic helper: test a binary v2 kernel against CPU reference
+template<typename KernelFn, typename RefFn>
+void test_v2_binary(const char* name, KernelFn kernel, RefFn ref_op) {
+    printf("%s...\n", name);
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_b(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_random_fp(i * 2 + 1);
+        h_b[i] = make_random_fp(i * 2 + 1000);
+    }
+
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef ref_b = ff_ref::FpRef::from_u32(h_b[i].limbs);
+        ff_ref::FpRef expected = ref_op(ref_a, ref_b);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, name);
+    printf("  %s: %d/%u matched\n", name, pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_mul_v2_gpu() {
+    test_v2_binary("test_ff_mul_v2_gpu", ff_mul_v2_kernel, ff_ref::fp_mul);
+}
+
+void test_ff_add_v2_gpu() {
+    test_v2_binary("test_ff_add_v2_gpu", ff_add_v2_kernel, ff_ref::fp_add);
+}
+
+void test_ff_sub_v2_gpu() {
+    test_v2_binary("test_ff_sub_v2_gpu", ff_sub_v2_kernel, ff_ref::fp_sub);
+}
+
+void test_ff_sqr_v2_gpu() {
+    printf("test_ff_sqr_v2_gpu...\n");
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i)
+        h_a[i] = make_random_fp(i * 2 + 1);
+
+    FpElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ff_sqr_v2_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef expected = ff_ref::fp_sqr(ref_a);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, "ff_sqr_v2 GPU vs CPU reference mismatch");
+    printf("  ff_sqr_v2: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── SoA Helpers ─────────────────────────────────────────────────────────────
+
+static void aos_to_soa(const std::vector<FpElement>& aos,
+                        std::vector<uint32_t>& soa, uint32_t n) {
+    soa.resize(8u * n);
+    for (uint32_t i = 0; i < n; ++i)
+        for (int j = 0; j < 8; ++j)
+            soa[j * n + i] = aos[i].limbs[j];
+}
+
+static void soa_to_aos(const std::vector<uint32_t>& soa,
+                        std::vector<FpElement>& aos, uint32_t n) {
+    aos.resize(n);
+    for (uint32_t i = 0; i < n; ++i)
+        for (int j = 0; j < 8; ++j)
+            aos[i].limbs[j] = soa[j * n + i];
+}
+
+// ─── Phase 3: SoA Kernel Correctness Tests ──────────────────────────────────
+
+void test_ff_mul_soa_gpu() {
+    printf("test_ff_mul_soa_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_b(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_random_fp(i * 2 + 1);
+        h_b[i] = make_random_fp(i * 2 + 1000);
+    }
+
+    std::vector<uint32_t> soa_a, soa_b;
+    aos_to_soa(h_a, soa_a, N);
+    aos_to_soa(h_b, soa_b, N);
+
+    const size_t soa_bytes = 8u * N * sizeof(uint32_t);
+    uint32_t *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, soa_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, soa_a.data(), soa_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, soa_b.data(), soa_bytes, cudaMemcpyHostToDevice));
+
+    ff_mul_soa_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint32_t> soa_out(8u * N);
+    CUDA_CHECK(cudaMemcpy(soa_out.data(), d_out, soa_bytes, cudaMemcpyDeviceToHost));
+
+    std::vector<FpElement> h_out;
+    soa_to_aos(soa_out, h_out, N);
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef ref_b = ff_ref::FpRef::from_u32(h_b[i].limbs);
+        ff_ref::FpRef expected = ff_ref::fp_mul(ref_a, ref_b);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, "ff_mul SoA GPU vs CPU reference mismatch");
+    printf("  ff_mul_soa: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_add_soa_gpu() {
+    printf("test_ff_add_soa_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_b(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_random_fp(i * 2 + 1);
+        h_b[i] = make_random_fp(i * 2 + 1000);
+    }
+
+    std::vector<uint32_t> soa_a, soa_b;
+    aos_to_soa(h_a, soa_a, N);
+    aos_to_soa(h_b, soa_b, N);
+
+    const size_t soa_bytes = 8u * N * sizeof(uint32_t);
+    uint32_t *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, soa_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, soa_a.data(), soa_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, soa_b.data(), soa_bytes, cudaMemcpyHostToDevice));
+
+    ff_add_soa_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint32_t> soa_out(8u * N);
+    CUDA_CHECK(cudaMemcpy(soa_out.data(), d_out, soa_bytes, cudaMemcpyDeviceToHost));
+
+    std::vector<FpElement> h_out;
+    soa_to_aos(soa_out, h_out, N);
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef ref_b = ff_ref::FpRef::from_u32(h_b[i].limbs);
+        ff_ref::FpRef expected = ff_ref::fp_add(ref_a, ref_b);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, "ff_add SoA GPU vs CPU reference mismatch");
+    printf("  ff_add_soa: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_sub_soa_gpu() {
+    printf("test_ff_sub_soa_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_b(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_random_fp(i * 2 + 1);
+        h_b[i] = make_random_fp(i * 2 + 1000);
+    }
+
+    std::vector<uint32_t> soa_a, soa_b;
+    aos_to_soa(h_a, soa_a, N);
+    aos_to_soa(h_b, soa_b, N);
+
+    const size_t soa_bytes = 8u * N * sizeof(uint32_t);
+    uint32_t *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, soa_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, soa_a.data(), soa_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, soa_b.data(), soa_bytes, cudaMemcpyHostToDevice));
+
+    ff_sub_soa_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint32_t> soa_out(8u * N);
+    CUDA_CHECK(cudaMemcpy(soa_out.data(), d_out, soa_bytes, cudaMemcpyDeviceToHost));
+
+    std::vector<FpElement> h_out;
+    soa_to_aos(soa_out, h_out, N);
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef ref_b = ff_ref::FpRef::from_u32(h_b[i].limbs);
+        ff_ref::FpRef expected = ff_ref::fp_sub(ref_a, ref_b);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, "ff_sub SoA GPU vs CPU reference mismatch");
+    printf("  ff_sub_soa: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_sqr_soa_gpu() {
+    printf("test_ff_sqr_soa_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_random_fp(i * 2 + 1);
+    }
+
+    std::vector<uint32_t> soa_a;
+    aos_to_soa(h_a, soa_a, N);
+
+    const size_t soa_bytes = 8u * N * sizeof(uint32_t);
+    uint32_t *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, soa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, soa_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, soa_a.data(), soa_bytes, cudaMemcpyHostToDevice));
+
+    ff_sqr_soa_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint32_t> soa_out(8u * N);
+    CUDA_CHECK(cudaMemcpy(soa_out.data(), d_out, soa_bytes, cudaMemcpyDeviceToHost));
+
+    std::vector<FpElement> h_out;
+    soa_to_aos(soa_out, h_out, N);
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef ref_a = ff_ref::FpRef::from_u32(h_a[i].limbs);
+        ff_ref::FpRef expected = ff_ref::fp_sqr(ref_a);
+        ff_ref::FpRef gpu_result = ff_ref::FpRef::from_u32(h_out[i].limbs);
+        if (gpu_result == expected) ++pass_count;
+    }
+    TEST_ASSERT(pass_count == (int)N, "ff_sqr SoA GPU vs CPU reference mismatch");
+    printf("  ff_sqr_soa: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -320,6 +617,18 @@ int main() {
     test_ff_sub_gpu();
     test_ff_mul_gpu();
     test_ff_sqr_gpu();
+
+    // Phase 3: v2 (branchless reduction) kernel correctness tests
+    test_ff_mul_v2_gpu();
+    test_ff_add_v2_gpu();
+    test_ff_sub_v2_gpu();
+    test_ff_sqr_v2_gpu();
+
+    // Phase 3: SoA kernel correctness tests
+    test_ff_add_soa_gpu();
+    test_ff_sub_soa_gpu();
+    test_ff_mul_soa_gpu();
+    test_ff_sqr_soa_gpu();
 
     // Phase 4: NTT correctness tests (GPU NTT vs CPU DFT reference)
 

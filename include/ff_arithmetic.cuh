@@ -231,6 +231,205 @@ FpElement ff_mul(const FpElement& a, const FpElement& b) {
     return result;
 }
 
+// ─── ff_mul_ptx: CIOS Montgomery mul with branchless conditional reduction ──
+// Same CIOS loop as ff_mul (compiler generates good carry chains from uint64_t).
+// Key optimization: branchless final reduction using PTX sub.cc chain + lop3 select.
+// Eliminates divergent branches in the comparison and conditional subtract.
+
+__device__ __forceinline__
+FpElement ff_mul_ptx(const FpElement& a, const FpElement& b) {
+    uint32_t T[10] = {0};
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        // Phase 1: T += a * b[i]
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint64_t prod = (uint64_t)a.limbs[j] * (uint64_t)b.limbs[i]
+                          + (uint64_t)T[j] + (uint64_t)carry;
+            T[j] = (uint32_t)prod;
+            carry = (uint32_t)(prod >> 32);
+        }
+        uint64_t sum = (uint64_t)T[8] + (uint64_t)carry;
+        T[8] = (uint32_t)sum;
+        T[9] = (uint32_t)(sum >> 32);
+
+        // Phase 2: Montgomery reduction
+        uint32_t m = T[0] * BLS12_381_P_INV;
+
+        uint64_t carry2 = (uint64_t)T[0] + (uint64_t)m * (uint64_t)BLS12_381_MODULUS[0];
+        uint32_t C = (uint32_t)(carry2 >> 32);
+
+        #pragma unroll
+        for (int j = 1; j < 8; ++j) {
+            carry2 = (uint64_t)T[j] + (uint64_t)m * (uint64_t)BLS12_381_MODULUS[j] + (uint64_t)C;
+            T[j - 1] = (uint32_t)carry2;
+            C = (uint32_t)(carry2 >> 32);
+        }
+
+        sum = (uint64_t)T[8] + (uint64_t)C;
+        T[7] = (uint32_t)sum;
+        T[8] = T[9] + (uint32_t)(sum >> 32);
+        T[9] = 0;
+    }
+
+    // ─── Branchless conditional reduction ────────────────────────────────────
+    // Compute S = T - p. If T >= p (no borrow), use S; else keep T.
+    // All CC-dependent instructions MUST be in a single asm block (CC is not
+    // preserved between separate asm() statements).
+    uint32_t S[8];
+    uint32_t mask;
+    asm("sub.cc.u32   %0, %9,  %18;\n\t"
+        "subc.cc.u32  %1, %10, %19;\n\t"
+        "subc.cc.u32  %2, %11, %20;\n\t"
+        "subc.cc.u32  %3, %12, %21;\n\t"
+        "subc.cc.u32  %4, %13, %22;\n\t"
+        "subc.cc.u32  %5, %14, %23;\n\t"
+        "subc.cc.u32  %6, %15, %24;\n\t"
+        "subc.cc.u32  %7, %16, %25;\n\t"
+        "subc.u32     %8, %17, 0;\n\t"    // mask = T[8] - 0 - borrow
+        "shr.s32      %8, %8, 31;"         // normalize to 0xFFFFFFFF or 0
+        : "=r"(S[0]), "=r"(S[1]), "=r"(S[2]), "=r"(S[3]),
+          "=r"(S[4]), "=r"(S[5]), "=r"(S[6]), "=r"(S[7]),
+          "=r"(mask)
+        : "r"(T[0]), "r"(T[1]), "r"(T[2]), "r"(T[3]),
+          "r"(T[4]), "r"(T[5]), "r"(T[6]), "r"(T[7]), "r"(T[8]),
+          "r"(BLS12_381_MODULUS[0]), "r"(BLS12_381_MODULUS[1]),
+          "r"(BLS12_381_MODULUS[2]), "r"(BLS12_381_MODULUS[3]),
+          "r"(BLS12_381_MODULUS[4]), "r"(BLS12_381_MODULUS[5]),
+          "r"(BLS12_381_MODULUS[6]), "r"(BLS12_381_MODULUS[7])
+    );
+
+    // Select: lop3 0xD8 = (a & ~c) | (b & c). mask=0→S, mask=0xFFFFFFFF→T
+    FpElement result;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        asm("lop3.b32 %0, %1, %2, %3, 0xD8;"
+            : "=r"(result.limbs[i])
+            : "r"(S[i]), "r"(T[i]), "r"(mask));
+    }
+
+    return result;
+}
+
+// ─── ff_add_v2: branchless modular addition ─────────────────────────────────
+// Compute a + b mod p. Always computes both sum and sum-p, selects branchlessly.
+
+__device__ __forceinline__
+FpElement ff_add_v2(const FpElement& a, const FpElement& b) {
+    // Step 1: sum = a + b (256-bit, carry out)
+    uint32_t sum[8], carry;
+    asm("add.cc.u32   %0, %9,  %17;\n\t"
+        "addc.cc.u32  %1, %10, %18;\n\t"
+        "addc.cc.u32  %2, %11, %19;\n\t"
+        "addc.cc.u32  %3, %12, %20;\n\t"
+        "addc.cc.u32  %4, %13, %21;\n\t"
+        "addc.cc.u32  %5, %14, %22;\n\t"
+        "addc.cc.u32  %6, %15, %23;\n\t"
+        "addc.cc.u32  %7, %16, %24;\n\t"
+        "addc.u32     %8, 0, 0;"
+        : "=r"(sum[0]), "=r"(sum[1]), "=r"(sum[2]), "=r"(sum[3]),
+          "=r"(sum[4]), "=r"(sum[5]), "=r"(sum[6]), "=r"(sum[7]),
+          "=r"(carry)
+        : "r"(a.limbs[0]), "r"(a.limbs[1]), "r"(a.limbs[2]), "r"(a.limbs[3]),
+          "r"(a.limbs[4]), "r"(a.limbs[5]), "r"(a.limbs[6]), "r"(a.limbs[7]),
+          "r"(b.limbs[0]), "r"(b.limbs[1]), "r"(b.limbs[2]), "r"(b.limbs[3]),
+          "r"(b.limbs[4]), "r"(b.limbs[5]), "r"(b.limbs[6]), "r"(b.limbs[7])
+    );
+
+    // Step 2: S = sum - p, mask from carry - borrow
+    uint32_t S[8], mask;
+    asm("sub.cc.u32   %0, %9,  %18;\n\t"
+        "subc.cc.u32  %1, %10, %19;\n\t"
+        "subc.cc.u32  %2, %11, %20;\n\t"
+        "subc.cc.u32  %3, %12, %21;\n\t"
+        "subc.cc.u32  %4, %13, %22;\n\t"
+        "subc.cc.u32  %5, %14, %23;\n\t"
+        "subc.cc.u32  %6, %15, %24;\n\t"
+        "subc.cc.u32  %7, %16, %25;\n\t"
+        "subc.u32     %8, %17, 0;\n\t"
+        "shr.s32      %8, %8, 31;"
+        : "=r"(S[0]), "=r"(S[1]), "=r"(S[2]), "=r"(S[3]),
+          "=r"(S[4]), "=r"(S[5]), "=r"(S[6]), "=r"(S[7]),
+          "=r"(mask)
+        : "r"(sum[0]), "r"(sum[1]), "r"(sum[2]), "r"(sum[3]),
+          "r"(sum[4]), "r"(sum[5]), "r"(sum[6]), "r"(sum[7]),
+          "r"(carry),
+          "r"(BLS12_381_MODULUS[0]), "r"(BLS12_381_MODULUS[1]),
+          "r"(BLS12_381_MODULUS[2]), "r"(BLS12_381_MODULUS[3]),
+          "r"(BLS12_381_MODULUS[4]), "r"(BLS12_381_MODULUS[5]),
+          "r"(BLS12_381_MODULUS[6]), "r"(BLS12_381_MODULUS[7])
+    );
+
+    // mask=0→use S (reduced), mask=0xFFFFFFFF→use sum (no reduction)
+    FpElement result;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        asm("lop3.b32 %0, %1, %2, %3, 0xD8;"
+            : "=r"(result.limbs[i])
+            : "r"(S[i]), "r"(sum[i]), "r"(mask));
+    }
+    return result;
+}
+
+// ─── ff_sub_v2: branchless modular subtraction ──────────────────────────────
+// Compute a - b mod p. Always computes both diff and diff+p, selects branchlessly.
+
+__device__ __forceinline__
+FpElement ff_sub_v2(const FpElement& a, const FpElement& b) {
+    // Step 1: diff = a - b (256-bit), borrow = 0xFFFFFFFF if a < b
+    uint32_t diff[8], borrow;
+    asm("sub.cc.u32   %0, %9,  %17;\n\t"
+        "subc.cc.u32  %1, %10, %18;\n\t"
+        "subc.cc.u32  %2, %11, %19;\n\t"
+        "subc.cc.u32  %3, %12, %20;\n\t"
+        "subc.cc.u32  %4, %13, %21;\n\t"
+        "subc.cc.u32  %5, %14, %22;\n\t"
+        "subc.cc.u32  %6, %15, %23;\n\t"
+        "subc.cc.u32  %7, %16, %24;\n\t"
+        "subc.u32     %8, 0, 0;"
+        : "=r"(diff[0]), "=r"(diff[1]), "=r"(diff[2]), "=r"(diff[3]),
+          "=r"(diff[4]), "=r"(diff[5]), "=r"(diff[6]), "=r"(diff[7]),
+          "=r"(borrow)
+        : "r"(a.limbs[0]), "r"(a.limbs[1]), "r"(a.limbs[2]), "r"(a.limbs[3]),
+          "r"(a.limbs[4]), "r"(a.limbs[5]), "r"(a.limbs[6]), "r"(a.limbs[7]),
+          "r"(b.limbs[0]), "r"(b.limbs[1]), "r"(b.limbs[2]), "r"(b.limbs[3]),
+          "r"(b.limbs[4]), "r"(b.limbs[5]), "r"(b.limbs[6]), "r"(b.limbs[7])
+    );
+
+    // Step 2: S = diff + p (correction)
+    uint32_t S[8];
+    asm("add.cc.u32   %0, %8,  %16;\n\t"
+        "addc.cc.u32  %1, %9,  %17;\n\t"
+        "addc.cc.u32  %2, %10, %18;\n\t"
+        "addc.cc.u32  %3, %11, %19;\n\t"
+        "addc.cc.u32  %4, %12, %20;\n\t"
+        "addc.cc.u32  %5, %13, %21;\n\t"
+        "addc.cc.u32  %6, %14, %22;\n\t"
+        "addc.u32     %7, %15, %23;"
+        : "=r"(S[0]), "=r"(S[1]), "=r"(S[2]), "=r"(S[3]),
+          "=r"(S[4]), "=r"(S[5]), "=r"(S[6]), "=r"(S[7])
+        : "r"(diff[0]), "r"(diff[1]), "r"(diff[2]), "r"(diff[3]),
+          "r"(diff[4]), "r"(diff[5]), "r"(diff[6]), "r"(diff[7]),
+          "r"(BLS12_381_MODULUS[0]), "r"(BLS12_381_MODULUS[1]),
+          "r"(BLS12_381_MODULUS[2]), "r"(BLS12_381_MODULUS[3]),
+          "r"(BLS12_381_MODULUS[4]), "r"(BLS12_381_MODULUS[5]),
+          "r"(BLS12_381_MODULUS[6]), "r"(BLS12_381_MODULUS[7])
+    );
+
+    // borrow=0xFFFFFFFF → use S (corrected); borrow=0 → use diff
+    // lop3 0xD8 with (diff, S, borrow): (diff & ~borrow) | (S & borrow)
+    FpElement result;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        asm("lop3.b32 %0, %1, %2, %3, 0xD8;"
+            : "=r"(result.limbs[i])
+            : "r"(diff[i]), "r"(S[i]), "r"(borrow));
+    }
+    return result;
+}
+
 // ─── ff_sqr: squaring via Montgomery multiplication ─────────────────────────
 // Simple delegation; dedicated squaring optimization deferred to Phase 3.
 
