@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <array>
+#include <vector>
+#include <cassert>
 
 namespace ff_ref {
 
@@ -213,6 +215,163 @@ inline FpRef fp_pow(const FpRef& base, const std::array<uint64_t, 4>& exp) {
         }
     }
     return result;
+}
+
+// ─── Modular Inverse (Fermat's little theorem) ──────────────────────────────
+// a^{-1} = a^{r-2} mod r.  Input/output in Montgomery form.
+
+inline FpRef fp_inv(const FpRef& a) {
+    // r - 2 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfefffffffeffffffff
+    std::array<uint64_t, 4> r_minus_2 = {{
+        0xfffffffeffffffffULL,
+        0x53bda402fffe5bfeULL,
+        0x3339d80809a1d805ULL,
+        0x73eda753299d7d48ULL
+    }};
+    return fp_pow(a, r_minus_2);
+}
+
+// ─── CPU Reference NTT ──────────────────────────────────────────────────────
+// Radix-2 Cooley-Tukey, in-place.  All elements in Montgomery form.
+//
+// BLS12-381 scalar field: TWO_ADICITY = 32 (i.e. 2^32 | r-1).
+// Multiplicative generator g = 7.
+// Primitive 2^32-th root of unity: omega = g^((r-1) / 2^32) mod r.
+
+// 256-bit right shift by k bits (0 < k <= 64)
+inline std::array<uint64_t, 4> shr256(const std::array<uint64_t, 4>& a, int k) {
+    assert(k > 0 && k <= 64);
+    std::array<uint64_t, 4> r = {{0, 0, 0, 0}};
+    if (k == 64) {
+        for (int i = 0; i < 3; ++i) r[i] = a[i + 1];
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            r[i] = a[i] >> k;
+            if (i + 1 < 4) r[i] |= a[i + 1] << (64 - k);
+        }
+    }
+    return r;
+}
+
+// Returns the primitive n-th root of unity in Montgomery form.
+// n must be a power of 2 with 1 <= log2(n) <= 32.
+inline FpRef get_root_of_unity(size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0);  // power of 2
+
+    // Compute log2(n)
+    int log_n = 0;
+    { size_t tmp = n; while (tmp > 1) { tmp >>= 1; ++log_n; } }
+    assert(log_n <= 32);
+
+    // exponent = (r - 1) / n  =  (r - 1) >> log_n
+    // r - 1 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000000
+    std::array<uint64_t, 4> r_minus_1 = {{
+        0xffffffff00000000ULL,
+        0x53bda402fffe5bfeULL,
+        0x3339d80809a1d805ULL,
+        0x73eda753299d7d48ULL
+    }};
+
+    // Multi-word right shift by log_n bits (log_n <= 32, so within one word)
+    std::array<uint64_t, 4> exp = shr256(r_minus_1, log_n);
+
+    // omega_n = g^exp mod r,  where g = 7
+    FpRef g = to_montgomery(FpRef::from_u64(7));
+    return fp_pow(g, exp);
+}
+
+// In-place bit-reversal permutation
+inline void bit_reverse_permute(std::vector<FpRef>& data, size_t n) {
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+}
+
+// Forward NTT (Cooley-Tukey, radix-2, in-place).
+// data: n elements in Montgomery form.  n must be a power of 2.
+inline void ntt_forward_reference(std::vector<FpRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0);
+    assert(data.size() >= n);
+
+    bit_reverse_permute(data, n);
+
+    FpRef one;
+    one.limbs = R_MOD;  // Montgomery(1)
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        FpRef w = get_root_of_unity(len);  // primitive len-th root
+        for (size_t i = 0; i < n; i += len) {
+            FpRef wj = one;
+            for (size_t j = 0; j < len / 2; ++j) {
+                FpRef u = data[i + j];
+                FpRef v = fp_mul(data[i + j + len / 2], wj);
+                data[i + j]           = fp_add(u, v);
+                data[i + j + len / 2] = fp_sub(u, v);
+                wj = fp_mul(wj, w);
+            }
+        }
+    }
+}
+
+// Inverse NTT: uses omega^{-1} twiddles, then scales by n^{-1}.
+inline void ntt_inverse_reference(std::vector<FpRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0);
+    assert(data.size() >= n);
+
+    bit_reverse_permute(data, n);
+
+    FpRef one;
+    one.limbs = R_MOD;
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        FpRef w = fp_inv(get_root_of_unity(len));  // inverse root
+        for (size_t i = 0; i < n; i += len) {
+            FpRef wj = one;
+            for (size_t j = 0; j < len / 2; ++j) {
+                FpRef u = data[i + j];
+                FpRef v = fp_mul(data[i + j + len / 2], wj);
+                data[i + j]           = fp_add(u, v);
+                data[i + j + len / 2] = fp_sub(u, v);
+                wj = fp_mul(wj, w);
+            }
+        }
+    }
+
+    // Scale by n^{-1} mod r
+    FpRef n_mont = to_montgomery(FpRef::from_u64(static_cast<uint64_t>(n)));
+    FpRef n_inv  = fp_inv(n_mont);
+    for (size_t i = 0; i < n; ++i)
+        data[i] = fp_mul(data[i], n_inv);
+}
+
+// Naive DFT O(n^2) — for small-n cross-validation against Cooley-Tukey.
+// data: n elements in Montgomery form.  Returns new vector (not in-place).
+inline std::vector<FpRef> dft_naive(const std::vector<FpRef>& data, size_t n) {
+    assert(data.size() >= n);
+
+    FpRef one;
+    one.limbs = R_MOD;
+
+    FpRef w = get_root_of_unity(n);  // primitive n-th root
+    std::vector<FpRef> out(n, FpRef::zero());
+
+    for (size_t i = 0; i < n; ++i) {
+        // w^i
+        FpRef wi = one;
+        for (size_t k = 0; k < i; ++k) wi = fp_mul(wi, w);
+
+        // w^{ij} for each j, accumulate
+        FpRef wij = one;
+        for (size_t j = 0; j < n; ++j) {
+            // out[i] += data[j] * w^{ij}
+            out[i] = fp_add(out[i], fp_mul(data[j], wij));
+            wij = fp_mul(wij, wi);
+        }
+    }
+    return out;
 }
 
 } // namespace ff_ref
