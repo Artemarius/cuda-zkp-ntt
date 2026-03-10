@@ -2,6 +2,7 @@
 
 **GPU-Accelerated Number-Theoretic Transform for Zero-Knowledge Proofs**
 
+[![CUDA Build](https://github.com/Artemarius/cuda-zkp-ntt/actions/workflows/build.yml/badge.svg)](https://github.com/Artemarius/cuda-zkp-ntt/actions/workflows/build.yml)
 [![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -146,6 +147,9 @@ cuda-zkp-ntt/
 │   └── analysis.md            # Annotated performance analysis
 ├── scripts/
 │   └── plot_benchmarks.py     # Generate charts from benchmark data
+├── .github/
+│   └── workflows/
+│       └── build.yml            # CI: Linux (CUDA 12.8/12.6) + Windows (MSVC)
 ├── CMakeLists.txt
 ├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization

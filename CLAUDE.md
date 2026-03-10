@@ -114,6 +114,10 @@ results/
 
 scripts/
   plot_benchmarks.py  — Generate benchmark bar charts from measured data
+
+.github/
+  workflows/
+    build.yml          — CI: compile on Linux (CUDA 12.8/12.6) + Windows (MSVC)
 ```
 
 ---
@@ -147,7 +151,7 @@ scripts/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 8 — Polish & Portfolio Presentation** (COMPLETE)
+All phases complete. Current version: **v1.0.0**
 
 ---
 

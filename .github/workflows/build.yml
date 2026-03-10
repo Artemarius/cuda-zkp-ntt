@@ -1,0 +1,74 @@
+name: CUDA Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    name: Linux (GCC ${{ matrix.gcc }} + CUDA ${{ matrix.cuda }})
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.8.0"
+            gcc: "11"
+            arch: "86"
+          - cuda: "12.6.0"
+            gcc: "11"
+            arch: "86"
+
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            git cmake g++-${{ matrix.gcc }} make ca-certificates
+          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc }} 100
+          update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc }} 100
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+            -DCMAKE_CXX_COMPILER=g++-${{ matrix.gcc }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Verify binaries
+        run: |
+          echo "=== Built binaries ==="
+          ls -lh build/test_correctness build/bench_ntt build/ff_microbench build/ntt_profile
+
+  build-windows:
+    name: Windows (MSVC + CUDA)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: "12.6.3"
+          method: network
+
+      - name: Configure
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=86
+
+      - name: Build
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
