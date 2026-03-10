@@ -125,10 +125,10 @@ results/
 
 ### Async Pipeline (Direction A)
 - Two pinned host buffers (double-buffer), two device buffers
-- Two CUDA streams: stream[0] and stream[1] alternate
-- cudaEvent_t for synchronization between stages
-- Batch size: tunable, default = 2^20 elements
-- Ordering: H2D(k+1) overlaps with NTT_compute(k)
+- Three CUDA streams: `stream_h2d_`, `stream_compute_[0/1]`, `stream_d2h_`
+- Cross-stream cudaEvent_t dependencies (`cudaStreamWaitEvent`) for H2D→compute→D2H ordering
+- Batch size: tunable (one NTT per batch)
+- Ordering: H2D(k+1) overlaps with NTT_compute(k) and D2H(k-1)
 
 ### NTT (Cooley-Tukey, radix-256)
 - Combines 8 radix-2 stages into one shared-memory kernel launch
@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 6 — Async Pipeline NTT** (next up; Phase 5 complete)
+Current phase: **Phase 7 — Profiling & Results** (next up; Phase 6 complete)
 
 ---
 

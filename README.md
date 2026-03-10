@@ -25,14 +25,12 @@ This project attacks both problems directly with two complementary CUDA implemen
 ## What's Inside
 
 ### Direction A — Async-Pipelined NTT
-A staged double-buffered NTT pipeline using CUDA streams and `cudaMemcpyAsync`. While batch *k* executes on the GPU, batch *k+1* transfers. Eliminates the transfer bottleneck identified in ZKProphet Figure 7, where NTT spends disproportionately more time on CPU-GPU transfers than on actual butterfly computation.
+A 3-stream double-buffered NTT pipeline using CUDA streams, `cudaMemcpyAsync`, and `cudaStreamWaitEvent` for cross-stream dependencies. Dedicated streams for H2D transfers, NTT compute, and D2H transfers enable maximum overlap across the GPU's copy and compute engines.
 
 ```
-CPU Memory          GPU Stream 1         GPU Stream 2
-─────────────       ────────────         ────────────
-[Batch 0] ──H2D──► [NTT Compute]
-[Batch 1] ──H2D──────────────────────► [NTT Compute]
-[Batch 2] ──H2D──► [NTT Compute]
+H2D Stream:    |--H2D(0)--|--H2D(1)--|--H2D(2)--|--H2D(3)--|
+Compute[0/1]:       |--NTT(0)--|--NTT(1)--|--NTT(2)--|--NTT(3)--|
+D2H Stream:              |--D2H(0)--|--D2H(1)--|--D2H(2)--|--D2H(3)--|
 ```
 
 ### Direction B — Optimized Finite-Field Arithmetic
@@ -51,15 +49,23 @@ Key implementation choices:
 > Profiling conducted on NVIDIA RTX 3060 Laptop GPU (Ampere, 30 SMs, CUDA 12.8).
 > Reference baseline: bellperson NTT (radix-256 Cooley-Tukey).
 
-| Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs. Naive |
-|---|---|---|---|---|
-| bellperson (reference) | — | — | — | — |
-| Naive GPU NTT (radix-2) | 7.13 ms | 31.2 ms | | 1.0× |
-| Radix-256 shared-mem NTT | 5.99 ms | 26.5 ms | | **1.18×** |
-| + Async pipeline | | | | |
-| **cuda-zkp-ntt (full)** | | | | |
+**NTT Compute (device-to-device, no transfer):**
 
-*RTX 3060 Laptop GPU, Release build, 5-repetition mean. Phase 5 complete.*
+| Implementation | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² | vs. Naive |
+|---|---|---|---|---|
+| Naive GPU NTT (radix-2) | 1.85 ms | 7.13 ms | 31.2 ms | 1.0x |
+| Radix-256 shared-mem NTT | 1.54 ms | 5.99 ms | 26.5 ms | **1.18x** |
+
+**Async Pipeline (end-to-end including H2D + compute + D2H, 8 batches, pinned memory):**
+
+| | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² |
+|---|---|---|---|
+| Pipelined (3-stream) | 29.7 ms | 141 ms | 541 ms |
+| Sequential (1-stream) | 49.4 ms | 188 ms | 579 ms |
+| **Speedup** | **1.66x** | **1.33x** | **1.07x** |
+
+*RTX 3060 Laptop GPU, Release build, 5-rep mean. Phase 6 complete.*
+*Pipeline speedup limited at 2²² by DMA interference (memory controller contention).*
 
 ---
 

@@ -229,67 +229,79 @@ This means our branchless v2 variants don't improve branch efficiency (already p
 ### 3.2 NTT Time Breakdown
 
 For optimized radix-256 NTT at scale 2²²:
-- Kernel compute time (on-device): 26.5 ms
-- CPU→GPU transfer time: TBD ms (Phase 6 will measure)
-- Transfer % of total: TBD %
+- Kernel compute time (on-device): 21.9 ms
+- H2D transfer (128 MB pinned): 20.2 ms (6.6 GB/s)
+- D2H transfer (128 MB pinned): 21.8 ms (6.2 GB/s)
+- Transfer % of total serial: 66% (H2D + D2H = 42ms out of 64ms)
 
-**ZKProphet reference** (Fig. 7): NTT transfer time >> compute time (unlike MSM, where they are overlapped). This motivates Direction A.
+**ZKProphet reference** (Fig. 7): NTT transfer time >> compute time (unlike MSM, where they are overlapped). Our RTX 3060 measurement confirms: transfer (42ms) > compute (22ms). This strongly motivates Direction A.
 
 ---
 
 ## Section 4 — Direction A Results (Async Pipeline)
 
-### 4.1 Pipeline Timeline
+### 4.1 Device Capabilities
 
-**Screenshot**: `screenshots/nsys_pipeline_overlap.png`
-**Comparison**: `screenshots/nsys_sequential.png`
-
-The Nsight Systems timeline should show:
-- **Sequential**: H2D copy (purple) fully completes before NTT kernel (green) starts
-- **Pipelined**: H2D copy for batch k+1 (purple) overlaps with NTT kernel for batch k (green)
-
-### 4.2 End-to-End Latency Comparison
-
-For scale 2²², 4 batches of 2²⁰ each:
-
-| Mode | Total Time | Per-batch | vs Sequential |
-|---|---|---|---|
-| Sequential (no pipeline) | TBD ms | TBD ms | 1.0× |
-| Async double-buffer pipeline | TBD ms | TBD ms | TBD× |
-
-**Theoretical max speedup**: (compute + transfer) / max(compute, transfer)
-
-At scale 2²², expected transfer time ~Xms, compute ~Yms (from Section 3.2). If Y < X, max speedup approaches X/Y.
-
-### 4.3 Batch Size Sensitivity
-
-| Batch log₂ | Pipeline Speedup |
+| Property | Value |
 |---|---|
-| 18 | TBD |
-| 20 | TBD |
-| 22 | TBD |
+| asyncEngineCount | **5** (supports concurrent H2D + D2H) |
+| concurrentKernels | 1 (yes) |
+| PCIe bandwidth (H2D, 128 MB) | 6.6 GB/s (20.2 ms) |
+| PCIe bandwidth (D2H, 128 MB) | 6.2 GB/s (21.8 ms) |
 
----
+### 4.2 Pipeline Architecture
 
-## Section 5 — Combined Results
+3-stream pipeline with cross-stream event dependencies:
+- `stream_h2d_`: dedicated H2D transfers (DMA engine)
+- `stream_compute_[0/1]`: NTT kernels (compute engine, double-buffered)
+- `stream_d2h_`: dedicated D2H transfers (DMA engine)
+- `cudaStreamWaitEvent`: H2D→compute and compute→D2H dependencies
 
-### Full NTT Performance Table
+### 4.3 End-to-End Latency: Pinned Memory (Best Case)
 
-| Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs bellperson* |
-|---|---|---|---|---|
-| bellperson (reference) | TBD | TBD | TBD | 1.0× |
-| cuda-zkp-ntt naive | TBD | TBD | TBD | TBD× |
-| + FF_mul optimized | TBD | TBD | TBD | TBD× |
-| + Async pipeline | TBD | TBD | TBD | TBD× |
-| **cuda-zkp-ntt full** | TBD | TBD | TBD | TBD× |
+8 independent NTT batches, pinned host memory (no CPU staging copies):
 
-*bellperson reference: we run bellperson's NTT from the bellperson Rust crate with CUDA backend and measure via its built-in timing, or estimate from ZKProphet Table II (scaled from A40 to RTX 3060 by SM count ratio).
+| Scale | Pipelined | Sequential | Speedup | Per-batch (pipe) | Per-batch (seq) |
+|---|---|---|---|---|---|
+| 2¹⁸ | **29.7 ms** | 49.4 ms | **1.66x (40%)** | 3.7 ms | 6.2 ms |
+| 2²⁰ | **141 ms** | 188 ms | **1.33x (25%)** | 17.6 ms | 23.5 ms |
+| 2²² | **541 ms** | 579 ms | **1.07x (7%)** | 67.6 ms | 72.4 ms |
+
+### 4.4 End-to-End Latency: Pageable Memory (Realistic Case)
+
+8 independent NTT batches, pageable host memory (with pinned staging copies):
+
+| Scale | Pipelined | Sequential | Speedup |
+|---|---|---|---|
+| 2¹⁸ | **40.2 ms** | 50.5 ms | **1.23x (19%)** |
+| 2²⁰ | **188 ms** | 200 ms | **1.06x (6%)** |
+| 2²² | **716 ms** | 791 ms | **1.10x (10%)** |
+
+### 4.5 Why Limited Speedup at Scale 2²²
+
+**Root cause: DMA interference on the GPU memory controller.**
+
+At 128 MB per transfer (2²²), concurrent H2D/D2H and NTT compute contend for the GPU's memory controller bandwidth:
+
+1. NTT is memory-bound (91% DRAM utilization) — it saturates the memory controller
+2. DMA transfers also access device DRAM (writing for H2D, reading for D2H)
+3. When both run simultaneously, they steal bandwidth from each other
+4. Net effect: neither runs at full speed, negating the overlap benefit
+
+At smaller sizes (2¹⁸ = 8 MB), transfers complete quickly and cause minimal contention, yielding strong overlap (40% speedup). At 2²⁰ (32 MB), the effect is moderate (25%). At 2²² (128 MB), sustained DMA traffic throughout the NTT execution causes continuous interference.
+
+This is consistent with known CUDA behavior: the overlap benefit depends on whether the kernel is compute-bound or memory-bound. For compute-bound kernels, concurrent DMA is essentially free. For memory-bound kernels, DMA steals bandwidth.
+
+**Potential mitigations** (not implemented, future work):
+- Restructure NTT to have compute-bound and memory-bound phases, overlap DMA only during compute-bound phases
+- Use CUDA graphs to batch kernel launches and reduce driver overhead
+- NVLink or PCIe 5.0 with higher bandwidth would reduce transfer time relative to compute
 
 ---
 
 ## Key Findings Summary
 
-*(Phases 2-5 complete, Phases 6-7 TBD)*
+*(Phases 2-6 complete, Phase 7 TBD)*
 
 1. **FF_mul instruction mix**: ALU pipe 44.8% (integer-dominated, IMAD+IADD3 ~85%) — ZKProphet: 70.8% IMAD
 2. **FF_mul throughput**: 2.48 Gops/s at 4M elements on RTX 3060
@@ -301,9 +313,9 @@ At scale 2²², expected transfer time ~Xms, compute ~Yms (from Section 3.2). If
 8. **AoS vs SoA**: No difference — `__align__(32)` FpElement already generates vectorized loads
 9. **Radix-256 NTT speedup**: **1.18-1.20×** for sizes ≥ 2^16 (fusing 8 stages in shared memory)
 10. **Radix-256 architecture**: 128 threads, 256 elements per block, 8 KB shmem. K=8 is optimal (K≥9 blocked by CUDA RDC template bug; bank conflict padding adds overhead)
-11. **NTT transfer vs compute ratio**: TBD (ZKProphet: transfer >> compute)
-12. **Pipeline latency improvement**: TBD× at scale 2²²
-13. **Combined optimization vs bellperson**: TBD×
+11. **NTT transfer vs compute ratio**: Transfer 66% of total serial time (42ms transfer vs 22ms compute at 2²²) — confirms ZKProphet: transfer >> compute
+12. **Pipeline latency improvement**: 1.66× at 2¹⁸, 1.33× at 2²⁰, 1.07× at 2²² (pinned memory, 8 batches). DMA interference limits overlap at large sizes.
+13. **Combined optimization vs bellperson**: Not directly measured (no bellperson build). Radix-256 + pipeline gives ~1.18× NTT compute + up to 1.66× end-to-end at transfer-dominated sizes.
 
 ---
 

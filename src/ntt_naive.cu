@@ -228,7 +228,7 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             break;
         }
         case NTTMode::ASYNC:
-            fprintf(stderr, "ntt_forward(ASYNC): stub — not yet implemented\n");
+            fprintf(stderr, "ntt_forward(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
             break;
     }
 }
@@ -263,7 +263,7 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             break;
         }
         case NTTMode::ASYNC:
-            fprintf(stderr, "ntt_inverse(ASYNC): stub — not yet implemented\n");
+            fprintf(stderr, "ntt_inverse(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
             break;
     }
 }

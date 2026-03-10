@@ -4,6 +4,7 @@
 
 #include "ff_arithmetic.cuh"
 #include "ntt.cuh"
+#include "pipeline.cuh"
 #include "cuda_utils.cuh"
 #include "ff_reference.h"
 
@@ -723,6 +724,88 @@ void test_ntt_roundtrip_gpu(int log_n, NTTMode mode = NTTMode::NAIVE) {
     CUDA_CHECK(cudaFree(d_data));
 }
 
+// ─── Phase 6: Async Pipeline NTT Tests ───────────────────────────────────────
+
+// Forward NTT through pipeline, compare each batch against CPU reference
+void test_async_pipeline_forward(int log_n, int num_batches) {
+    size_t ntt_size = static_cast<size_t>(1) << log_n;
+    size_t total_n = ntt_size * num_batches;
+    printf("test_async_pipeline_forward (n=2^%d, %d batches)...\n", log_n, num_batches);
+
+    // Generate test data in standard form
+    std::vector<FpElement> h_input(total_n);
+    for (size_t i = 0; i < total_n; ++i) {
+        h_input[i] = FpElement::zero();
+        h_input[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+    }
+
+    std::vector<FpElement> h_output(total_n);
+
+    // Process through async pipeline
+    {
+        AsyncNTTPipeline pipe(ntt_size);
+        pipe.process(h_input.data(), h_output.data(), total_n, ntt_size);
+    }
+
+    // Verify each batch against CPU reference NTT
+    int total_pass = 0;
+    for (int b = 0; b < num_batches; ++b) {
+        std::vector<ff_ref::FpRef> cpu_data(ntt_size);
+        for (size_t i = 0; i < ntt_size; ++i) {
+            cpu_data[i] = ff_ref::to_montgomery(
+                ff_ref::FpRef::from_u32(h_input[b * ntt_size + i].limbs));
+        }
+        ff_ref::ntt_forward_reference(cpu_data, ntt_size);
+        for (size_t i = 0; i < ntt_size; ++i) {
+            cpu_data[i] = ff_ref::from_montgomery(cpu_data[i]);
+        }
+
+        for (size_t i = 0; i < ntt_size; ++i) {
+            ff_ref::FpRef gpu_val = ff_ref::FpRef::from_u32(
+                h_output[b * ntt_size + i].limbs);
+            if (gpu_val == cpu_data[i]) ++total_pass;
+        }
+    }
+
+    TEST_ASSERT(total_pass == static_cast<int>(total_n),
+        "Async pipeline forward NTT mismatch");
+    printf("  Async pipeline forward (n=2^%d, %d batches): %d/%zu matched\n",
+        log_n, num_batches, total_pass, total_n);
+}
+
+// Verify pipeline and sequential produce identical output
+void test_async_pipeline_vs_sequential(int log_n) {
+    size_t ntt_size = static_cast<size_t>(1) << log_n;
+    int num_batches = 4;
+    size_t total_n = ntt_size * num_batches;
+    printf("test_async_pipeline_vs_sequential (n=2^%d, %d batches)...\n",
+        log_n, num_batches);
+
+    std::vector<FpElement> h_input(total_n);
+    for (size_t i = 0; i < total_n; ++i) {
+        h_input[i] = FpElement::zero();
+        h_input[i].limbs[0] = static_cast<uint32_t>((i * 54321u + 9876u) % 999999937u);
+    }
+
+    std::vector<FpElement> h_pipe(total_n), h_seq(total_n);
+
+    {
+        AsyncNTTPipeline pipe(ntt_size);
+        pipe.process(h_input.data(), h_pipe.data(), total_n, ntt_size);
+        pipe.process_sequential(h_input.data(), h_seq.data(), total_n, ntt_size);
+    }
+
+    int pass_count = 0;
+    for (size_t i = 0; i < total_n; ++i) {
+        if (h_pipe[i] == h_seq[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(total_n),
+        "Pipeline vs sequential output mismatch");
+    printf("  Pipeline vs sequential (n=2^%d): %d/%zu matched\n",
+        log_n, pass_count, total_n);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -777,6 +860,45 @@ int main() {
     test_ntt_roundtrip_gpu(15, NTTMode::OPTIMIZED);
     test_ntt_roundtrip_gpu(17, NTTMode::OPTIMIZED);
     test_ntt_roundtrip_gpu(20, NTTMode::OPTIMIZED);
+
+    // Phase 6: Async pipeline NTT correctness tests
+    test_async_pipeline_forward(10, 4);  // 4 batches of 2^10
+    test_async_pipeline_forward(15, 4);  // 4 batches of 2^15
+    test_async_pipeline_forward(18, 2);  // 2 batches of 2^18
+    test_async_pipeline_vs_sequential(12); // pipeline vs sequential match
+
+    // Phase 6: Pinned-memory pipeline test
+    {
+        size_t ntt_size = 1u << 12;
+        int num_batches = 4;
+        size_t total_n = ntt_size * num_batches;
+        printf("test_async_pipeline_pinned (n=2^12, %d batches)...\n", num_batches);
+
+        FpElement *h_in, *h_out;
+        CUDA_CHECK(cudaMallocHost(&h_in, total_n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMallocHost(&h_out, total_n * sizeof(FpElement)));
+        for (size_t i = 0; i < total_n; ++i) {
+            h_in[i] = FpElement::zero();
+            h_in[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+        }
+
+        { AsyncNTTPipeline pipe(ntt_size); pipe.process_pinned(h_in, h_out, total_n, ntt_size); }
+
+        // Compare with pipeline (pageable) output
+        std::vector<FpElement> h_ref(total_n);
+        { AsyncNTTPipeline pipe(ntt_size); pipe.process(h_in, h_ref.data(), total_n, ntt_size); }
+
+        int pass_count = 0;
+        for (size_t i = 0; i < total_n; ++i)
+            if (h_out[i] == h_ref[i]) ++pass_count;
+
+        TEST_ASSERT(pass_count == static_cast<int>(total_n),
+            "Pinned pipeline vs pageable pipeline mismatch");
+        printf("  Pinned pipeline (n=2^12): %d/%zu matched\n", pass_count, total_n);
+
+        CUDA_CHECK(cudaFreeHost(h_in));
+        CUDA_CHECK(cudaFreeHost(h_out));
+    }
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

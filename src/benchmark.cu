@@ -62,6 +62,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --mode   ff_mul | ff_add | ff_sub | ff_sqr\n");
     fprintf(stderr, "           ff_mul_v2 | ff_add_v2 | ff_sub_v2 | ff_sqr_v2\n");
     fprintf(stderr, "           naive | optimized | async\n");
+    fprintf(stderr, "           device_info  (PCIe bandwidth + copy engine count)\n");
     fprintf(stderr, "  --size   log2 of element count (default: 20)\n");
 }
 
@@ -155,7 +156,46 @@ int main(int argc, char** argv) {
     printf("Mode: %s, Size: 2^%d = %u elements\n", mode_str, log_size, n);
     printf("\n");
 
-    if (strncmp(mode_str, "ff_", 3) == 0) {
+    if (strcmp(mode_str, "device_info") == 0) {
+        cudaDeviceProp dp;
+        CUDA_CHECK(cudaGetDeviceProperties(&dp, device));
+        printf("asyncEngineCount: %d\n", dp.asyncEngineCount);
+        printf("concurrentKernels: %d\n", dp.concurrentKernels);
+        printf("deviceOverlap: %d\n", dp.deviceOverlap);
+
+        size_t bw_bytes = (size_t)n * sizeof(FpElement);
+        void *h_bw, *d_bw;
+        CUDA_CHECK(cudaMallocHost(&h_bw, bw_bytes));
+        CUDA_CHECK(cudaMalloc(&d_bw, bw_bytes));
+        CUDA_CHECK(cudaMemcpy(d_bw, h_bw, bw_bytes, cudaMemcpyHostToDevice)); // warmup
+
+        cudaEvent_t t0, t1;
+        CUDA_CHECK(cudaEventCreate(&t0));
+        CUDA_CHECK(cudaEventCreate(&t1));
+
+        CUDA_CHECK(cudaEventRecord(t0));
+        CUDA_CHECK(cudaMemcpy(d_bw, h_bw, bw_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        float ms_h2d;
+        CUDA_CHECK(cudaEventElapsedTime(&ms_h2d, t0, t1));
+        printf("H2D %zu MB: %.1f ms (%.1f GB/s)\n",
+            bw_bytes / (1024*1024), ms_h2d, bw_bytes / ms_h2d / 1e6);
+
+        CUDA_CHECK(cudaEventRecord(t0));
+        CUDA_CHECK(cudaMemcpy(h_bw, d_bw, bw_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        float ms_d2h;
+        CUDA_CHECK(cudaEventElapsedTime(&ms_d2h, t0, t1));
+        printf("D2H %zu MB: %.1f ms (%.1f GB/s)\n",
+            bw_bytes / (1024*1024), ms_d2h, bw_bytes / ms_d2h / 1e6);
+
+        CUDA_CHECK(cudaEventDestroy(t0));
+        CUDA_CHECK(cudaEventDestroy(t1));
+        CUDA_CHECK(cudaFreeHost(h_bw));
+        CUDA_CHECK(cudaFree(d_bw));
+    } else if (strncmp(mode_str, "ff_", 3) == 0) {
         profile_ff(mode_str, n);
     } else {
         // NTT modes — Phase 7
