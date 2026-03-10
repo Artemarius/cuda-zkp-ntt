@@ -1,0 +1,21 @@
+// include/ntt.cuh — NTT public interface
+#pragma once
+#include "ff_arithmetic.cuh"
+#include <cuda_runtime.h>
+#include <cstddef>
+
+enum class NTTMode {
+    NAIVE,      // radix-2, global memory only
+    OPTIMIZED,  // radix-256, shared memory twiddles
+    ASYNC       // async double-buffered pipeline (Direction A)
+};
+
+// Forward NTT: computes NTT in-place on device buffer
+void ntt_forward(FpElement* d_data, size_t n, NTTMode mode = NTTMode::OPTIMIZED, cudaStream_t stream = 0);
+
+// Inverse NTT: computes INTT in-place
+void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode = NTTMode::OPTIMIZED, cudaStream_t stream = 0);
+
+// Precompute twiddle factors on device (call once per NTT size)
+FpElement* ntt_precompute_twiddles(size_t n);
+void       ntt_free_twiddles(FpElement* d_twiddles);

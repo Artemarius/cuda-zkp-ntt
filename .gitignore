@@ -1,0 +1,54 @@
+# Private strategic notes — never commit
+PROJECT.md
+
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# CUDA compiled artifacts
+*.fatbin
+*.cubin
+*.ptx
+
+# Nsight Compute / Systems binary reports (large binary files)
+*.ncu-rep
+*.nsys-rep
+*.qdstrm
+*.nvvp
+*.nvprof
+
+# Benchmark output (raw data CSV is committed, not intermediate)
+results/data/*.tmp
+
+# IDE / editor
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+*.sdf
+*.VC.db
+*.VC.opendb
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache (for profiling scripts)
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
