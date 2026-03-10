@@ -124,12 +124,22 @@ cmake --build . --config Release
 
 ### Running Tests
 ```bash
-./build/tests/test_correctness
+# Linux / WSL2
+./build/test_correctness
+
+# Windows (MSVC multi-config)
+./build/Release/test_correctness.exe
 ```
 
 ### Running Benchmarks
 ```bash
-./build/benchmarks/bench_ntt --benchmark_format=csv > results/data/bench_output.csv
+# Linux / WSL2
+./build/ff_microbench --benchmark_format=csv
+./build/bench_ntt --benchmark_format=csv > results/data/bench_output.csv
+
+# Windows (MSVC multi-config)
+./build/Release/ff_microbench.exe --benchmark_format=csv
+./build/Release/bench_ntt.exe --benchmark_format=csv > results/data/bench_output.csv
 ```
 
 ---

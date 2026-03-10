@@ -6,7 +6,7 @@ Replicating the ZKProphet (IISWC 2025) analysis framework on NVIDIA RTX 3060.
 
 - NVIDIA RTX 3060 Laptop GPU (Ampere, sm_86, 30 SMs, 6GB GDDR6)
 - PCIe 4.0 x16 (~32 GB/s peak)
-- INT32 throughput: ~3.19 TOPS
+- INT32 throughput: ~3.42 TOPS (30 SMs × 4 SMSPs × 16 × 1.78 GHz)
 
 ## Tools
 
@@ -25,7 +25,7 @@ Replicating the ZKProphet (IISWC 2025) analysis framework on NVIDIA RTX 3060.
 
 ### Roofline (replicating ZKProphet Fig. 9)
 - Arithmetic intensity: `weighted_ops / bytes_accessed`
-- Ceilings: INT32 = 3.19 TOPS, DRAM = 360 GB/s, L2 = ~1.5 TB/s
+- Ceilings: INT32 = ~3.42 TOPS, DRAM = ~360 GB/s, L2 = ~1.5 TB/s
 
 ### Warp Stall Breakdown (replicating ZKProphet Fig. 10)
 - `Stall_Wait`: fixed-latency instruction dependency

@@ -292,14 +292,14 @@ In practice, inputs are converted once before computation and outputs once after
 
 ### SM Structure (Ampere / RTX 3060)
 
-The RTX 3060 has 28 Streaming Multiprocessors (SMs). Each SM contains:
+The RTX 3060 Laptop GPU has 30 Streaming Multiprocessors (SMs). Each SM contains:
 - 4 Sub-Partitions (SMSPs)
 - Each SMSP: 16 CUDA cores (INT32 units), 16 FP32 units, 8 FP64 units, 1 Tensor Core
 - Warp scheduler: selects one warp per cycle to issue from
 - 256KB register file per SM
 - 128KB shared memory / L1 cache per SM (configurable)
 
-Total RTX 3060 integer throughput: `28 SMs × 4 SMSPs × 16 INT32 = 1,792 INT32 ops/cycle × 1.78 GHz ≈ 3.19 TOPS (INT32)`
+Total RTX 3060 integer throughput: `30 SMs × 4 SMSPs × 16 INT32 = 1,920 INT32 ops/cycle × 1.78 GHz ≈ 3.42 TOPS (INT32)`
 
 ### Why ZKP Hits Integer Throughput
 
@@ -562,7 +562,7 @@ ncu --metrics \
 **Roofline position**:
 - X-axis: `arithmetic_intensity = (IMAD_ops × 2 + other_ops × 1) / bytes_accessed`
 - Y-axis: `throughput = total_weighted_ops / kernel_time`
-- Plot against RTX 3060 ceilings: INT32 = ~3.19 TOPS, DRAM = ~360 GB/s, L2 = ~1.5 TB/s
+- Plot against RTX 3060 ceilings: INT32 = ~3.42 TOPS, DRAM = ~360 GB/s, L2 = ~1.5 TB/s
 
 **Warp stall interpretation**:
 - High `Stall_Wait` → instruction latency (unavoidable, instruction dependency chain)

@@ -12,10 +12,10 @@ Two complementary optimization directions targeting BLS12-381 ZKP proof generati
 
 ## Development Environment
 
-- **OS**: Windows 10 Pro + WSL2 Ubuntu 22.04 (primary build target)
+- **OS**: Windows 10 Pro (primary build target); WSL2 Ubuntu 22.04 available
 - **GPU**: NVIDIA RTX 3060 Laptop GPU, 6GB VRAM, Ampere (sm_86), 30 SMs
 - **CUDA**: 12.8
-- **Compiler**: GCC 11 (WSL2) / MSVC 2022 (Windows fallback)
+- **Compiler**: MSVC 2022 (primary) / GCC 11 (WSL2)
 - **CMake**: 3.20+
 - **IDE**: VS Code + Remote WSL extension; CUDA files open in Visual Studio 2022 for IntelliSense
 - **Profiler**: NVIDIA Nsight Compute (ncu), Nsight Systems (nsys)
