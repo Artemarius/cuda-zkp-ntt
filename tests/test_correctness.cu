@@ -599,6 +599,121 @@ void test_ff_sqr_soa_gpu() {
     CUDA_CHECK(cudaFree(d_out));
 }
 
+// ─── Phase 4: NTT Correctness Tests ──────────────────────────────────────────
+
+// Forward NTT: GPU result vs CPU reference
+void test_ntt_forward_gpu(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_ntt_forward_gpu (n=2^%d=%zu)...\n", log_n, n);
+
+    // Generate test data in standard form (small deterministic values)
+    std::vector<FpElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+    }
+
+    // CPU reference: convert to Montgomery, run NTT, convert back
+    std::vector<ff_ref::FpRef> cpu_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        cpu_data[i] = ff_ref::to_montgomery(ff_ref::FpRef::from_u32(h_data[i].limbs));
+    }
+    ff_ref::ntt_forward_reference(cpu_data, n);
+    for (size_t i = 0; i < n; ++i) {
+        cpu_data[i] = ff_ref::from_montgomery(cpu_data[i]);
+    }
+
+    // GPU path: upload standard form, ntt_forward converts to/from Montgomery internally
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_forward(d_data, n, NTTMode::NAIVE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_result(n);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Compare
+    int pass_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        ff_ref::FpRef gpu_val = ff_ref::FpRef::from_u32(h_result[i].limbs);
+        if (gpu_val == cpu_data[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(n),
+        "NTT forward GPU vs CPU mismatch");
+    printf("  NTT forward (n=2^%d): %d/%zu matched\n", log_n, pass_count, n);
+
+    if (pass_count != static_cast<int>(n) && n <= 1024) {
+        // Print first few mismatches for debugging
+        int printed = 0;
+        for (size_t i = 0; i < n && printed < 5; ++i) {
+            ff_ref::FpRef gpu_val = ff_ref::FpRef::from_u32(h_result[i].limbs);
+            if (gpu_val != cpu_data[i]) {
+                printf("    [%zu] GPU: %08x%08x... CPU: %08x%08x...\n",
+                    i,
+                    static_cast<uint32_t>(gpu_val.limbs[3] >> 32),
+                    static_cast<uint32_t>(gpu_val.limbs[3]),
+                    static_cast<uint32_t>(cpu_data[i].limbs[3] >> 32),
+                    static_cast<uint32_t>(cpu_data[i].limbs[3]));
+                ++printed;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+// Roundtrip test: INTT(NTT(x)) == x
+void test_ntt_roundtrip_gpu(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_ntt_roundtrip_gpu (n=2^%d=%zu)...\n", log_n, n);
+
+    // Generate test data in standard form
+    std::vector<FpElement> h_original(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_original[i] = FpElement::zero();
+        h_original[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+    }
+
+    // GPU: forward NTT then inverse NTT
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_original.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_forward(d_data, n, NTTMode::NAIVE);
+    ntt_inverse(d_data, n, NTTMode::NAIVE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_result(n);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Compare with original
+    int pass_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (h_result[i] == h_original[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(n),
+        "NTT roundtrip mismatch");
+    printf("  NTT roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass_count, n);
+
+    if (pass_count != static_cast<int>(n) && n <= 1024) {
+        int printed = 0;
+        for (size_t i = 0; i < n && printed < 5; ++i) {
+            if (h_result[i] != h_original[i]) {
+                printf("    [%zu] got: %08x %08x... expected: %08x %08x...\n",
+                    i, h_result[i].limbs[7], h_result[i].limbs[6],
+                    h_original[i].limbs[7], h_original[i].limbs[6]);
+                ++printed;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -631,6 +746,16 @@ int main() {
     test_ff_sqr_soa_gpu();
 
     // Phase 4: NTT correctness tests (GPU NTT vs CPU DFT reference)
+    test_ntt_forward_gpu(10);  // 2^10 = 1024
+    test_ntt_forward_gpu(12);  // 2^12 = 4096
+    test_ntt_forward_gpu(15);  // 2^15 = 32768
+    test_ntt_forward_gpu(17);  // 2^17 = 131072
+    test_ntt_forward_gpu(20);  // 2^20 = 1048576
+    test_ntt_roundtrip_gpu(10);
+    test_ntt_roundtrip_gpu(12);
+    test_ntt_roundtrip_gpu(15);
+    test_ntt_roundtrip_gpu(17);
+    test_ntt_roundtrip_gpu(20);
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

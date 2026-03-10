@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 4 — Naive GPU NTT** (next up; Phase 3 complete)
+Current phase: **Phase 5 — Optimized Shared-Memory NTT** (next up; Phase 4 complete)
 
 ---
 

@@ -56,6 +56,8 @@ add_library(zkp_ntt_core STATIC
 set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+# ntt_naive.cu uses ff_reference.h for CPU-side twiddle computation
+target_include_directories(zkp_ntt_core PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
 # ─── Correctness Tests ────────────────────────────────────────────────────────
 add_executable(test_correctness

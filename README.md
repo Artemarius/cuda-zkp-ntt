@@ -54,12 +54,12 @@ Key implementation choices:
 | Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs. Baseline |
 |---|---|---|---|---|
 | bellperson (reference) | — | — | — | 1.0× |
-| Naive GPU NTT | | | | |
+| Naive GPU NTT (radix-2) | 5.94 ms | 26.3 ms | | |
 | + FF_mul optimization | | | | |
 | + Async pipeline | | | | |
 | **cuda-zkp-ntt (full)** | | | | |
 
-*Results populated after profiling runs — see `results/` directory.*
+*Phase 4 baseline numbers from RTX 3060. Remaining cells populated as optimizations land.*
 
 ---
 
