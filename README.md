@@ -48,7 +48,7 @@ Key implementation choices:
 
 ## Performance Results
 
-> Profiling conducted on NVIDIA RTX 3060 (Ampere, 28 SMs, CUDA 12.8).
+> Profiling conducted on NVIDIA RTX 3060 Laptop GPU (Ampere, 30 SMs, CUDA 12.8).
 > Reference baseline: bellperson NTT (radix-256 Cooley-Tukey).
 
 | Implementation | Scale 2²⁰ | Scale 2²² | Scale 2²⁴ | vs. Baseline |
@@ -68,6 +68,7 @@ Key implementation choices:
 ```
 cuda-zkp-ntt/
 ├── include/
+│   ├── cuda_utils.cuh         # CUDA_CHECK macro, GPU timer
 │   ├── ff_arithmetic.cuh      # Finite-field types and Montgomery mul
 │   ├── ntt.cuh                # NTT interface
 │   └── pipeline.cuh           # Async pipeline infrastructure
@@ -76,19 +77,22 @@ cuda-zkp-ntt/
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
 │   ├── ntt_optimized.cu       # Radix-256 NTT with shared memory twiddles
 │   ├── ntt_async.cu           # Double-buffered async pipeline
-│   └── benchmark.cu           # End-to-end benchmark harness
+│   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   └── test_correctness.cu    # Validation against CPU reference
+│   ├── test_correctness.cu    # Validation against CPU reference
+│   └── ff_reference.h         # CPU-only finite field + NTT reference oracle
 ├── benchmarks/
-│   └── bench_ntt.cu           # Google Benchmark integration
+│   ├── bench_ntt.cu           # Google Benchmark: NTT latency vs scale
+│   └── ff_microbench.cu       # Isolated FF_add / FF_mul throughput
 ├── profiling/
-│   ├── scripts/               # Nsight Compute automation scripts
+│   ├── scripts/               # Nsight Compute / Systems automation scripts
 │   └── README.md              # Profiling methodology
 ├── results/
 │   ├── screenshots/           # Nsight Compute roofline + warp analysis
 │   ├── data/                  # Raw benchmark CSV output
 │   └── analysis.md            # Annotated performance analysis
 ├── CMakeLists.txt
+├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization
 └── README.md
 ```

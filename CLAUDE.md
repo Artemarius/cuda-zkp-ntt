@@ -13,7 +13,7 @@ Two complementary optimization directions targeting BLS12-381 ZKP proof generati
 ## Development Environment
 
 - **OS**: Windows 10 Pro + WSL2 Ubuntu 22.04 (primary build target)
-- **GPU**: NVIDIA RTX 3060, 6GB VRAM, Ampere (sm_86), 28 SMs
+- **GPU**: NVIDIA RTX 3060 Laptop GPU, 6GB VRAM, Ampere (sm_86), 30 SMs
 - **CUDA**: 12.8
 - **Compiler**: GCC 11 (WSL2) / MSVC 2022 (Windows fallback)
 - **CMake**: 3.20+
@@ -93,7 +93,7 @@ src/
 
 tests/
   test_correctness.cu — Validates all NTT variants agree with CPU DFT reference
-  ff_reference.h      — CPU-only finite field for test oracle
+  ff_reference.h      — CPU-only finite field + NTT reference (test oracle)
 
 benchmarks/
   bench_ntt.cu        — Google Benchmark: latency vs scale for all variants
@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 1 — Scaffold**
+Current phase: **Phase 2 — Finite Field Foundation** (Phase 1 complete)
 
 ---
 

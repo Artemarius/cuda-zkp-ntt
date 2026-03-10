@@ -4,7 +4,7 @@ Replicating the ZKProphet (IISWC 2025) analysis framework on NVIDIA RTX 3060.
 
 ## Hardware
 
-- NVIDIA RTX 3060 (Ampere, sm_86, 28 SMs, 6GB GDDR6)
+- NVIDIA RTX 3060 Laptop GPU (Ampere, sm_86, 30 SMs, 6GB GDDR6)
 - PCIe 4.0 x16 (~32 GB/s peak)
 - INT32 throughput: ~3.19 TOPS
 
