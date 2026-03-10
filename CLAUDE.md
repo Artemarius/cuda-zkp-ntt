@@ -143,7 +143,7 @@ results/
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 
-Current phase: **Phase 3 — Direction B: IADD3-Path FF_mul** (in progress, SoA + branchless done)
+Current phase: **Phase 4 — Naive GPU NTT** (next up; Phase 3 complete)
 
 ---
 

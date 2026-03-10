@@ -9,7 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 
-// Kernel declarations from ff_mul.cu
+// Kernel declarations from ff_mul.cu — baseline
 extern __global__ void ff_mul_throughput_kernel(
     const FpElement* __restrict__ a,
     const FpElement* __restrict__ b,
@@ -33,9 +33,35 @@ extern __global__ void ff_sqr_throughput_kernel(
     FpElement* __restrict__ out,
     uint32_t n);
 
+// Kernel declarations from ff_mul.cu — v2 (branchless PTX reduction)
+extern __global__ void ff_mul_v2_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_add_v2_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_sub_v2_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
+extern __global__ void ff_sqr_v2_kernel(
+    const FpElement* __restrict__ a,
+    FpElement* __restrict__ out,
+    uint32_t n);
+
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s --mode <mode> [--size N]\n", prog);
-    fprintf(stderr, "  --mode   ff_mul | ff_add | ff_sub | ff_sqr | naive | optimized | async\n");
+    fprintf(stderr, "  --mode   ff_mul | ff_add | ff_sub | ff_sqr\n");
+    fprintf(stderr, "           ff_mul_v2 | ff_add_v2 | ff_sub_v2 | ff_sqr_v2\n");
+    fprintf(stderr, "           naive | optimized | async\n");
     fprintf(stderr, "  --size   log2 of element count (default: 20)\n");
 }
 
@@ -64,29 +90,33 @@ static void profile_ff(const char* mode, uint32_t n) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
 
+    // Helper lambda to dispatch kernel by mode name
+    auto launch = [&]() {
+        if (strcmp(mode, "ff_mul") == 0)
+            ff_mul_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_add") == 0)
+            ff_add_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_sub") == 0)
+            ff_sub_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_sqr") == 0)
+            ff_sqr_throughput_kernel<<<blocks, threads>>>(d_a, d_out, n);
+        else if (strcmp(mode, "ff_mul_v2") == 0)
+            ff_mul_v2_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_add_v2") == 0)
+            ff_add_v2_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_sub_v2") == 0)
+            ff_sub_v2_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
+        else if (strcmp(mode, "ff_sqr_v2") == 0)
+            ff_sqr_v2_kernel<<<blocks, threads>>>(d_a, d_out, n);
+    };
+
     // Warmup (not profiled by ncu --launch-skip)
-    if (strcmp(mode, "ff_mul") == 0) {
-        ff_mul_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_add") == 0) {
-        ff_add_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_sub") == 0) {
-        ff_sub_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_sqr") == 0) {
-        ff_sqr_throughput_kernel<<<blocks, threads>>>(d_a, d_out, n);
-    }
+    launch();
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Profiled kernel launch
     printf("Launching %s kernel: %d blocks x %d threads, %u elements\n", mode, blocks, threads, n);
-    if (strcmp(mode, "ff_mul") == 0) {
-        ff_mul_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_add") == 0) {
-        ff_add_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_sub") == 0) {
-        ff_sub_throughput_kernel<<<blocks, threads>>>(d_a, d_b, d_out, n);
-    } else if (strcmp(mode, "ff_sqr") == 0) {
-        ff_sqr_throughput_kernel<<<blocks, threads>>>(d_a, d_out, n);
-    }
+    launch();
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("Done.\n");
 
