@@ -69,9 +69,11 @@ CMake targets:
 
 ### NTT
 - All NTT operate on BLS12-381 scalar field elements
-- Input/output in standard (non-Montgomery) form; Montgomery conversion internal
-- Twiddle factors precomputed on device, stored in constant or global memory
-- NTT size must be power of 2, range [2^15 .. 2^26]
+- Input/output in standard (non-Montgomery) form
+- Two arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead)
+  and `NTTMode::BARRETT` (standard-form throughout, no conversion)
+- Twiddle factors precomputed on device: Montgomery twiddles + separate standard-form cache
+- NTT size must be power of 2, range [2^8 .. 2^26]
 - Butterfly operation: `A[i] += w * A[j]; A[j] = A[i] - 2*w*A[j]` (in-place Cooley-Tukey)
 
 ---
@@ -83,14 +85,14 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
-  ntt.cuh             — NTT public interface (all variants)
+  ntt.cuh             — NTT public interface (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC)
   pipeline.cuh        — AsyncNTTPipeline class interface
 
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
-  ntt_naive.cu        — Radix-2 NTT, no optimization (correctness baseline)
-  ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer fusion
-  ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC TU)
+  ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches
+  ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer (Montgomery + Barrett)
+  ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
   ntt_async.cu        — Double-buffered async pipeline NTT
   benchmark.cu        — Main benchmark entry point
 

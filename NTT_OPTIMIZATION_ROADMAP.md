@@ -25,13 +25,13 @@ forcing every access to hit DRAM.
 and near-ASIC performance on consumer GPUs. Their approach differs from ours in three
 fundamental ways:
 
-| Aspect | Our v1.1.0 | MoMA (CGO 2025) |
+| Aspect | Our v1.2.0-s2 | MoMA (CGO 2025) |
 |---|---|---|
-| Modular arithmetic | Montgomery (CIOS) | **Barrett reduction** (no domain conversion) |
+| Modular arithmetic | Montgomery (CIOS) **+ Barrett** (v1.2.0) | **Barrett reduction** (no domain conversion) |
 | NTT batching | Single NTT per call | **Batched** (8-64 concurrent NTTs) |
 | Code generation | Hand-tuned PTX | **SPIRAL auto-generated** (recursive rewrite rules) |
 | Data flow | Shared memory butterfly stages | **Register-centric** (minimize shmem) |
-| Montgomery overhead | ~3 ms (12% at 2^22) | **Zero** (Barrett needs no domain conversion) |
+| Montgomery overhead | **Eliminated** via Barrett mode (0 ms conversion) | **Zero** (Barrett needs no domain conversion) |
 
 **Reference**: "Code Generation for Cryptographic Kernels using Multi-word Modular Arithmetic
 on GPU" — [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
@@ -45,8 +45,9 @@ on GPU" — [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
 (eliminates 12% Montgomery conversion overhead) and batched NTT processing
 (multiple independent transforms in parallel for dramatically better GPU utilization).
 
-**Expected improvement:** 20-40% throughput for batch workloads; ~3 ms saving per
-single NTT from eliminating Montgomery conversion.
+**Expected improvement:** 20-40% throughput for batch workloads. Barrett NTT measured at
+-0.7 ms (2.5%) for single NTT at n=2^22 (conversion savings partially offset by heavier
+fused kernel compute). Batching is the primary throughput lever for this release.
 
 ### Session 1 — Barrett Reduction for BLS12-381 ✅ COMPLETE
 
@@ -159,8 +160,35 @@ eliminating the conversion overhead compensates. Profile both paths.
 **Deliverables:**
 - Barrett-path NTT (fused + outer kernels)
 - Benchmark comparison table: Barrett vs Montgomery
-- ncu profile comparison (instruction mix, throughput)
+- ncu profile comparison (instruction mix, throughput) — deferred to Session 4
 - Decision: adopt Barrett as default or keep Montgomery
+
+**Measured results (RTX 3060 Laptop, median of 5 reps):**
+
+| Size | Montgomery (OPTIMIZED) | Barrett | Delta |
+|---|---|---|---|
+| 2^15 | 0.339 ms | 0.397 ms | +17% slower |
+| 2^16 | 0.579 ms | 0.668 ms | +15% slower |
+| 2^18 | 1.36 ms | 1.35 ms | ~0% |
+| 2^20 | 6.07 ms | 6.02 ms | -1% faster |
+| **2^22** | **28.0 ms** | **27.3 ms** | **-2.5% faster** |
+
+**Analysis:**
+- Small sizes (2^15-2^16): Barrett slower because fused kernel is **compute-bound** (69%
+  utilization) and Barrett has 68% more instructions per ff_mul. Conversion overhead is
+  small at these sizes (~0.1 ms), so the extra compute cost dominates.
+- Large sizes (2^20-2^22): Barrett faster — outer stages (77% of time) are **memory-bound**,
+  so extra Barrett instructions are hidden. The ~3 ms conversion savings minus ~2.3 ms
+  fused kernel overhead yields ~0.7 ms net improvement.
+- Net improvement at 2^22 is -0.7 ms (not the projected -1.8 ms) because the fused kernel
+  overhead is ~2.3 ms (not the estimated 1.2 ms). Barrett's 68% more instructions hit
+  harder when the kernel is already at 69% compute utilization.
+- **Decision**: Keep both paths. Barrett is the better default for n >= 2^20. Batching
+  (Session 3) and 4-step NTT (v1.3.0) will benefit more since they reduce outer-stage
+  DRAM passes where conversion savings compound.
+
+**Tests:** 93/93 pass (70 existing + 23 new Barrett NTT tests).
+Barrett and Montgomery outputs are **bitwise identical** at all tested sizes (2^8..2^22).
 
 ---
 
@@ -550,8 +578,9 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
 
 **Cumulative target (n=2^22, single NTT):**
-- v1.1.0 (current): 25.2 ms
-- v1.2.0: ~22 ms (Barrett saves ~3 ms conversion) + dramatically better batch throughput
+- v1.1.0 (current): 25.2 ms (bench baseline), 28.0 ms (5-rep median with warmup variance)
+- v1.2.0 Barrett-only: 27.3 ms (measured, -0.7 ms vs Montgomery). Batching won't reduce
+  single-NTT time but improves throughput. Revised single target: ~27 ms.
 - v1.3.0: ~13-16 ms (4-step eliminates outer-stage DRAM passes)
 - v1.4.0: ~10-14 ms (register optimization + CUDA Graphs)
 
