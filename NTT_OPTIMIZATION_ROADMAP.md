@@ -25,10 +25,10 @@ forcing every access to hit DRAM.
 and near-ASIC performance on consumer GPUs. Their approach differs from ours in three
 fundamental ways:
 
-| Aspect | Our v1.2.0-s2 | MoMA (CGO 2025) |
+| Aspect | Our v1.2.0 | MoMA (CGO 2025) |
 |---|---|---|
-| Modular arithmetic | Montgomery (CIOS) **+ Barrett** (v1.2.0) | **Barrett reduction** (no domain conversion) |
-| NTT batching | Single NTT per call | **Batched** (8-64 concurrent NTTs) |
+| Modular arithmetic | Montgomery (CIOS) **+ Barrett** | **Barrett reduction** (no domain conversion) |
+| NTT batching | **Batched** (B=1..16, single launch set) | **Batched** (8-64 concurrent NTTs) |
 | Code generation | Hand-tuned PTX | **SPIRAL auto-generated** (recursive rewrite rules) |
 | Data flow | Shared memory butterfly stages | **Register-centric** (minimize shmem) |
 | Montgomery overhead | **Eliminated** via Barrett mode (0 ms conversion) | **Zero** (Barrett needs no domain conversion) |
@@ -636,18 +636,18 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | 10 | v1.4.0 | Phase-aware async pipeline | Compute/memory phase separation |
 | 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
 
-**Cumulative target (n=2^22, single NTT):**
-- v1.1.0 (current): 25.2 ms (bench baseline), 28.0 ms (5-rep median with warmup variance)
-- v1.2.0 Barrett-only: 27.3 ms (measured, -0.7 ms vs Montgomery). Batching won't reduce
-  single-NTT time but improves throughput. Revised single target: ~27 ms.
-- v1.3.0: ~13-16 ms (4-step eliminates outer-stage DRAM passes)
-- v1.4.0: ~10-14 ms (register optimization + CUDA Graphs)
+**Cumulative results (n=2^22, single NTT, 5-rep median):**
+- v1.1.0: 25.1 ms (Montgomery, fused K=10 + cooperative outer)
+- **v1.2.0: 24.9 ms (Barrett, -0.8%)** — minimal single-NTT gain; outer stages still dominate
+- v1.3.0 target: ~13-16 ms (4-step eliminates outer-stage DRAM passes)
+- v1.4.0 target: ~10-14 ms (register optimization + CUDA Graphs)
 
-**Batch throughput target (8× 2^22 NTTs):**
-- v1.1.0: 8 × 25.2 ms = ~202 ms (sequential)
-- v1.2.0: ~120-150 ms (batched kernel, shared twiddles)
-- v1.3.0: ~80-100 ms (4-step batched, all sub-NTTs in shmem)
-- v1.4.0: ~60-80 ms (register opt + CUDA Graphs + phase-aware pipeline)
+**Batch throughput (8× 2^22 NTTs):**
+- v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
+- **v1.2.0: 219 ms batched (~1.0x) / 216 ms sequential** — GPU saturated, no gain at 2^22.
+  Batching helps at 2^15 (1.52x) where GPU is underutilized.
+- v1.3.0 target: ~80-100 ms (4-step batched, all sub-NTTs in shmem)
+- v1.4.0 target: ~60-80 ms (register opt + CUDA Graphs + phase-aware pipeline)
 
 ---
 
