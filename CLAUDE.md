@@ -262,7 +262,7 @@ Phases 1-8 complete. Current version: **v1.3.0**.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 
 ### Future Releases
-- **v1.4.0** — Register optimization + CUDA Graphs (target: ~10-14 ms)
+- **v1.4.0** — Register optimization + outer-stage improvements + CUDA Graphs (target: ~18-22 ms)
 
 ---
 

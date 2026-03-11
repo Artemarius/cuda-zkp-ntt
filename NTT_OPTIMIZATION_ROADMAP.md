@@ -582,13 +582,14 @@ due to internal batch structure. But in absolute terms, Barrett batched is still
 
 ---
 
-## v1.4.0 — MoMA-Inspired Register Optimization + Phase-Aware Pipeline
+## v1.4.0 — MoMA-Inspired Register Optimization + CUDA Graphs
 
 **Goal:** Push arithmetic performance closer to MoMA's auto-generated code by adopting
-register-centric data flow patterns, and exploit the 4-step NTT's phase structure for
-optimal DMA overlap.
+register-centric data flow patterns, and reduce launch overhead with CUDA Graphs.
+Targets the cooperative outer stages directly (v1.3.0 showed 4-step adds overhead
+rather than removing it).
 
-**Expected improvement:** 10-20% single-NTT compute; 20-40% end-to-end pipeline
+**Expected improvement:** 10-20% single-NTT compute; 5-15% launch overhead reduction
 
 ### Session 9 — Register-Centric Butterfly + MoMA Carry Chain Patterns
 
@@ -631,35 +632,35 @@ We can't replicate the full SPIRAL code generator, but we can adopt the patterns
 
 ---
 
-### Session 10 — Phase-Aware Async Pipeline
+### Session 10 — Outer-Stage Optimization + Adaptive Pipeline
 
-**Objective:** Exploit the 4-step NTT's distinct compute/memory phases for optimal
-DMA overlap.
+**Objective:** Reduce the memory-bound outer-stage bottleneck (77% of time at n=2^22)
+through L2-aware scheduling and improved pipeline overlap.
 
-The 4-step NTT has a clear phase structure:
-- transpose (memory-bound) → sub-NTTs (compute-bound) → twiddle (compute-bound) →
-  transpose (memory-bound) → sub-NTTs (compute-bound)
-
-DMA transfers can overlap with compute phases without memory controller contention —
-solving the v1.1 pipeline's DMA interference problem at n=2^22.
+**Background — v1.3.0 lesson:**
+The 4-step NTT (Session 8) showed that restructuring the algorithm with transposes
+is slower than the cooperative approach. The outer stages remain the dominant bottleneck.
+This session targets them directly with microarchitectural optimizations.
 
 **Tasks:**
-- Implement phase-aware overlap strategy:
-  - During compute phases: issue H2D for next batch + D2H for previous batch
-  - During memory phases: pause DMA, let NTT have full DRAM bandwidth
-  - Use `cudaStreamWaitEvent` to gate DMA streams on phase boundaries
-- Extend `AsyncNTTPipeline` with 4-step NTT support
+- **L2-aware cooperative scheduling**: Process outer-stage butterflies in L2-sized
+  chunks rather than full-array sweeps. Group butterflies so that consecutive iterations
+  access nearby memory addresses, improving L2 hit rate.
+- **Radix-4 outer stages**: Fuse pairs of outer stages into radix-4 butterflies
+  (2 stages per kernel launch, halving launch count from 12 to 6). Each radix-4
+  butterfly does 2× the compute per memory access → better arithmetic intensity.
+- **Pipeline improvements**: Tune DMA overlap for the cooperative approach — overlap
+  H2D/D2H with the compute-bound fused kernel (not the memory-bound outer stages).
 - Implement adaptive dispatch:
   - n < 2^8: naive radix-2
-  - 2^8 ≤ n < 2^20: fused K=10 + cooperative outer
-  - n ≥ 2^20: 4-step NTT
-  - Batch mode: always 4-step (sub-NTTs provide natural parallelism)
-- Benchmark: phase-aware pipeline vs naive overlap vs sequential at 2^22
+  - n ≥ 2^8: fused K + cooperative outer (Barrett for single, Montgomery for batch)
+- Benchmark: outer-stage optimizations at 2^22
 
 **Deliverables:**
-- Phase-aware `AsyncNTTPipeline`
+- L2-aware cooperative outer kernel
+- Radix-4 outer-stage variant (optional, if beneficial)
 - Adaptive dispatch logic
-- Benchmark comparison + nsys timeline visualization
+- Benchmark comparison
 
 ---
 
@@ -669,12 +670,11 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 
 **Tasks:**
 - Implement CUDA Graph capture for:
-  - Single NTT (4-step sequence: transpose → sub-NTTs → twiddle → transpose → sub-NTTs)
+  - Single NTT (cooperative sequence: bit-reverse → fused K=10 → cooperative outer stages)
   - Batched NTT (same structure, more blocks)
-  - Graph instantiation caching by (n, batch_size) key
+  - Graph instantiation caching by (n, batch_size, mode) key
 - Final benchmark suite: all modes × all sizes × single/batch
 - Final ncu profiling: capture definitive roofline and warp stall screenshots
-- nsys timeline: visualize 4-step phase-aware pipeline overlap
 - Update all documentation: README, analysis.md, GUIDE.md, CLAUDE.md, profiling/README.md
 - Generate final charts
 - Tag v1.4.0 release
@@ -723,7 +723,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | **7** | **v1.3.0** | **4-step NTT: correctness + edge cases** ✅ | **Fallback + 221 tests** |
 | **8** | **v1.3.0** | **Benchmark + release (negative result)** ✅ | **+18% slower than Barrett** |
 | 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |
-| 10 | v1.4.0 | Phase-aware async pipeline | Compute/memory phase separation |
+| 10 | v1.4.0 | Outer-stage optimization + adaptive pipeline | L2-aware scheduling, radix-4 |
 | 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
 
 **Cumulative results (n=2^22, single NTT, 5-rep median):**
@@ -731,7 +731,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 - **v1.2.0: 24.9 ms (Barrett, -0.8%)** — minimal single-NTT gain; outer stages still dominate
 - **v1.3.0: 29.5 ms (4-Step, +18% SLOWER)** — 3 transposes + sub-NTT outer stages add overhead.
   **Best mode remains Barrett at 24.9 ms.** 4-step is a negative result.
-- v1.4.0 target: ~10-14 ms (register optimization + CUDA Graphs on cooperative approach)
+- v1.4.0 target: ~18-22 ms (register optimization + outer-stage improvements + CUDA Graphs)
 
 **Batch throughput (8× 2^22 NTTs):**
 - v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
@@ -739,7 +739,8 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
   Batching helps at 2^15 (1.52x) where GPU is underutilized.
 - **v1.3.0: 241 ms (4-step batched) vs 199 ms (Barrett batched)** — 4-step +21% slower.
   4-step benefits more from batching (1.16x vs 1.05x) but still slower in absolute terms.
-- v1.4.0 target: ~60-80 ms (register opt + CUDA Graphs on cooperative approach)
+  Best batch mode remains Barrett at 199 ms.
+- v1.4.0 target: ~150-180 ms (register opt + CUDA Graphs on cooperative approach)
 
 ---
 
