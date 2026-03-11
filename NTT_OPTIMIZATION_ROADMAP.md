@@ -417,8 +417,8 @@ in standard form avoids any conversion.
 - **Transpose kernel**: TILE=16, 256 threads/block, shmem padded 16×17 (FpElement is 32B,
   so TILE=16 uses 8.5 KB shmem — TILE=32 would use 34 KB). Supports arbitrary n1×n2.
 - **Batched transpose**: uses z-dimension gridDim for batch index
-- **4-step skeleton**: forward + inverse Barrett paths. Currently uses 4 transposes
-  (will optimize to 2 in Session 6). Reuses existing batched sub-NTT infrastructure.
+- **4-step skeleton**: forward + inverse Barrett paths. Uses 3 transposes
+  (Session 6 determined 3 are needed for natural output order). Reuses existing batched sub-NTT infrastructure.
 - **Twiddle multiply kernels**: pointwise data[i] *= omega_n^(i*j), Barrett and Montgomery
 
 **Deliverables:**

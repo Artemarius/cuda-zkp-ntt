@@ -210,7 +210,7 @@ LICENSE                — MIT License
 - Small sizes benefit most: single NTT at 2^15 barely fills 30 SMs; batch of 8 gives 8× blocks
 - Large sizes (2^22): GPU already saturated; batching saves launch overhead only
 
-### 4-Step NTT (in progress, v1.3.0 — Session 6 complete)
+### 4-Step NTT (in progress, v1.3.0 — Session 7 complete)
 - Bailey's algorithm: decompose n = n1 × n2 into sub-NTTs + transpose + twiddle multiply
 - For n=2^22 with n1=n2=2^11: each sub-NTT is 2048 elements → mostly fused in shmem
 - Eliminates outer-stage DRAM passes (sub-NTTs at 2048 elements have ≤1 outer stage, L2-resident)
