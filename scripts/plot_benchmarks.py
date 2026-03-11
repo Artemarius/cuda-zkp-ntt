@@ -197,10 +197,126 @@ def plot_sass_reduction():
     print(f"  {path}")
 
 
+def plot_barrett_vs_montgomery():
+    """Barrett vs Montgomery single NTT latency comparison."""
+    scales = ["2^15", "2^16", "2^18", "2^20", "2^22"]
+    montgomery = [0.132, 0.244, 1.21, 5.51, 25.1]
+    barrett =    [0.159, 0.308, 1.27, 5.61, 24.9]
+
+    x = np.arange(len(scales))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bars1 = ax.bar(x - w/2, montgomery, w, label="Montgomery (OPTIMIZED)", color="#5B9BD5", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x + w/2, barrett, w, label="Barrett", color="#70AD47", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Single NTT Latency — Montgomery vs Barrett (v1.2.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.set_ylim(0.1, 50)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Annotate delta
+    for i in range(len(scales)):
+        delta = (barrett[i] / montgomery[i] - 1) * 100
+        color = "#C00000" if delta > 0 else "#006400"
+        sign = "+" if delta > 0 else ""
+        ax.annotate(f"{sign}{delta:.0f}%",
+                    xy=(x[i] + w/2, barrett[i]),
+                    xytext=(0, 6), textcoords="offset points",
+                    ha="center", fontsize=8, fontweight="bold", color=color)
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "barrett_vs_montgomery.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_batch_throughput():
+    """Batched NTT throughput: batch vs sequential at different sizes."""
+    sizes = ["2^15", "2^18", "2^20", "2^22"]
+    batched_8 =    [1.12, 10.4, 48.0, 219]
+    sequential_8 = [1.70, 11.2, 48.3, 216]
+
+    x = np.arange(len(sizes))
+    w = 0.35
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), gridspec_kw={"width_ratios": [2, 1]})
+
+    # Left: latency bars
+    bars1 = ax1.bar(x - w/2, sequential_8, w, label="Sequential 8x", color="#A5A5A5", edgecolor="white", linewidth=0.5)
+    bars2 = ax1.bar(x + w/2, batched_8, w, label="Batched 8x", color="#ED7D31", edgecolor="white", linewidth=0.5)
+
+    ax1.set_xlabel("NTT Size (8 NTTs, Barrett mode)")
+    ax1.set_ylabel("Total Latency (ms)")
+    ax1.set_title("Batched vs Sequential NTT (v1.2.0)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(sizes)
+    ax1.legend(loc="upper left")
+    ax1.set_yscale("log")
+    ax1.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Right: speedup bars
+    speedups = [s / b for s, b in zip(sequential_8, batched_8)]
+    colors = ["#70AD47" if sp > 1.2 else "#FFC000" if sp > 1.05 else "#A5A5A5" for sp in speedups]
+    bars3 = ax2.bar(sizes, speedups, color=colors, edgecolor="white", linewidth=0.5)
+    ax2.set_ylabel("Speedup (x)")
+    ax2.set_title("Batch Speedup")
+    ax2.set_ylim(0.8, 1.8)
+    ax2.axhline(y=1.0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
+    ax2.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, sp in zip(bars3, speedups):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.03,
+                 f"{sp:.2f}x", ha="center", fontweight="bold", fontsize=10)
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "batch_throughput.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_batch_scaling():
+    """Per-NTT cost as batch size increases (Montgomery, 2^15)."""
+    batch_sizes = [1, 4, 8, 16]
+    per_ntt = [0.140, 0.131, 0.126, 0.124]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(batch_sizes, per_ntt, "o-", color="#5B9BD5", linewidth=2, markersize=8)
+    ax.fill_between(batch_sizes, per_ntt, alpha=0.15, color="#5B9BD5")
+
+    ax.set_xlabel("Batch Size (B)")
+    ax.set_ylabel("Per-NTT Latency (ms)")
+    ax.set_title("Per-NTT Cost vs Batch Size (Montgomery, 2^15)")
+    ax.set_xticks(batch_sizes)
+    ax.set_ylim(0.10, 0.16)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for i, (b, t) in enumerate(zip(batch_sizes, per_ntt)):
+        ax.annotate(f"{t:.3f} ms",
+                    xy=(b, t), xytext=(0, 10), textcoords="offset points",
+                    ha="center", fontsize=9, fontweight="bold")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "batch_scaling.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
 if __name__ == "__main__":
     print("Generating benchmark charts...")
     plot_ntt_compute()
     plot_async_pipeline()
     plot_kernel_profile()
     plot_sass_reduction()
+    plot_barrett_vs_montgomery()
+    plot_batch_throughput()
+    plot_batch_scaling()
     print("Done.")

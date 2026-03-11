@@ -222,9 +222,9 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-Phases 1-8 complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
+Phases 1-8 complete. Current version: **v1.2.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
 
-**v1.2.0 progress:** Sessions 1-3 (Barrett arithmetic + NTT integration + batched NTT) complete. Session 4 remaining.
+**v1.2.0:** All 4 sessions complete. Barrett arithmetic, Barrett NTT integration, batched NTT, benchmarks + documentation.
 
 ### Future Releases
 - **v1.2.0** — MoMA-inspired Barrett arithmetic + batched NTT (target: ~22 ms single, better batch throughput)

@@ -294,7 +294,7 @@ Batching improves GPU utilization in two ways:
 
 ---
 
-### Session 4 — Benchmark, Profile, Release v1.2.0
+### Session 4 — Benchmark, Profile, Release v1.2.0 ✅ COMPLETE
 
 **Objective:** Comprehensive benchmarking of Barrett + batching, profile, release.
 
@@ -329,6 +329,35 @@ Batching improves GPU utilization in two ways:
 - New ncu screenshots
 - Full regression pass (all tests green)
 - Git tag v1.2.0
+
+**Measured results (RTX 3060 Laptop, 5-rep median):**
+
+Single NTT forward:
+
+| Size | Naive | Montgomery | Barrett | Barrett vs Montgomery |
+|---|---|---|---|---|
+| 2^15 | 0.122 ms | 0.132 ms | 0.159 ms | +20% slower |
+| 2^16 | 0.228 ms | 0.244 ms | 0.308 ms | +26% slower |
+| 2^18 | 1.34 ms | 1.21 ms | 1.27 ms | +5% slower |
+| 2^20 | 5.88 ms | 5.51 ms | 5.61 ms | +2% slower |
+| **2^22** | **26.2 ms** | **25.1 ms** | **24.9 ms** | **-1% faster** |
+
+Batched 8× Barrett vs sequential:
+
+| Size | Batched 8× | Sequential 8× | Speedup |
+|---|---|---|---|
+| 2^15 | 1.12 ms | 1.70 ms | **1.52x** |
+| 2^18 | 10.4 ms | 11.2 ms | 1.08x |
+| 2^20 | 48.0 ms | 48.3 ms | ~1.0x |
+| 2^22 | 219 ms | 216 ms | ~1.0x |
+
+**Analysis:**
+- Barrett is faster at 2^22 single NTT (-1%) by avoiding Montgomery conversion overhead.
+- Batching wins dramatically at small sizes (1.52x at 2^15 where GPU is underutilized).
+- At 2^22, GPU is already saturated — batching saves only launch overhead.
+- v1.2.0's primary value is infrastructure: Barrett elimination of conversion cost compounds
+  in 4-step NTT (v1.3.0), and batched kernel API enables batch-of-sub-NTTs pattern.
+- **Tests**: 119/119 pass (full regression clean).
 
 ---
 

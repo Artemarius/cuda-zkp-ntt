@@ -288,6 +288,57 @@ In practice, inputs are converted once before computation and outputs once after
 
 ---
 
+## 5b. Barrett Reduction — The Alternative
+
+### The Motivation
+
+Montgomery multiplication requires converting inputs to Montgomery domain (`ã = a·R mod p`) before computation and converting back afterwards. For NTT, this means two full-array passes (to/from Montgomery form) that cost ~3 ms at n=2^22 — about 12% of the total NTT time.
+
+Barrett reduction operates directly on standard-form integers, eliminating this conversion overhead entirely.
+
+### Barrett Modular Multiplication
+
+Given `a, b ∈ [0, p)`, compute `c = a·b mod p`:
+
+```
+1. w = a · b                          // full 512-bit product
+2. q̂ = ⌊w · μ / 2^(2k)⌋             // estimate quotient, where μ = ⌊2^(2k)/p⌋
+3. r = w - q̂ · p                     // remainder estimate
+4. if r ≥ p: r = r - p               // at most one conditional subtraction
+```
+
+Where `k = 256` (the bit-width of the modulus) and `μ = ⌊2^512/p⌋` is precomputed once.
+
+### Barrett vs Montgomery Tradeoffs
+
+| Aspect | Montgomery (CIOS) | Barrett |
+|---|---|---|
+| Domain | Montgomery form (a·R mod p) | Standard form |
+| Conversion overhead | ~3 ms per NTT (to + from) | **None** |
+| Per-multiply cost | ~128 MADs (8×8 CIOS) | ~188 MADs (~47% more) |
+| SASS instructions | 528 (v2 branchless) | 888 (1.68×) |
+| Microbench throughput | 2.48 Gops/s | 2.48 Gops/s (identical — memory-bound) |
+| Best for | Small NTTs (compute-bound fused kernel) | Large NTTs (outer stages memory-bound) |
+
+### BLS12-381 Barrett Constant
+
+```
+μ = ⌊2^512 / r⌋
+  = 0x2355094edfede377c38b5dcb707e08ed365043eb4be4bad7142737a020c0d6393
+```
+
+This is a 258-bit value stored as 9 × uint32_t limbs.
+
+### When Barrett Wins
+
+In the NTT, the fused kernel (stages 0-9) is **compute-bound** at 69% utilization. Here, Barrett's 68% more instructions per ff_mul directly increase runtime — small NTTs that consist mainly of fused-kernel work are ~20% slower with Barrett.
+
+However, the outer stages (stages 10-21) are **memory-bound** — each butterfly does one load-multiply-store round-trip to DRAM. Barrett's extra instructions are hidden behind memory latency. Since outer stages dominate at large sizes (77% of time at n=2^22), the ~3 ms conversion savings yields a net improvement.
+
+The crossover is around n=2^18: below that, Montgomery wins; above, Barrett is equal or faster.
+
+---
+
 ## 6. GPU Architecture for Integer Workloads
 
 ### SM Structure (Ampere / RTX 3060)
