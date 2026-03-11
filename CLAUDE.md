@@ -230,6 +230,14 @@ LICENSE                — MIT License
   - Batched 4-step: B full NTTs → B*n2 column sub-NTTs + B*n1 row sub-NTTs
   - `NTTMode::FOUR_STEP` in public API (single + batched, forward + inverse)
   - Implementation: `src/ntt_4step.cu`
+- **Session 7 (complete):** Exhaustive correctness + edge cases + fallback logic
+  - Fallback: `FOUR_STEP` for n < 2^16 transparently delegates to Barrett (sub-NTTs need K=8 minimum = 256 elements)
+  - Forward + roundtrip tested for ALL sizes 2^10..2^22 (13 sizes, even + odd log_n)
+  - Known-vector tests: all-zeros, all-ones, single-nonzero, ascending, all-(p-1) at 5 sizes
+  - Inverse explicit: verified both inv(fwd(x))=x AND fwd(inv(x))=x at 4 sizes
+  - 4-step vs Barrett cross-validation at 11 sizes (bitwise identical)
+  - Batched B=8 vs sequential at 2^16, 2^18; batched at 9 additional size×B configurations
+  - Batched 4-step vs batched Barrett cross-validation at 5 size×B configurations
 
 ---
 
@@ -245,7 +253,7 @@ Phases 1-8 complete. Current version: **v1.2.0**.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 
 ### In Progress
-- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8). Session 6 complete (sub-NTT integration + NTTMode::FOUR_STEP). 157 tests.
+- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8). Session 7 complete (exhaustive correctness + fallback). 221 tests.
 
 ### Future Releases
 - **v1.4.0** — Register optimization + phase-aware pipeline + CUDA Graphs (target: ~10-14 ms)

@@ -484,10 +484,18 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         }
         case NTTMode::FOUR_STEP: {
             assert(n >= 2 && (n & (n - 1)) == 0);
-            ensure_twiddles_4step(n);
-            ntt_4step_forward_barrett(d_data, n,
-                s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
-                s_d_fwd_twiddles_4step, stream);
+            // 4-step requires sub-NTTs of at least 256 elements (K=8 fused kernel).
+            // Minimum full NTT size: 2^16 (sub-NTTs = 2^8 = 256).
+            // For smaller sizes, fall back to Barrett (same arithmetic, no conversion overhead).
+            if (n < (1u << 16)) {
+                ensure_twiddles_barrett(n);
+                ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
+            } else {
+                ensure_twiddles_4step(n);
+                ntt_4step_forward_barrett(d_data, n,
+                    s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
+                    s_d_fwd_twiddles_4step, stream);
+            }
             break;
         }
         case NTTMode::ASYNC:
@@ -534,11 +542,16 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         }
         case NTTMode::FOUR_STEP: {
             assert(n >= 2 && (n & (n - 1)) == 0);
-            ensure_twiddles_4step(n);
-            ntt_4step_inverse_barrett(d_data, n,
-                s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
-                s_d_inv_twiddles_4step,
-                s_n1_inv_4step, s_n2_inv_4step, stream);
+            if (n < (1u << 16)) {
+                ensure_twiddles_barrett(n);
+                ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            } else {
+                ensure_twiddles_4step(n);
+                ntt_4step_inverse_barrett(d_data, n,
+                    s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
+                    s_d_inv_twiddles_4step,
+                    s_n1_inv_4step, s_n2_inv_4step, stream);
+            }
             break;
         }
         case NTTMode::ASYNC:
@@ -579,10 +592,15 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         }
         case NTTMode::FOUR_STEP: {
             assert(n >= 2 && (n & (n - 1)) == 0);
-            ensure_twiddles_4step(n);
-            ntt_4step_forward_batch_barrett(d_data, batch_size, n,
-                s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
-                s_d_fwd_twiddles_4step, stream);
+            if (n < (1u << 16)) {
+                ensure_twiddles_barrett(n);
+                ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
+            } else {
+                ensure_twiddles_4step(n);
+                ntt_4step_forward_batch_barrett(d_data, batch_size, n,
+                    s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
+                    s_d_fwd_twiddles_4step, stream);
+            }
             break;
         }
         default:
@@ -618,11 +636,17 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         }
         case NTTMode::FOUR_STEP: {
             assert(n >= 2 && (n & (n - 1)) == 0);
-            ensure_twiddles_4step(n);
-            ntt_4step_inverse_batch_barrett(d_data, batch_size, n,
-                s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
-                s_d_inv_twiddles_4step,
-                s_n1_inv_4step, s_n2_inv_4step, stream);
+            if (n < (1u << 16)) {
+                ensure_twiddles_barrett(n);
+                ntt_inverse_batch_barrett(d_data, batch_size, n,
+                    s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            } else {
+                ensure_twiddles_4step(n);
+                ntt_4step_inverse_batch_barrett(d_data, batch_size, n,
+                    s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
+                    s_d_inv_twiddles_4step,
+                    s_n1_inv_4step, s_n2_inv_4step, stream);
+            }
             break;
         }
         default:

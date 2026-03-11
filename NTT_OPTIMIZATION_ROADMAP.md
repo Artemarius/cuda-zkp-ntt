@@ -486,7 +486,7 @@ in standard form avoids any conversion.
 
 ---
 
-### Session 7 — 4-Step NTT: Correctness + Edge Cases
+### Session 7 — 4-Step NTT: Correctness + Edge Cases ✅ COMPLETE
 
 **Objective:** Exhaustive correctness testing and edge case handling.
 
@@ -499,10 +499,38 @@ in standard form avoids any conversion.
 - Handle sizes where √n is not integer (odd log_n): use n1=2^(k/2), n2=2^((k+1)/2)
 - Verify inverse NTT uses correct inverse twiddles and n^{-1} scaling
 
+**Implementation details:**
+- **Fallback logic**: `NTTMode::FOUR_STEP` for n < 2^16 transparently delegates to Barrett
+  path (sub-NTTs need K=8 minimum = 256 elements). Applied to all 4 dispatch points:
+  `ntt_forward`, `ntt_inverse`, `ntt_forward_batch`, `ntt_inverse_batch`.
+- **Forward + roundtrip**: tested at ALL sizes 2^10..2^22 (13 sizes). Both even log_n
+  (n1=n2, true 4-step) and odd log_n (n1<n2, true 4-step) and small sizes (Barrett fallback).
+- **Known-vector patterns**: 6 patterns (all-zeros, all-ones, single-nonzero-at-0,
+  single-nonzero-at-mid, ascending, all-(p-1)) tested as roundtrip at 5 sizes.
+- **Inverse explicit**: both inv(fwd(x))=x AND fwd(inv(x))=x verified at 2^16, 2^17, 2^20, 2^22.
+- **Cross-validation**: 4-step vs Barrett bitwise identical at 11 sizes (2^10..2^22).
+  Covers fallback path (2^10..2^15) and true 4-step (2^16..2^22), even + odd log_n.
+- **Batched B=8**: vs sequential at 2^16 and 2^18 (key Groth16 workload size).
+- **Additional batched**: 9 more size×B configurations (2^10 B=4, 2^15 B=4, 2^17 B=4,
+  2^19 B=2, 2^22 B=2 sequential; 2^10 B=4, 2^15 B=8, 2^17 B=4, 2^19 B=2, 2^22 B=2 roundtrip).
+- **Batched cross-validation**: 4-step batch vs Barrett batch at 5 configurations.
+
 **Deliverables:**
-- Full test coverage for 4-step path (single + batched)
-- Fallback logic for small sizes
-- All existing tests still pass (no regressions)
+- Fallback logic in `ntt_naive.cu` dispatch (all 4 API entry points)
+- Full test coverage: 221 tests (157 existing + 64 new Session 7 tests)
+- All existing tests pass (no regressions)
+
+**Tests:** 221/221 pass (157 existing + 64 new):
+- Forward GPU vs CPU reference: 13 sizes (2^10..2^22)
+- Roundtrip INTT(NTT(x))=x: 13 sizes (2^10..2^22)
+- Known-vector roundtrip: 5 sizes × 6 patterns = 30 sub-tests
+- Forward zeros: 2 sizes (NTT(0) = 0)
+- Inverse explicit: 4 sizes × 2 directions = 8 sub-tests
+- 4-step vs Barrett cross-validation: 6 extra sizes
+- Batched B=8 vs sequential: 2 sizes
+- Batched vs sequential: 5 additional configurations
+- Batched roundtrip: 5 additional configurations
+- Batched 4-step vs batched Barrett: 5 configurations
 
 ---
 
@@ -668,7 +696,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | 4 | v1.2.0 | Benchmark, profile, release | — |
 | **5** | **v1.3.0** | **4-step NTT: transpose kernel + architecture** ✅ | **Bailey's algorithm** |
 | **6** | **v1.3.0** | **4-step NTT: sub-NTT integration (+ batch)** ✅ | **Sub-NTTs fit in shmem** |
-| 7 | v1.3.0 | 4-step NTT: correctness + edge cases | — |
+| **7** | **v1.3.0** | **4-step NTT: correctness + edge cases** ✅ | **Fallback + 221 tests** |
 | 8 | v1.3.0 | Benchmark, profile, release | — |
 | 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |
 | 10 | v1.4.0 | Phase-aware async pipeline | Compute/memory phase separation |
