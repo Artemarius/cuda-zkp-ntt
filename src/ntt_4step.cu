@@ -3,21 +3,23 @@
 // Decomposes n-point NTT into sub-NTTs that fit entirely in shared memory,
 // eliminating the memory-bound outer stages that dominate execution time.
 //
-// Algorithm for n = n1 * n2:
-//   1. View input as n1 x n2 matrix (row-major)
-//   2. Column NTTs: n2 independent n1-point NTTs (on columns)
-//      → Transpose to row-major, then batch n2 sub-NTTs on contiguous rows
-//   3. Twiddle multiply: pointwise data[i*n2+j] *= omega_n^(i*j)
-//   4. Row NTTs: n1 independent n2-point NTTs (on rows)
-//      → Transpose to column-major, batch n1 sub-NTTs, transpose back
+// Algorithm for n = n1 * n2 (input viewed as n1 x n2 row-major matrix):
+//   Forward NTT (2 transposes):
+//     1. Transpose n1 x n2 → d_tmp (n2 x n1): columns become contiguous rows
+//     2. Batch n2 independent n1-point sub-NTTs on d_tmp (column NTTs)
+//     3. Transpose d_tmp (n2 x n1) → d_data (n1 x n2): restore layout
+//     4. Twiddle multiply: d_data[i*n2+j] *= omega_n^(i*j)
+//     5. Batch n1 independent n2-point sub-NTTs on d_data (row NTTs, contiguous)
+//   Output is in natural order — no final transpose needed.
 //
 // Decomposition strategy:
 //   - Even log_n: n1 = n2 = sqrt(n) = 2^(log_n/2)
-//   - Odd log_n:  n1 = 2^((log_n-1)/2), n2 = 2^((log_n+1)/2)  (n2 > n1)
-//   - Sub-NTT size capped at 2^11 = 2048 (fits in fused K=10 kernel with shmem)
+//   - Odd log_n:  n1 = 2^(log_n/2), n2 = 2^(log_n - log_n/2)  (n2 >= n1)
+//   - Sub-NTT sizes fit in fused K=10 kernel (<=2048 elements: 1 outer stage max)
 //   - Minimum n for 4-step: n >= 2^16 (below that, fused+cooperative is fine)
 //
 // v1.3.0 Session 5: Transpose kernel + architecture skeleton
+// v1.3.0 Session 6: Sub-NTT integration, 2-transpose optimization, batched 4-step
 
 #include "ntt.cuh"
 #include "ff_arithmetic.cuh"
@@ -28,7 +30,7 @@
 #include <cassert>
 
 // ─── Transpose Kernel ────────────────────────────────────────────────────────
-// Transpose an n1 x n2 matrix of FpElement in-place (via out-of-place copy).
+// Transpose an n1 x n2 matrix of FpElement (out-of-place: src → dst).
 //
 // Classic GPU transpose pattern:
 //   - Each thread block handles a TILE x TILE tile
@@ -234,63 +236,40 @@ static __host__ void launch_transpose_batch(
         src, dst, rows, cols, batch_size);
 }
 
-// ─── 4-Step Twiddle Cache ────────────────────────────────────────────────────
-// Precomputed omega_n^(i*j) for the middle twiddle multiply step.
-// Separate caches for Barrett (standard form) and Montgomery.
+// ─── Extern sub-NTT dispatch (from ntt_optimized.cu) ────────────────────────
 
-// Forward declarations from ntt_naive.cu (linked via separable compilation)
-extern void ntt_forward_optimized_barrett(
-    FpElement* d_data, size_t n, const FpElement* d_twiddles, cudaStream_t stream);
-extern void ntt_inverse_optimized_barrett(
-    FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
-extern void ntt_forward_optimized_montgomery(
-    FpElement* d_data, size_t n, const FpElement* d_twiddles, cudaStream_t stream);
-extern void ntt_inverse_optimized_montgomery(
-    FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
-
-// Batched sub-NTT dispatch (from ntt_optimized.cu)
 extern void ntt_forward_batch_barrett(
     FpElement* d_data, int batch_size, size_t n,
     const FpElement* d_twiddles, cudaStream_t stream);
 extern void ntt_inverse_batch_barrett(
     FpElement* d_data, int batch_size, size_t n,
     const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
-extern void ntt_forward_batch_montgomery(
-    FpElement* d_data, int batch_size, size_t n,
-    const FpElement* d_twiddles, cudaStream_t stream);
-extern void ntt_inverse_batch_montgomery(
-    FpElement* d_data, int batch_size, size_t n,
-    const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
-
-// Extern conversion kernels from ntt_naive.cu
-extern __global__ void ntt_to_montgomery_kernel(FpElement* data, uint32_t n);
-extern __global__ void ntt_from_montgomery_kernel(FpElement* data, uint32_t n);
 
 // ─── 4-Step Forward NTT (Barrett, standard-form) ─────────────────────────────
 //
 // Input: d_data[0..n-1] in standard form
-// Output: NTT(d_data) in standard form
+// Output: NTT(d_data) in standard form (natural order)
 //
-// Steps:
-//   1. Interpret as n1 x n2 row-major matrix
-//   2. Transpose to n2 x n1 → column NTTs become contiguous row sub-NTTs
-//   3. Batch n2 independent n1-point sub-NTTs (column NTTs on transposed data)
-//   4. Transpose back to n1 x n2
-//   5. Twiddle multiply: data[i*n2+j] *= omega_n^(i*j)
-//   6. Transpose to n2 x n1
-//   7. Batch n1 independent n2-point sub-NTTs (row NTTs on transposed data)
-//   8. Transpose back to n1 x n2 (final output in original layout)
+// Bailey's 4-step algorithm with 3 transposes:
+//   1. Transpose d_data (n1×n2) → d_tmp (n2×n1): columns become contiguous rows
+//   2. Batch n2 independent n1-point sub-NTTs on d_tmp (column NTTs)
+//   3. Transpose d_tmp (n2×n1) → d_data (n1×n2): restore layout
+//   4. Twiddle multiply on d_data: data[i*n2+j] *= omega_n^(i*j)
+//   5. Batch n1 independent n2-point sub-NTTs on d_data (row NTTs, contiguous)
+//   6. Transpose d_data (n1×n2) → d_tmp (n2×n1): reorder to natural order
+//   7. Copy d_tmp → d_data
 //
-// Optimization: steps 4-6 can be fused to reduce transposes. For now,
-// keep them separate for correctness — fuse in Session 6/7 after validation.
+// Why the final transpose: the 4-step decomposition uses k = k1 + k2*n1
+// (mixed-radix output), so after steps 1-5 the result at position [k1][k2]
+// holds X[k2*n1+k1]. Transposing to n2×n1 places X[j] at flat index j.
 //
 // Temporary buffer: one n-element buffer for out-of-place transpose.
 
 void ntt_4step_forward_barrett(
     FpElement* d_data, size_t n,
-    const FpElement* d_twiddles_sub,       // sub-NTT twiddles (size max(n1,n2)/2)
-    const FpElement* d_twiddles_4step,     // 4-step twiddles (size n1*n2 = n)
-    FpElement n1_inv,                      // n1^{-1} for sub-NTT inverse (unused for forward)
+    const FpElement* d_twiddles_n1,    // sub-NTT twiddles for n1-point NTTs (size n1/2)
+    const FpElement* d_twiddles_n2,    // sub-NTT twiddles for n2-point NTTs (size n2/2)
+    const FpElement* d_twiddles_4step, // 4-step twiddles omega_n^(i*j), size n
     cudaStream_t stream
 ) {
     const uint32_t N = static_cast<uint32_t>(n);
@@ -303,40 +282,29 @@ void ntt_4step_forward_barrett(
     FpElement* d_tmp;
     CUDA_CHECK(cudaMalloc(&d_tmp, N * sizeof(FpElement)));
 
-    // Step 1-2: Transpose n1 x n2 → n2 x n1 (columns become rows)
+    // Step 1: Transpose d_data (n1×n2) → d_tmp (n2×n1)
     launch_transpose(d_data, d_tmp, n1, n2, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
-                                cudaMemcpyDeviceToDevice, stream));
 
-    // Step 3: Batch n2 independent n1-point sub-NTTs (Barrett)
-    // Data layout: n2 contiguous sub-arrays of size n1
-    ntt_forward_batch_barrett(d_data, static_cast<int>(n2), n1, d_twiddles_sub, stream);
+    // Step 2: Batch n2 independent n1-point sub-NTTs on d_tmp
+    ntt_forward_batch_barrett(d_tmp, static_cast<int>(n2), n1, d_twiddles_n1, stream);
 
-    // Step 4: Transpose back n2 x n1 → n1 x n2
-    launch_transpose(d_data, d_tmp, n2, n1, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
-                                cudaMemcpyDeviceToDevice, stream));
+    // Step 3: Transpose d_tmp (n2×n1) → d_data (n1×n2)
+    launch_transpose(d_tmp, d_data, n2, n1, stream);
 
-    // Step 5: Twiddle multiply: data[i*n2+j] *= omega_n^(i*j)
+    // Step 4: Twiddle multiply on d_data: data[i*n2+j] *= omega_n^(i*j)
     {
         uint32_t grid = (N + BLOCK - 1) / BLOCK;
         ntt_twiddle_multiply_kernel<<<grid, BLOCK, 0, stream>>>(
             d_data, d_twiddles_4step, N);
     }
 
-    // Step 6: Transpose n1 x n2 → n2 x n1
+    // Step 5: Batch n1 independent n2-point sub-NTTs on d_data (rows are contiguous)
+    ntt_forward_batch_barrett(d_data, static_cast<int>(n1), n2, d_twiddles_n2, stream);
+
+    // Step 6: Transpose d_data (n1×n2) → d_tmp (n2×n1) for natural output order
     launch_transpose(d_data, d_tmp, n1, n2, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
-                                cudaMemcpyDeviceToDevice, stream));
 
-    // Step 7: Batch n1 independent n2-point sub-NTTs (Barrett)
-    ntt_forward_batch_barrett(d_data, static_cast<int>(n1), n2, d_twiddles_sub, stream);
-
-    // Step 8: Transpose back n2 x n1 → n1 x n2 (restore original layout)
-    // Actually for forward NTT, we want the output in the standard order.
-    // The 4-step NTT output is naturally in transposed order after row NTTs.
-    // Final transpose: n1 x n2 layout restored.
-    launch_transpose(d_data, d_tmp, static_cast<uint32_t>(n1), n2, stream);
+    // Step 7: Copy d_tmp → d_data
     CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
                                 cudaMemcpyDeviceToDevice, stream));
 
@@ -344,15 +312,30 @@ void ntt_4step_forward_barrett(
 }
 
 // ─── 4-Step Inverse NTT (Barrett, standard-form) ─────────────────────────────
-// Mirror of forward: same structure with inverse twiddles and n^{-1} scaling.
+// Reverses the forward 4-step: input in natural order, output in natural order.
+//
+// Forward produced output via: col-NTTs → twiddle → row-NTTs → transpose.
+// Inverse reverses: un-transpose → inv-row-NTTs → inv-twiddle → inv-col-NTTs → transpose.
+//
+//   1. Transpose d_data (n2×n1) → d_tmp (n1×n2): undo final forward transpose
+//   2. Batch n1 independent n2-point inverse sub-NTTs on d_tmp (inverse row NTTs)
+//   3. Inverse twiddle multiply on d_tmp
+//   4. Transpose d_tmp (n1×n2) → d_data (n2×n1): columns become contiguous
+//   5. Batch n2 independent n1-point inverse sub-NTTs on d_data (inverse column NTTs)
+//   6. Transpose d_data (n2×n1) → d_tmp (n1×n2): restore natural order
+//   7. Copy d_tmp → d_data
+//
+// Sub-NTT inverse functions handle n_sub^{-1} scaling internally:
+//   row INTTs scale by n2^{-1}, column INTTs scale by n1^{-1}.
+//   Total: n1^{-1} * n2^{-1} = n^{-1}.
 
 void ntt_4step_inverse_barrett(
     FpElement* d_data, size_t n,
-    const FpElement* d_inv_twiddles_sub,   // inverse sub-NTT twiddles
-    const FpElement* d_inv_twiddles_4step, // inverse 4-step twiddles: omega_n^(-i*j)
-    FpElement n1_inv,                      // n1^{-1} for sub-NTT scaling
-    FpElement n2_inv,                      // n2^{-1} for sub-NTT scaling
-    FpElement n_inv,                       // n^{-1} = (n1*n2)^{-1} for final scaling
+    const FpElement* d_inv_twiddles_n1,    // inverse sub-NTT twiddles for n1-point INTTs
+    const FpElement* d_inv_twiddles_n2,    // inverse sub-NTT twiddles for n2-point INTTs
+    const FpElement* d_inv_twiddles_4step, // inverse 4-step twiddles omega_n^(-i*j), size n
+    FpElement n1_inv,                      // n1^{-1} for column sub-NTT scaling
+    FpElement n2_inv,                      // n2^{-1} for row sub-NTT scaling
     cudaStream_t stream
 ) {
     const uint32_t N = static_cast<uint32_t>(n);
@@ -364,39 +347,141 @@ void ntt_4step_inverse_barrett(
     FpElement* d_tmp;
     CUDA_CHECK(cudaMalloc(&d_tmp, N * sizeof(FpElement)));
 
-    // Step 1-2: Transpose n1 x n2 → n2 x n1
-    launch_transpose(d_data, d_tmp, n1, n2, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
-                                cudaMemcpyDeviceToDevice, stream));
-
-    // Step 3: Batch n2 independent n1-point inverse sub-NTTs
-    ntt_inverse_batch_barrett(d_data, static_cast<int>(n2), n1,
-                              d_inv_twiddles_sub, n1_inv, stream);
-
-    // Step 4: Transpose back n2 x n1 → n1 x n2
+    // Step 1: Transpose d_data (n2×n1) → d_tmp (n1×n2): undo forward's final transpose
+    // Input is in natural order = n2×n1 row-major from forward's perspective
     launch_transpose(d_data, d_tmp, n2, n1, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
-                                cudaMemcpyDeviceToDevice, stream));
 
-    // Step 5: Inverse twiddle multiply: data[i*n2+j] *= omega_n^(-i*j)
+    // Step 2: Batch n1 inverse n2-point sub-NTTs on d_tmp (rows are n2 elements, contiguous)
+    ntt_inverse_batch_barrett(d_tmp, static_cast<int>(n1), n2,
+                              d_inv_twiddles_n2, n2_inv, stream);
+
+    // Step 3: Inverse twiddle multiply on d_tmp: data[i*n2+j] *= omega_n^(-i*j)
     {
         uint32_t grid = (N + BLOCK - 1) / BLOCK;
         ntt_twiddle_multiply_kernel<<<grid, BLOCK, 0, stream>>>(
-            d_data, d_inv_twiddles_4step, N);
+            d_tmp, d_inv_twiddles_4step, N);
     }
 
-    // Step 6: Transpose n1 x n2 → n2 x n1
-    launch_transpose(d_data, d_tmp, n1, n2, stream);
+    // Step 4: Transpose d_tmp (n1×n2) → d_data (n2×n1): columns become contiguous rows
+    launch_transpose(d_tmp, d_data, n1, n2, stream);
+
+    // Step 5: Batch n2 inverse n1-point sub-NTTs on d_data (inverse column NTTs)
+    ntt_inverse_batch_barrett(d_data, static_cast<int>(n2), n1,
+                              d_inv_twiddles_n1, n1_inv, stream);
+
+    // Step 6: Transpose d_data (n2×n1) → d_tmp (n1×n2): restore natural order
+    launch_transpose(d_data, d_tmp, n2, n1, stream);
+
+    // Step 7: Copy d_tmp → d_data
     CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
                                 cudaMemcpyDeviceToDevice, stream));
 
-    // Step 7: Batch n1 independent n2-point inverse sub-NTTs
-    ntt_inverse_batch_barrett(d_data, static_cast<int>(n1), n2,
-                              d_inv_twiddles_sub, n2_inv, stream);
+    CUDA_CHECK(cudaFree(d_tmp));
+}
 
-    // Step 8: Transpose back
-    launch_transpose(d_data, d_tmp, static_cast<uint32_t>(n1), n2, stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, N * sizeof(FpElement),
+// ─── Batched 4-Step Forward NTT (Barrett) ────────────────────────────────────
+// Process B independent n-point NTTs using the 4-step algorithm.
+// Data layout: contiguous, d_data[b*n .. (b+1)*n-1] is NTT #b.
+//
+// For each NTT: n = n1 * n2, column NTTs → twiddle → row NTTs.
+// Step 1 column NTTs: B full NTTs = B*n2 sub-NTTs of size n1.
+// Step 2 row NTTs: B*n1 sub-NTTs of size n2.
+
+void ntt_4step_forward_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles_n1,
+    const FpElement* d_twiddles_n2,
+    const FpElement* d_twiddles_4step,
+    cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const uint32_t B = static_cast<uint32_t>(batch_size);
+    uint32_t n1, n2;
+    compute_4step_split(N, n1, n2);
+
+    static constexpr uint32_t BLOCK = 256;
+    const uint32_t total_elements = B * N;
+
+    FpElement* d_tmp;
+    CUDA_CHECK(cudaMalloc(&d_tmp, total_elements * sizeof(FpElement)));
+
+    // Step 1: Batched transpose of B matrices (n1×n2 each) → d_tmp (n2×n1 each)
+    launch_transpose_batch(d_data, d_tmp, n1, n2, B, stream);
+
+    // Step 2: Batch B*n2 independent n1-point sub-NTTs on d_tmp
+    ntt_forward_batch_barrett(d_tmp, static_cast<int>(B * n2), n1, d_twiddles_n1, stream);
+
+    // Step 3: Batched transpose of B matrices (n2×n1 each) → d_data (n1×n2 each)
+    launch_transpose_batch(d_tmp, d_data, n2, n1, B, stream);
+
+    // Step 4: Batched twiddle multiply (all B NTTs share same twiddle table)
+    {
+        uint32_t grid = (total_elements + BLOCK - 1) / BLOCK;
+        ntt_twiddle_multiply_batch_kernel<<<grid, BLOCK, 0, stream>>>(
+            d_data, d_twiddles_4step, N, total_elements);
+    }
+
+    // Step 5: Batch B*n1 independent n2-point sub-NTTs on d_data
+    ntt_forward_batch_barrett(d_data, static_cast<int>(B * n1), n2, d_twiddles_n2, stream);
+
+    // Step 6: Batched transpose d_data (n1×n2 each) → d_tmp (n2×n1 each): natural order
+    launch_transpose_batch(d_data, d_tmp, n1, n2, B, stream);
+
+    // Step 7: Copy d_tmp → d_data
+    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, total_elements * sizeof(FpElement),
+                                cudaMemcpyDeviceToDevice, stream));
+
+    CUDA_CHECK(cudaFree(d_tmp));
+}
+
+// ─── Batched 4-Step Inverse NTT (Barrett) ────────────────────────────────────
+
+void ntt_4step_inverse_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles_n1,
+    const FpElement* d_inv_twiddles_n2,
+    const FpElement* d_inv_twiddles_4step,
+    FpElement n1_inv,
+    FpElement n2_inv,
+    cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const uint32_t B = static_cast<uint32_t>(batch_size);
+    uint32_t n1, n2;
+    compute_4step_split(N, n1, n2);
+
+    static constexpr uint32_t BLOCK = 256;
+    const uint32_t total_elements = B * N;
+
+    FpElement* d_tmp;
+    CUDA_CHECK(cudaMalloc(&d_tmp, total_elements * sizeof(FpElement)));
+
+    // Step 1: Batched transpose (n2×n1 → n1×n2): undo forward's final transpose
+    launch_transpose_batch(d_data, d_tmp, n2, n1, B, stream);
+
+    // Step 2: Batch B*n1 inverse n2-point sub-NTTs (inverse row NTTs, scales by n2^{-1})
+    ntt_inverse_batch_barrett(d_tmp, static_cast<int>(B * n1), n2,
+                              d_inv_twiddles_n2, n2_inv, stream);
+
+    // Step 3: Batched inverse twiddle multiply
+    {
+        uint32_t grid = (total_elements + BLOCK - 1) / BLOCK;
+        ntt_twiddle_multiply_batch_kernel<<<grid, BLOCK, 0, stream>>>(
+            d_tmp, d_inv_twiddles_4step, N, total_elements);
+    }
+
+    // Step 4: Batched transpose (n1×n2 → n2×n1): columns become contiguous
+    launch_transpose_batch(d_tmp, d_data, n1, n2, B, stream);
+
+    // Step 5: Batch B*n2 inverse n1-point sub-NTTs (inverse column NTTs, scales by n1^{-1})
+    ntt_inverse_batch_barrett(d_data, static_cast<int>(B * n2), n1,
+                              d_inv_twiddles_n1, n1_inv, stream);
+
+    // Step 6: Batched transpose (n2×n1 → n1×n2): restore natural order
+    launch_transpose_batch(d_data, d_tmp, n2, n1, B, stream);
+
+    // Step 7: Copy d_tmp → d_data
+    CUDA_CHECK(cudaMemcpyAsync(d_data, d_tmp, total_elements * sizeof(FpElement),
                                 cudaMemcpyDeviceToDevice, stream));
 
     CUDA_CHECK(cudaFree(d_tmp));

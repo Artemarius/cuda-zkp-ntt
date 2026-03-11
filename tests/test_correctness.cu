@@ -610,6 +610,7 @@ static const char* mode_name(NTTMode m) {
         case NTTMode::OPTIMIZED: return "OPTIMIZED";
         case NTTMode::ASYNC:     return "ASYNC";
         case NTTMode::BARRETT:   return "BARRETT";
+        case NTTMode::FOUR_STEP: return "FOUR_STEP";
         default:                 return "UNKNOWN";
     }
 }
@@ -2060,6 +2061,125 @@ int main() {
     test_transpose_batch(16, 32, 4);
     test_transpose_batch(64, 64, 8);
     test_transpose_4step_sizes();  // 2048x2048 (actual 4-step decomposition)
+
+    // v1.3.0 Session 6: 4-Step NTT integration tests
+    // Forward correctness: 4-step NTT vs CPU reference
+    test_ntt_forward_gpu(16, NTTMode::FOUR_STEP);   // n1=n2=256 (even log_n)
+    test_ntt_forward_gpu(17, NTTMode::FOUR_STEP);   // n1=256, n2=512 (odd log_n)
+    test_ntt_forward_gpu(18, NTTMode::FOUR_STEP);   // n1=n2=512
+    test_ntt_forward_gpu(20, NTTMode::FOUR_STEP);   // n1=n2=1024 (all fused, 0 outer)
+    test_ntt_forward_gpu(22, NTTMode::FOUR_STEP);   // n1=n2=2048 (key target size)
+
+    // Roundtrip: INTT(NTT(x)) = x for 4-step path
+    test_ntt_roundtrip_gpu(16, NTTMode::FOUR_STEP);
+    test_ntt_roundtrip_gpu(17, NTTMode::FOUR_STEP);
+    test_ntt_roundtrip_gpu(18, NTTMode::FOUR_STEP);
+    test_ntt_roundtrip_gpu(20, NTTMode::FOUR_STEP);
+    test_ntt_roundtrip_gpu(22, NTTMode::FOUR_STEP);
+
+    // Cross-validation: 4-step NTT == Barrett NTT (bitwise, same arithmetic)
+    test_ntt_barrett_vs_montgomery(16);  // already tested, but re-verify
+    // Dedicated 4-step vs Barrett cross-validation
+    {
+        int four_step_sizes[] = {16, 17, 18, 20, 22};
+        for (int log_n : four_step_sizes) {
+            size_t nn = static_cast<size_t>(1) << log_n;
+            printf("test_4step_vs_barrett (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(nn);
+            for (size_t i = 0; i < nn; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+                h_data[i].limbs[1] = static_cast<uint32_t>((i * 54321u + 9876u) % 999999937u);
+            }
+
+            FpElement *d_4step, *d_barrett;
+            CUDA_CHECK(cudaMalloc(&d_4step, nn * sizeof(FpElement)));
+            CUDA_CHECK(cudaMalloc(&d_barrett, nn * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_4step, h_data.data(), nn * sizeof(FpElement), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_barrett, h_data.data(), nn * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            ntt_forward(d_4step, nn, NTTMode::FOUR_STEP);
+            ntt_forward(d_barrett, nn, NTTMode::BARRETT);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<FpElement> h_4step(nn), h_barrett(nn);
+            CUDA_CHECK(cudaMemcpy(h_4step.data(), d_4step, nn * sizeof(FpElement), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_barrett.data(), d_barrett, nn * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < nn; ++i) {
+                if (h_4step[i] == h_barrett[i]) ++pass;
+            }
+            TEST_ASSERT(pass == static_cast<int>(nn), "4-step vs Barrett mismatch");
+            printf("  4-step vs Barrett (n=2^%d): %d/%zu matched\n", log_n, pass, nn);
+
+            if (pass != static_cast<int>(nn)) {
+                int printed = 0;
+                for (size_t i = 0; i < nn && printed < 5; ++i) {
+                    if (h_4step[i] != h_barrett[i]) {
+                        printf("    [%zu] 4step: %08x%08x barrett: %08x%08x\n",
+                            i, h_4step[i].limbs[7], h_4step[i].limbs[6],
+                            h_barrett[i].limbs[7], h_barrett[i].limbs[6]);
+                        ++printed;
+                    }
+                }
+            }
+
+            CUDA_CHECK(cudaFree(d_4step));
+            CUDA_CHECK(cudaFree(d_barrett));
+        }
+    }
+
+    // Batched 4-step NTT tests
+    test_ntt_batch_vs_sequential(16, 4, NTTMode::FOUR_STEP);
+    test_ntt_batch_vs_sequential(18, 4, NTTMode::FOUR_STEP);
+    test_ntt_batch_vs_sequential(20, 2, NTTMode::FOUR_STEP);
+
+    // Batched 4-step roundtrip
+    test_ntt_batch_roundtrip(16, 4, NTTMode::FOUR_STEP);
+    test_ntt_batch_roundtrip(18, 4, NTTMode::FOUR_STEP);
+    test_ntt_batch_roundtrip(20, 2, NTTMode::FOUR_STEP);
+
+    // Batched 4-step vs Barrett cross-validation
+    {
+        printf("test_4step_batch_vs_barrett_batch (n=2^16, B=4)...\n");
+        int log_n = 16;
+        int batch_size = 4;
+        size_t nn = static_cast<size_t>(1) << log_n;
+        size_t total = static_cast<size_t>(batch_size) * nn;
+
+        std::vector<FpElement> h_data(total);
+        for (size_t i = 0; i < total; ++i) {
+            h_data[i] = FpElement::zero();
+            h_data[i].limbs[0] = static_cast<uint32_t>((i * 31337u + 42u) % 1000000007u);
+        }
+
+        FpElement *d_4step, *d_barrett;
+        CUDA_CHECK(cudaMalloc(&d_4step, total * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&d_barrett, total * sizeof(FpElement)));
+        CUDA_CHECK(cudaMemcpy(d_4step, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_barrett, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+        ntt_forward_batch(d_4step, batch_size, nn, NTTMode::FOUR_STEP);
+        ntt_forward_batch(d_barrett, batch_size, nn, NTTMode::BARRETT);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<FpElement> h_4step(total), h_barrett(total);
+        CUDA_CHECK(cudaMemcpy(h_4step.data(), d_4step, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_barrett.data(), d_barrett, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (size_t i = 0; i < total; ++i) {
+            if (h_4step[i] == h_barrett[i]) ++pass;
+        }
+        TEST_ASSERT(pass == static_cast<int>(total), "Batched 4-step vs Barrett mismatch");
+        printf("  Batched 4-step vs Barrett (n=2^%d, B=%d): %d/%zu matched\n",
+               log_n, batch_size, pass, total);
+
+        CUDA_CHECK(cudaFree(d_4step));
+        CUDA_CHECK(cudaFree(d_barrett));
+    }
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

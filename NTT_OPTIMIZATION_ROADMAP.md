@@ -436,7 +436,7 @@ in standard form avoids any conversion.
 
 ---
 
-### Session 6 — 4-Step NTT: Sub-NTT Integration
+### Session 6 — 4-Step NTT: Sub-NTT Integration ✅ COMPLETE
 
 **Objective:** Wire up the column NTTs, twiddle multiply, transpose, and row NTTs.
 
@@ -458,11 +458,31 @@ in standard form avoids any conversion.
   stages needed. **This is the sweet spot.**
 - n1=2^10, n2=2^12: sub-NTTs of 1024 and 4096 → K=10 fuses all of 1024; 4096 needs outer stages
 
+**Implementation details:**
+- **3-transpose algorithm** (not 2): Bailey's decomposition uses mixed-radix output
+  k = k1 + k2*n1 (column-major). After column NTTs + twiddle + row NTTs, the result
+  at position [k1][k2] holds X[k2*n1+k1]. A final transpose (n1×n2 → n2×n1) places
+  X[j] at flat index j for natural order.
+- **Forward:** transpose → n2 column NTTs → transpose → twiddle → n1 row NTTs → transpose + copy
+- **Inverse:** reverse forward steps — un-transpose → inv-row-NTTs → inv-twiddle → transpose
+  → inv-column-NTTs → transpose + copy. Sub-NTT inverse functions handle n_sub^{-1}
+  scaling (column INTTs: n1^{-1}, row INTTs: n2^{-1}, total: n^{-1}).
+- **4-step twiddle cache:** sub-NTT twiddles for n1 and n2 sizes (shared when n1==n2 for even
+  log_n, distinct for odd log_n) + omega_n^(i*j) table of size n. All in Barrett standard form.
+- **Batched 4-step:** B full NTTs = B*n2 column sub-NTTs + B*n1 row sub-NTTs. Batched transposes
+  via z-dimension gridDim. B*n twiddle multiply with index wrapping.
+- **Kernel count:** 3 transposes + 1 memcpy + 2 batch sub-NTTs + 1 twiddle = 7 operations per NTT.
+
 **Deliverables:**
-- Complete `ntt_4step_forward` and `ntt_4step_inverse` implementation
-- Integration with NTT dispatch (new `NTTMode::FOUR_STEP`)
-- Intermediate correctness checks (column NTTs alone, then full pipeline)
-- Batched 4-step path
+- Complete `ntt_4step_forward_barrett` / `ntt_4step_inverse_barrett` (single + batched)
+- `NTTMode::FOUR_STEP` in public API (`ntt_forward`, `ntt_inverse`, `ntt_forward_batch`, `ntt_inverse_batch`)
+- 4-step twiddle cache in `ntt_naive.cu` (`ensure_twiddles_4step`)
+- Correctness: 157/157 tests pass (134 existing + 23 new)
+  - Forward vs CPU reference (5 sizes: 2^16, 2^17, 2^18, 2^20, 2^22)
+  - Roundtrip INTT(NTT(x)) = x (5 sizes)
+  - Cross-validation: 4-step == Barrett (bitwise identical, 5 sizes)
+  - Batched forward vs sequential (3 sizes), batched roundtrip (3 sizes)
+  - Batched 4-step vs batched Barrett (2^16, B=4)
 
 ---
 
@@ -647,7 +667,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | 3 | v1.2.0 | Batched NTT kernel | MoMA batch processing pattern |
 | 4 | v1.2.0 | Benchmark, profile, release | — |
 | **5** | **v1.3.0** | **4-step NTT: transpose kernel + architecture** ✅ | **Bailey's algorithm** |
-| 6 | v1.3.0 | 4-step NTT: sub-NTT integration (+ batch) | Sub-NTTs fit in shmem |
+| **6** | **v1.3.0** | **4-step NTT: sub-NTT integration (+ batch)** ✅ | **Sub-NTTs fit in shmem** |
 | 7 | v1.3.0 | 4-step NTT: correctness + edge cases | — |
 | 8 | v1.3.0 | Benchmark, profile, release | — |
 | 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |

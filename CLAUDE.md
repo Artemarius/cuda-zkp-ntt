@@ -70,8 +70,9 @@ CMake targets:
 ### NTT
 - All NTT operate on BLS12-381 scalar field elements
 - Input/output in standard (non-Montgomery) form
-- Two arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead)
-  and `NTTMode::BARRETT` (standard-form throughout, no conversion)
+- Three arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead),
+  `NTTMode::BARRETT` (standard-form throughout, no conversion),
+  and `NTTMode::FOUR_STEP` (4-step Bailey's algorithm, Barrett arithmetic)
 - Batched NTT: `ntt_forward_batch()` / `ntt_inverse_batch()` process B independent NTTs
   in a single set of kernel launches. Contiguous memory layout: `d_data[b*n..(b+1)*n-1]`
 - Twiddle factors precomputed on device: Montgomery twiddles + separate standard-form cache
@@ -88,7 +89,7 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
-  ntt.cuh             — NTT public interface (single + batched, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC)
+  ntt.cuh             — NTT public interface (single + batched, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
   pipeline.cuh        — AsyncNTTPipeline class interface
 
 src/
@@ -96,7 +97,7 @@ src/
   ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches
   ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer (Montgomery + Barrett)
   ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
-  ntt_4step.cu        — 4-step NTT: transpose kernel, twiddle multiply, forward/inverse skeleton
+  ntt_4step.cu        — 4-step NTT: transpose kernel, twiddle multiply, forward/inverse (single + batched)
   ntt_async.cu        — Double-buffered async pipeline NTT
   benchmark.cu        — Main benchmark entry point
 
@@ -209,17 +210,25 @@ LICENSE                — MIT License
 - Small sizes benefit most: single NTT at 2^15 barely fills 30 SMs; batch of 8 gives 8× blocks
 - Large sizes (2^22): GPU already saturated; batching saves launch overhead only
 
-### 4-Step NTT (in progress, v1.3.0 — Session 5 complete)
+### 4-Step NTT (in progress, v1.3.0 — Session 6 complete)
 - Bailey's algorithm: decompose n = n1 × n2 into sub-NTTs + transpose + twiddle multiply
-- For n=2^22 with n1=n2=2^11: each sub-NTT is 2048 elements → fully fused in shmem
-- Eliminates outer-stage DRAM passes entirely (~3 DRAM passes vs current 12+)
+- For n=2^22 with n1=n2=2^11: each sub-NTT is 2048 elements → mostly fused in shmem
+- Eliminates outer-stage DRAM passes (sub-NTTs at 2048 elements have ≤1 outer stage, L2-resident)
 - Natural synergy with batching: B full NTTs = B×n2 sub-NTTs in step 1
 - **Session 5 (complete):** Transpose kernel + architecture skeleton
   - Transpose kernel: TILE=16, shmem padded 16×(16+1), coalesced R/W, supports non-square
   - Batched transpose via z-dimension gridDim
   - Split strategy: n1=2^(log_n/2), n2=2^(log_n-log_n/2) (balanced)
   - Twiddle multiply kernels (Barrett + Montgomery, single + batched)
-  - Forward/inverse 4-step skeleton (Barrett path), reuses batched sub-NTT infrastructure
+- **Session 6 (complete):** Sub-NTT integration, 3-transpose algorithm, NTTMode::FOUR_STEP
+  - Forward: transpose → n2 column NTTs → transpose → twiddle → n1 row NTTs → transpose
+  - Key insight: output is in mixed-radix order k=k1+k2*n1 (column-major); final transpose
+    to n2×n1 yields natural order. 3 transposes total (not 2).
+  - Inverse: reverse the forward steps with conjugate twiddles and n_sub^{-1} scaling
+  - 4-step twiddle cache: separate sub-NTT twiddles for n1 and n2 + omega_n^(i*j) table
+  - Shared twiddles when n1==n2 (even log_n); distinct tables for odd log_n
+  - Batched 4-step: B full NTTs → B*n2 column sub-NTTs + B*n1 row sub-NTTs
+  - `NTTMode::FOUR_STEP` in public API (single + batched, forward + inverse)
   - Implementation: `src/ntt_4step.cu`
 
 ---
@@ -236,7 +245,7 @@ Phases 1-8 complete. Current version: **v1.2.0**.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 
 ### In Progress
-- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8). Session 5 complete (transpose kernel + architecture). 134 tests.
+- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8). Session 6 complete (sub-NTT integration + NTTMode::FOUR_STEP). 157 tests.
 
 ### Future Releases
 - **v1.4.0** — Register optimization + phase-aware pipeline + CUDA Graphs (target: ~10-14 ms)

@@ -38,6 +38,27 @@ extern void ntt_inverse_batch_barrett(
     FpElement* d_data, int batch_size, size_t n,
     const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
 
+// 4-Step NTT dispatch (from ntt_4step.cu)
+extern void ntt_4step_forward_barrett(
+    FpElement* d_data, size_t n,
+    const FpElement* d_twiddles_n1, const FpElement* d_twiddles_n2,
+    const FpElement* d_twiddles_4step, cudaStream_t stream);
+extern void ntt_4step_inverse_barrett(
+    FpElement* d_data, size_t n,
+    const FpElement* d_inv_twiddles_n1, const FpElement* d_inv_twiddles_n2,
+    const FpElement* d_inv_twiddles_4step,
+    FpElement n1_inv, FpElement n2_inv, cudaStream_t stream);
+extern void ntt_4step_forward_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles_n1, const FpElement* d_twiddles_n2,
+    const FpElement* d_twiddles_4step, cudaStream_t stream);
+extern void ntt_4step_inverse_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles_n1, const FpElement* d_inv_twiddles_n2,
+    const FpElement* d_inv_twiddles_4step,
+    FpElement n1_inv, FpElement n2_inv, cudaStream_t stream);
+extern void ntt_4step_get_split(uint32_t n, uint32_t& n1, uint32_t& n2);
+
 // ─── Internal Twiddle Cache ──────────────────────────────────────────────────
 // Twiddles are computed on CPU (using ff_ref) and uploaded to device.
 // Forward: twiddles[k] = omega_n^k  for k = 0..n/2-1
@@ -65,6 +86,133 @@ static void free_cached_twiddles_barrett() {
     if (s_d_fwd_twiddles_barrett) { cudaFree(s_d_fwd_twiddles_barrett); s_d_fwd_twiddles_barrett = nullptr; }
     if (s_d_inv_twiddles_barrett) { cudaFree(s_d_inv_twiddles_barrett); s_d_inv_twiddles_barrett = nullptr; }
     s_cached_n_barrett = 0;
+}
+
+// ─── 4-Step Twiddle Cache ────────────────────────────────────────────────────
+// Caches sub-NTT twiddles for n1-point and n2-point transforms, plus the
+// 4-step twiddle table omega_n^(i*j). All in standard form (Barrett).
+// Keyed by n (from which n1, n2 are derived).
+
+static FpElement* s_d_fwd_twiddles_4s_n1 = nullptr;  // sub-NTT twiddles for n1-point (size n1/2)
+static FpElement* s_d_inv_twiddles_4s_n1 = nullptr;
+static FpElement* s_d_fwd_twiddles_4s_n2 = nullptr;  // sub-NTT twiddles for n2-point (size n2/2)
+static FpElement* s_d_inv_twiddles_4s_n2 = nullptr;
+static FpElement* s_d_fwd_twiddles_4step = nullptr;   // omega_n^(i*j), size n
+static FpElement* s_d_inv_twiddles_4step = nullptr;   // omega_n^(-i*j), size n
+static FpElement  s_n1_inv_4step;                      // n1^{-1} in standard form
+static FpElement  s_n2_inv_4step;                      // n2^{-1} in standard form
+static size_t     s_cached_n_4step = 0;
+
+static void free_cached_twiddles_4step() {
+    // Free n2 twiddles first (only if distinct from n1, i.e., n1 != n2)
+    if (s_d_fwd_twiddles_4s_n2 && s_d_fwd_twiddles_4s_n2 != s_d_fwd_twiddles_4s_n1) {
+        cudaFree(s_d_fwd_twiddles_4s_n2);
+    }
+    s_d_fwd_twiddles_4s_n2 = nullptr;
+    if (s_d_inv_twiddles_4s_n2 && s_d_inv_twiddles_4s_n2 != s_d_inv_twiddles_4s_n1) {
+        cudaFree(s_d_inv_twiddles_4s_n2);
+    }
+    s_d_inv_twiddles_4s_n2 = nullptr;
+    // Now free n1 twiddles
+    if (s_d_fwd_twiddles_4s_n1) { cudaFree(s_d_fwd_twiddles_4s_n1); s_d_fwd_twiddles_4s_n1 = nullptr; }
+    if (s_d_inv_twiddles_4s_n1) { cudaFree(s_d_inv_twiddles_4s_n1); s_d_inv_twiddles_4s_n1 = nullptr; }
+    if (s_d_fwd_twiddles_4step) { cudaFree(s_d_fwd_twiddles_4step); s_d_fwd_twiddles_4step = nullptr; }
+    if (s_d_inv_twiddles_4step) { cudaFree(s_d_inv_twiddles_4step); s_d_inv_twiddles_4step = nullptr; }
+    s_cached_n_4step = 0;
+}
+
+// Helper: compute standard-form twiddles for a given sub-NTT size and upload to device.
+static void compute_sub_twiddles_barrett(
+    size_t sub_n,
+    FpElement** d_fwd, FpElement** d_inv, FpElement* h_sub_inv
+) {
+    size_t half = sub_n / 2;
+
+    ff_ref::FpRef omega     = ff_ref::get_root_of_unity(sub_n);
+    ff_ref::FpRef omega_inv = ff_ref::fp_inv(omega);
+    ff_ref::FpRef one_mont;
+    one_mont.limbs = ff_ref::R_MOD;
+
+    std::vector<FpElement> h_fwd(half), h_inv(half);
+    ff_ref::FpRef wk     = one_mont;
+    ff_ref::FpRef wk_inv = one_mont;
+    for (size_t k = 0; k < half; ++k) {
+        ff_ref::FpRef wk_std     = ff_ref::from_montgomery(wk);
+        ff_ref::FpRef wk_inv_std = ff_ref::from_montgomery(wk_inv);
+        wk_std.to_u32(h_fwd[k].limbs);
+        wk_inv_std.to_u32(h_inv[k].limbs);
+        wk     = ff_ref::fp_mul(wk, omega);
+        wk_inv = ff_ref::fp_mul(wk_inv, omega_inv);
+    }
+
+    CUDA_CHECK(cudaMalloc(d_fwd, half * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(d_inv, half * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(*d_fwd, h_fwd.data(), half * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(*d_inv, h_inv.data(), half * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    // Compute sub_n^{-1} in standard form
+    ff_ref::FpRef n_mont     = ff_ref::to_montgomery(ff_ref::FpRef::from_u64(static_cast<uint64_t>(sub_n)));
+    ff_ref::FpRef n_inv_mont = ff_ref::fp_inv(n_mont);
+    ff_ref::FpRef n_inv_std  = ff_ref::from_montgomery(n_inv_mont);
+    n_inv_std.to_u32(h_sub_inv->limbs);
+}
+
+static void ensure_twiddles_4step(size_t n) {
+    if (s_cached_n_4step == n) return;
+    free_cached_twiddles_4step();
+
+    uint32_t n1, n2;
+    ntt_4step_get_split(static_cast<uint32_t>(n), n1, n2);
+
+    // Sub-NTT twiddles for n1-point and n2-point transforms
+    compute_sub_twiddles_barrett(n1, &s_d_fwd_twiddles_4s_n1, &s_d_inv_twiddles_4s_n1, &s_n1_inv_4step);
+    if (n2 != n1) {
+        compute_sub_twiddles_barrett(n2, &s_d_fwd_twiddles_4s_n2, &s_d_inv_twiddles_4s_n2, &s_n2_inv_4step);
+    } else {
+        // n1 == n2 (even log_n): reuse same twiddle tables
+        s_d_fwd_twiddles_4s_n2 = s_d_fwd_twiddles_4s_n1;
+        s_d_inv_twiddles_4s_n2 = s_d_inv_twiddles_4s_n1;
+        s_n2_inv_4step = s_n1_inv_4step;
+    }
+
+    // 4-step twiddle table: omega_n^(i*j) for i in [0,n1), j in [0,n2)
+    // Stored in row-major: index = i*n2 + j
+    ff_ref::FpRef omega_n = ff_ref::get_root_of_unity(n);
+    ff_ref::FpRef omega_n_inv = ff_ref::fp_inv(omega_n);
+
+    std::vector<FpElement> h_fwd_4s(n), h_inv_4s(n);
+
+    // omega_n^i for each row
+    ff_ref::FpRef one_mont;
+    one_mont.limbs = ff_ref::R_MOD;
+    ff_ref::FpRef omega_i = one_mont;  // omega_n^0 = 1
+    ff_ref::FpRef omega_inv_i = one_mont;
+
+    for (uint32_t i = 0; i < n1; ++i) {
+        // For row i: twiddle[i][j] = omega_n^(i*j)
+        ff_ref::FpRef omega_ij = one_mont;  // omega_n^(i*0) = 1
+        ff_ref::FpRef omega_inv_ij = one_mont;
+        for (uint32_t j = 0; j < n2; ++j) {
+            ff_ref::FpRef fwd_std = ff_ref::from_montgomery(omega_ij);
+            ff_ref::FpRef inv_std = ff_ref::from_montgomery(omega_inv_ij);
+            fwd_std.to_u32(h_fwd_4s[i * n2 + j].limbs);
+            inv_std.to_u32(h_inv_4s[i * n2 + j].limbs);
+
+            omega_ij = ff_ref::fp_mul(omega_ij, omega_i);
+            omega_inv_ij = ff_ref::fp_mul(omega_inv_ij, omega_inv_i);
+        }
+        omega_i = ff_ref::fp_mul(omega_i, omega_n);
+        omega_inv_i = ff_ref::fp_mul(omega_inv_i, omega_n_inv);
+    }
+
+    CUDA_CHECK(cudaMalloc(&s_d_fwd_twiddles_4step, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&s_d_inv_twiddles_4step, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(s_d_fwd_twiddles_4step, h_fwd_4s.data(),
+                          n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s_d_inv_twiddles_4step, h_inv_4s.data(),
+                          n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    s_cached_n_4step = n;
 }
 
 static int compute_log2(size_t n) {
@@ -334,6 +482,14 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
             break;
         }
+        case NTTMode::FOUR_STEP: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_4step(n);
+            ntt_4step_forward_barrett(d_data, n,
+                s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
+                s_d_fwd_twiddles_4step, stream);
+            break;
+        }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_forward(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
             break;
@@ -376,6 +532,15 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             break;
         }
+        case NTTMode::FOUR_STEP: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_4step(n);
+            ntt_4step_inverse_barrett(d_data, n,
+                s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
+                s_d_inv_twiddles_4step,
+                s_n1_inv_4step, s_n2_inv_4step, stream);
+            break;
+        }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_inverse(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
             break;
@@ -412,6 +577,14 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
             break;
         }
+        case NTTMode::FOUR_STEP: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_4step(n);
+            ntt_4step_forward_batch_barrett(d_data, batch_size, n,
+                s_d_fwd_twiddles_4s_n1, s_d_fwd_twiddles_4s_n2,
+                s_d_fwd_twiddles_4step, stream);
+            break;
+        }
         default:
             fprintf(stderr, "ntt_forward_batch: mode %d not supported for batching\n",
                     static_cast<int>(mode));
@@ -441,6 +614,15 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             ensure_twiddles_barrett(n);
             ntt_inverse_batch_barrett(d_data, batch_size, n,
                 s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            break;
+        }
+        case NTTMode::FOUR_STEP: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_4step(n);
+            ntt_4step_inverse_batch_barrett(d_data, batch_size, n,
+                s_d_inv_twiddles_4s_n1, s_d_inv_twiddles_4s_n2,
+                s_d_inv_twiddles_4step,
+                s_n1_inv_4step, s_n2_inv_4step, stream);
             break;
         }
         default:
