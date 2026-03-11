@@ -1,0 +1,495 @@
+# NTT Optimization Roadmap — Future Releases
+
+## Current State (v1.1.0)
+
+**Benchmark (RTX 3060 Laptop, n=2^22):** 25.2 ms (single NTT, compute only)
+**Target:** ≤20 ms (not met — outer stages are memory-bandwidth-limited)
+
+### Where Time Goes (n=2^22, 4 kernel launches)
+
+| Phase | Duration | % of Total | Bottleneck |
+|---|---|---|---|
+| Bit-reverse permutation | ~0.3 ms | 1% | Memory (scatter) |
+| Fused K=10 (stages 0-9) | ~2.5 ms | 10% | **Compute** (69%, IPC 2.41) |
+| Cooperative outer (stages 10-21) | ~19.4 ms | 77% | **Memory** (DRAM R-M-W) |
+| Montgomery conversion (to/from) | ~3.0 ms | 12% | Memory |
+
+**Root cause**: Each outer-stage butterfly reads 2 FpElements (64 B) + 1 twiddle (32 B)
+from DRAM, performs 1 ff_mul + 1 ff_add + 1 ff_sub, then writes 2 FpElements back.
+With stride doubling each stage, data quickly exceeds L2 capacity (4 MB on RTX 3060),
+forcing every access to hit DRAM.
+
+### Key Gaps vs State-of-the-Art
+
+**MoMA** (Zhang & Franchetti, CGO 2025) achieves 13× over ICICLE for 256-bit NTTs on H100
+and near-ASIC performance on consumer GPUs. Their approach differs from ours in three
+fundamental ways:
+
+| Aspect | Our v1.1.0 | MoMA (CGO 2025) |
+|---|---|---|
+| Modular arithmetic | Montgomery (CIOS) | **Barrett reduction** (no domain conversion) |
+| NTT batching | Single NTT per call | **Batched** (8-64 concurrent NTTs) |
+| Code generation | Hand-tuned PTX | **SPIRAL auto-generated** (recursive rewrite rules) |
+| Data flow | Shared memory butterfly stages | **Register-centric** (minimize shmem) |
+| Montgomery overhead | ~3 ms (12% at 2^22) | **Zero** (Barrett needs no domain conversion) |
+
+**Reference**: "Code Generation for Cryptographic Kernels using Multi-word Modular Arithmetic
+on GPU" — [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
+[CMU SPIRAL](https://spiral.ece.cmu.edu/pub-spiral/abstract.jsp?id=376)
+
+---
+
+## v1.2.0 — MoMA-Inspired Arithmetic + Batched NTT
+
+**Goal:** Adopt the two highest-impact techniques from MoMA: Barrett reduction
+(eliminates 12% Montgomery conversion overhead) and batched NTT processing
+(multiple independent transforms in parallel for dramatically better GPU utilization).
+
+**Expected improvement:** 20-40% throughput for batch workloads; ~3 ms saving per
+single NTT from eliminating Montgomery conversion.
+
+### Session 1 — Barrett Reduction for BLS12-381
+
+**Objective:** Implement Barrett modular arithmetic as alternative to Montgomery,
+eliminating the to/from Montgomery conversion overhead.
+
+**Background — Why Barrett:**
+Montgomery multiplication requires all operands to be in Montgomery domain
+(x̃ = x·R mod p). Our NTT spends ~3 ms (12% of total) on `to_montgomery` and
+`from_montgomery` conversions. Barrett reduction operates on standard-form integers
+directly:
+
+```
+Barrett: c = a·b mod p  (standard form in, standard form out)
+Montgomery: c̃ = ã·b̃·R⁻¹ mod p  (requires a→ã and c̃→c conversions)
+```
+
+MoMA uses Barrett exclusively. For the NTT butterfly (`t = ω·A[j]`, `A[i] ± t`),
+Barrett avoids two full-array conversion passes.
+
+**Tasks:**
+- Implement `ff_mul_barrett(a, b, p)` for BLS12-381 scalar field (8×32-bit limbs):
+  - Precompute Barrett constant μ = ⌊2^(2k) / p⌋ where k = 256 (ceil of 255-bit modulus)
+  - Full 512-bit product: a×b (schoolbook or Karatsuba)
+  - Barrett quotient estimate: q̂ = ⌊(a×b) · μ / 2^(2k)⌋
+  - Reduction: r = a×b − q̂·p, conditional subtract if r ≥ p
+- Implement `ff_add_barrett` / `ff_sub_barrett` (same as current — no Montgomery needed)
+- Device functions: `__device__ __forceinline__` in new `include/ff_barrett.cuh`
+- CPU reference Barrett implementation in `tests/ff_reference.h` for validation
+- Correctness tests: Barrett vs Montgomery output for 10^6 random inputs
+- Microbenchmark: Barrett vs Montgomery isolated throughput
+
+**Key analysis point:** Barrett requires a wider intermediate product (512-bit) and
+an extra multiply by μ, vs Montgomery's cheaper CIOS reduction. The question is whether
+eliminating the conversion overhead compensates. Profile both paths.
+
+**Trade-off to evaluate:**
+- Barrett: no conversion overhead, but ~30% more instructions per ff_mul
+- Montgomery: cheaper per-multiply, but pays ~3 ms conversion tax per NTT call
+- Breakeven: if conversion saves > per-multiply overhead × num_multiplies
+- For NTT: ~n·log(n)/2 butterflies × 1 ff_mul each = ~46M ff_mul for n=2^22
+  vs 2×n = 8M ff_mul for conversion → Barrett wins if per-mul overhead < 5.75×
+
+**Deliverables:**
+- `include/ff_barrett.cuh` with Barrett arithmetic device functions
+- CPU reference Barrett in `tests/ff_reference.h`
+- Correctness tests + microbenchmark comparison
+- Analysis: Barrett vs Montgomery instruction count (cuobjdump SASS comparison)
+
+---
+
+### Session 2 — Barrett NTT Integration + Benchmarking
+
+**Objective:** Integrate Barrett arithmetic into the NTT pipeline and measure end-to-end impact.
+
+**Tasks:**
+- Create Barrett-path NTT variants:
+  - Modify twiddle factor storage: store in standard form (not Montgomery form)
+  - NTT butterfly using `ff_mul_barrett` for twiddle×element multiply
+  - `ff_add` / `ff_sub` remain unchanged (no Montgomery dependency)
+  - Remove `to_montgomery` / `from_montgomery` wrapper calls
+- Add `NTTMode::BARRETT` to public API (keep Montgomery path as baseline)
+- Integrate into fused K=10 kernel: swap ff_mul_mont → ff_mul_barrett
+- Integrate into cooperative outer kernel: same swap
+- Correctness: test Barrett NTT against CPU reference for all sizes
+- Benchmark: Barrett vs Montgomery NTT for sizes 2^15 through 2^22
+- Profile with ncu: compare instruction mix, DRAM throughput, IPC
+- Key metric: is the per-butterfly overhead of Barrett > or < conversion saving?
+
+**Deliverables:**
+- Barrett-path NTT (fused + outer kernels)
+- Benchmark comparison table: Barrett vs Montgomery
+- ncu profile comparison (instruction mix, throughput)
+- Decision: adopt Barrett as default or keep Montgomery
+
+---
+
+### Session 3 — Batched NTT Kernel
+
+**Objective:** Process multiple independent NTTs in a single kernel launch for
+dramatically better GPU utilization.
+
+**Background — Why Batching:**
+Groth16 proof generation requires ~9 independent NTTs of the same size. FHE workloads
+need even more. Our current implementation processes them sequentially (1 NTT per call).
+MoMA shows optimal batch size >8 for 128-384 bit inputs — matching Groth16's 9 NTTs.
+
+Batching improves GPU utilization in two ways:
+1. **More thread blocks** → more SMs active simultaneously (especially at smaller sizes
+   where a single NTT doesn't fill all 30 SMs)
+2. **Amortized launch overhead** → one launch for B NTTs instead of B separate launches
+3. **Better memory bandwidth utilization** → interleaved access across B arrays
+
+**Tasks:**
+- Design batched NTT API:
+  ```cpp
+  void ntt_forward_batch(FpElement** d_arrays, int batch_size, uint32_t n, NTTMode mode);
+  // or: contiguous layout with stride
+  void ntt_forward_batch(FpElement* d_data, int batch_size, uint32_t n, NTTMode mode);
+  ```
+- **Fused kernel batching**: Each thread block already processes 1024 elements independently.
+  For batch of B NTTs of size n: launch `B × (n/1024)` blocks. Block ID determines
+  which NTT and which sub-array within that NTT. Shared memory usage unchanged.
+- **Outer stage batching**: Cooperative kernel processes butterflies across all B arrays.
+  `grid.sync()` synchronizes across all blocks (all NTTs must complete each stage together).
+  Alternative: separate cooperative launch per NTT (simpler but more launches).
+- **Bit-reverse batching**: Trivially parallelizable across B arrays.
+- **Twiddle factor sharing**: All B NTTs of the same size share the same twiddle table.
+  Single precomputation, B× reuse — better cache utilization.
+- Correctness: batch of 8 NTTs vs 8 sequential single NTTs
+- Benchmark: batch throughput vs sequential for batch_size = 1, 2, 4, 8, 16, 32
+
+**Expected results:**
+- At n=2^15 (small): massive improvement (single NTT barely fills the GPU)
+- At n=2^22 (large): moderate improvement (single NTT already fills SMs, but
+  twiddle cache reuse and launch amortization still help)
+
+**Deliverables:**
+- Batched NTT API and kernel implementations
+- Correctness tests for batch mode
+- Throughput benchmark: NTTs/second for varying batch sizes
+
+---
+
+### Session 4 — Benchmark, Profile, Release v1.2.0
+
+**Objective:** Comprehensive benchmarking of Barrett + batching, profile, release.
+
+**Tasks:**
+- Full benchmark matrix: {Montgomery, Barrett} × {single, batch-8} × {2^15..2^22}
+- Profile batched kernel with ncu: occupancy, SM utilization, memory throughput
+- Profile Barrett vs Montgomery: instruction mix comparison (SASS)
+- Capture screenshots: batched NTT occupancy, Barrett vs Montgomery roofline
+- Update analysis.md with new sections on Barrett arithmetic and batching
+- Update README performance tables (add batch throughput table)
+- Update CLAUDE.md, GUIDE.md (add Barrett reduction section)
+- Update plot_benchmarks.py with new data
+- Tag v1.2.0 release
+
+**Deliverables:**
+- Updated benchmark tables + charts
+- New ncu screenshots
+- Git tag v1.2.0
+
+---
+
+## v1.3.0 — 4-Step NTT Algorithm
+
+**Goal:** Restructure the NTT algorithm so all butterfly stages operate on shmem-resident
+data, eliminating the memory-bound outer-stage bottleneck entirely. Combine with batching
+for maximum throughput.
+
+**Expected improvement:** 30-50% at n=2^22 (target: ≤16 ms single, much better batched)
+
+### Background: 4-Step NTT (Bailey's Algorithm)
+
+For n = n1 × n2, decompose the n-point NTT into:
+
+1. **Column NTTs**: n2 independent n1-point NTTs (each fits in shared memory)
+2. **Twiddle multiply**: pointwise multiplication by ω^(i·j) for all i,j
+3. **Row NTTs**: n1 independent n2-point NTTs (each fits in shared memory)
+
+For n=2^22 with n1=n2=2^11:
+- Step 1: 2048 independent 2048-point NTTs → each uses the fused K=10 kernel (all in shmem)
+- Step 2: 2^22 pointwise ff_mul operations (compute-bound, embarrassingly parallel)
+- Step 3: 2048 independent 2048-point NTTs → same as step 1
+
+**Key insight:** No outer stages at all. Every butterfly operates on shmem-resident data.
+The only DRAM traffic is the initial load, the twiddle multiply pass, and the final store.
+
+**Synergy with batching:** Step 1 is already a batch of 2048 sub-NTTs. With external
+batching of B full NTTs, step 1 becomes B×2048 independent sub-NTTs — perfect GPU
+utilization even on large GPUs.
+
+**Synergy with Barrett:** 4-step NTT benefits even more from Barrett because the twiddle
+multiply (step 2) is a standalone kernel with n pointwise multiplications — having data
+in standard form avoids any conversion.
+
+### Session 5 — 4-Step NTT: Transpose Kernel + Architecture
+
+**Objective:** Design the 4-step decomposition and implement the transpose kernel.
+
+**Tasks:**
+- Design the 4-step decomposition for the NTT size range [2^10, 2^26]:
+  - Choose n1, n2 split strategy (prefer n1=n2=√n when possible)
+  - Handle non-square cases (n1 ≠ n2) for odd log_n
+- Implement efficient matrix transpose kernel for FpElement data:
+  - Shared-memory tiled transpose (32×32 tiles to avoid bank conflicts)
+  - Coalesced reads + coalesced writes (classic GPU transpose pattern)
+  - Handle non-square transpose (n1 ≠ n2)
+- Implement twiddle factor precomputation for 4-step:
+  - Twiddle table: ω^(i·j) for 0 ≤ i < n1, 0 ≤ j < n2
+  - Can reuse existing twiddle infrastructure with index remapping
+- Skeleton of `ntt_4step_forward` / `ntt_4step_inverse` host functions
+- Unit tests for transpose kernel correctness
+
+**Deliverables:**
+- New `src/ntt_4step.cu` with transpose kernel and host dispatch skeleton
+- Transpose correctness tests
+- Design doc in code comments explaining the decomposition
+
+---
+
+### Session 6 — 4-Step NTT: Sub-NTT Integration
+
+**Objective:** Wire up the column NTTs, twiddle multiply, transpose, and row NTTs.
+
+**Tasks:**
+- Implement column NTT pass: launch fused kernel on n2 independent sub-arrays
+  - Data layout: n1 × n2 matrix in row-major → column NTTs operate on columns
+  - Option A: transpose first, then batch sub-NTTs on contiguous rows
+  - Option B: strided sub-NTT launch (less efficient memory access)
+- Implement twiddle multiply kernel: pointwise `ff_mul(data[i], twiddle[i])` for all i
+  - Use Barrett if v1.2 showed it's faster, otherwise Montgomery
+- Wire up the full sequence: transpose → column NTTs → twiddle → transpose → row NTTs
+  (minimize total transposes — optimal is 2 transposes total)
+- Handle bit-reverse permutation: integrate with sub-NTT or separate pass
+- **Batch integration**: 4-step naturally supports batching — B full NTTs = B×n2 sub-NTTs
+  in step 1. Implement batched 4-step from the start.
+
+**Key design decision:** Sub-NTT size. For n=2^22:
+- n1=n2=2^11: each sub-NTT is 2048 elements → fused K=10 handles it in 1 launch, no outer
+  stages needed. **This is the sweet spot.**
+- n1=2^10, n2=2^12: sub-NTTs of 1024 and 4096 → K=10 fuses all of 1024; 4096 needs outer stages
+
+**Deliverables:**
+- Complete `ntt_4step_forward` and `ntt_4step_inverse` implementation
+- Integration with NTT dispatch (new `NTTMode::FOUR_STEP`)
+- Intermediate correctness checks (column NTTs alone, then full pipeline)
+- Batched 4-step path
+
+---
+
+### Session 7 — 4-Step NTT: Correctness + Edge Cases
+
+**Objective:** Exhaustive correctness testing and edge case handling.
+
+**Tasks:**
+- Test 4-step NTT against CPU reference for all sizes 2^10 through 2^22
+- Test roundtrip: INTT(NTT(x)) = x for all sizes
+- Test with known vectors (all-zeros, all-ones, single-element, random)
+- Test batched 4-step: batch of 8 vs 8 sequential single 4-step NTTs
+- Handle sizes too small for 4-step (n < n1×n2 minimum) — fallback to fused+cooperative
+- Handle sizes where √n is not integer (odd log_n): use n1=2^(k/2), n2=2^((k+1)/2)
+- Verify inverse NTT uses correct inverse twiddles and n^{-1} scaling
+
+**Deliverables:**
+- Full test coverage for 4-step path (single + batched)
+- Fallback logic for small sizes
+- All existing tests still pass (no regressions)
+
+---
+
+### Session 8 — 4-Step NTT: Benchmark, Profile, Release v1.3.0
+
+**Objective:** Quantify the 4-step improvement and release.
+
+**Tasks:**
+- Benchmark 4-step vs cooperative (v1.1) for all sizes (single + batched)
+- Profile with ncu: capture roofline for sub-NTT kernels, transpose, twiddle multiply
+  - Expect sub-NTTs to be compute-bound (like current fused kernel)
+  - Expect transpose to be memory-bound but with coalesced access (high DRAM efficiency)
+  - Expect twiddle multiply to be compute-bound (embarrassingly parallel ff_mul)
+- Measure total DRAM traffic: 4-step should be ~3 full passes (load + twiddle + store)
+  vs current 12+ passes (one per outer stage)
+- Capture screenshots: roofline for 4-step sub-NTT, transpose, and twiddle kernels
+- Update analysis.md, README, CLAUDE.md
+- Update plot_benchmarks.py with new data
+- Tag v1.3.0 release
+
+**Deliverables:**
+- Updated benchmark tables (single + batch throughput)
+- New ncu screenshots and analysis
+- Git tag v1.3.0
+
+---
+
+## v1.4.0 — MoMA-Inspired Register Optimization + Phase-Aware Pipeline
+
+**Goal:** Push arithmetic performance closer to MoMA's auto-generated code by adopting
+register-centric data flow patterns, and exploit the 4-step NTT's phase structure for
+optimal DMA overlap.
+
+**Expected improvement:** 10-20% single-NTT compute; 20-40% end-to-end pipeline
+
+### Session 9 — Register-Centric Butterfly + MoMA Carry Chain Patterns
+
+**Objective:** Adopt MoMA's register-centric approach — minimize shared memory pressure
+and maximize register-resident computation.
+
+**Background — MoMA's Approach:**
+MoMA's recursive rewriting decomposes multi-word operations so that the code generator
+can keep intermediate values in registers and schedule carry-chain instructions optimally.
+We can't replicate the full SPIRAL code generator, but we can adopt the patterns:
+
+1. **Register-resident butterfly**: Instead of loading from shared memory, computing,
+   and storing back, keep both butterfly elements in registers across multiple stages
+   (for warp-shuffle stages, this is already partially done)
+2. **Carry chain scheduling**: MoMA's rewrite rules produce carry chains where each
+   `add.cc` / `addc.cc` / `madc.hi.cc` is scheduled to minimize stalls between
+   dependent instructions. Review our PTX carry chains against MoMA's patterns.
+3. **Operand reuse**: MoMA tracks data dependencies to minimize register spills.
+   Ensure our ff_mul doesn't spill to local memory at high register pressure.
+
+**Tasks:**
+- Analyze register pressure in current fused kernel (ncu: register usage, local memory spills)
+- Implement register-resident butterfly variant for warp-shuffle stages:
+  - Each thread holds 2 FpElements (64 bytes = 16 registers) permanently
+  - For K=10: stages 0-4 are already warp-shuffle (register-to-register)
+  - Stages 5-9: explore keeping data in registers with warp shuffle for stride > 16
+    (requires multi-warp shuffle protocol — each thread shuffles with tid ± stride,
+    which may span warps. If stride > 32, shared memory is unavoidable.)
+- Review and optimize PTX carry chain scheduling in ff_mul:
+  - Compare our CIOS carry chain instruction sequence vs MoMA-style decomposed sequence
+  - Identify any stall bubbles between dependent carry-chain instructions
+  - Test reordering independent limb operations to fill stall slots
+- Benchmark: measure IPC and stall cycles before/after optimization
+- Profile with ncu: `smsp__inst_executed_pipe_alu` counter, warp stall breakdown
+
+**Deliverables:**
+- Optimized carry chain scheduling in `ff_arithmetic.cuh`
+- Register pressure analysis (ncu screenshots)
+- Benchmark: IPC comparison for fused kernel
+
+---
+
+### Session 10 — Phase-Aware Async Pipeline
+
+**Objective:** Exploit the 4-step NTT's distinct compute/memory phases for optimal
+DMA overlap.
+
+The 4-step NTT has a clear phase structure:
+- transpose (memory-bound) → sub-NTTs (compute-bound) → twiddle (compute-bound) →
+  transpose (memory-bound) → sub-NTTs (compute-bound)
+
+DMA transfers can overlap with compute phases without memory controller contention —
+solving the v1.1 pipeline's DMA interference problem at n=2^22.
+
+**Tasks:**
+- Implement phase-aware overlap strategy:
+  - During compute phases: issue H2D for next batch + D2H for previous batch
+  - During memory phases: pause DMA, let NTT have full DRAM bandwidth
+  - Use `cudaStreamWaitEvent` to gate DMA streams on phase boundaries
+- Extend `AsyncNTTPipeline` with 4-step NTT support
+- Implement adaptive dispatch:
+  - n < 2^8: naive radix-2
+  - 2^8 ≤ n < 2^20: fused K=10 + cooperative outer
+  - n ≥ 2^20: 4-step NTT
+  - Batch mode: always 4-step (sub-NTTs provide natural parallelism)
+- Benchmark: phase-aware pipeline vs naive overlap vs sequential at 2^22
+
+**Deliverables:**
+- Phase-aware `AsyncNTTPipeline`
+- Adaptive dispatch logic
+- Benchmark comparison + nsys timeline visualization
+
+---
+
+### Session 11 — CUDA Graphs + Final Polish + Release v1.4.0
+
+**Objective:** Wrap all launch sequences in CUDA Graphs, final benchmarking, release.
+
+**Tasks:**
+- Implement CUDA Graph capture for:
+  - Single NTT (4-step sequence: transpose → sub-NTTs → twiddle → transpose → sub-NTTs)
+  - Batched NTT (same structure, more blocks)
+  - Graph instantiation caching by (n, batch_size) key
+- Final benchmark suite: all modes × all sizes × single/batch
+- Final ncu profiling: capture definitive roofline and warp stall screenshots
+- nsys timeline: visualize 4-step phase-aware pipeline overlap
+- Update all documentation: README, analysis.md, GUIDE.md, CLAUDE.md, profiling/README.md
+- Generate final charts
+- Tag v1.4.0 release
+
+**Deliverables:**
+- CUDA Graph integration
+- Complete benchmark suite
+- Full documentation update
+- Git tag v1.4.0
+
+---
+
+## Stretch Goals (v1.5.0+)
+
+### SPIRAL/MoMA Code Generation Study
+- Attempt to use SPIRAL (open-source) to generate BLS12-381 NTT kernels
+- Compare auto-generated vs hand-tuned code quality (SASS instruction count, throughput)
+- If SPIRAL-generated code is superior, adopt as primary implementation
+
+### On-the-Fly Twiddle Computation
+- Compute twiddles during butterfly stages instead of precomputing and loading from memory
+- Trades memory bandwidth for compute (beneficial when compute-bound)
+- Uses fast modular exponentiation: ω^k = ω^(k-1) · ω (sequential chain per thread)
+
+### Mixed-Radix Outer Stages
+- Use radix-4 butterflies for outer stages (2 stages per kernel, halving launch count)
+- Higher arithmetic intensity per memory access → better compute/memory ratio
+
+### Multi-GPU NTT
+- Split n-point NTT across 2+ GPUs using the 4-step decomposition
+- Column NTTs on GPU 0, row NTTs on GPU 1 (or split evenly)
+- Requires NVLink or PCIe peer-to-peer for transpose step
+
+---
+
+## Summary: Session Plan
+
+| Session | Release | Focus | Key Technique |
+|---|---|---|---|
+| 1 | v1.2.0 | Barrett reduction for BLS12-381 | MoMA-inspired arithmetic |
+| 2 | v1.2.0 | Barrett NTT integration + benchmarking | Eliminate Montgomery overhead |
+| 3 | v1.2.0 | Batched NTT kernel | MoMA batch processing pattern |
+| 4 | v1.2.0 | Benchmark, profile, release | — |
+| 5 | v1.3.0 | 4-step NTT: transpose kernel + architecture | Bailey's algorithm |
+| 6 | v1.3.0 | 4-step NTT: sub-NTT integration (+ batch) | Sub-NTTs fit in shmem |
+| 7 | v1.3.0 | 4-step NTT: correctness + edge cases | — |
+| 8 | v1.3.0 | Benchmark, profile, release | — |
+| 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |
+| 10 | v1.4.0 | Phase-aware async pipeline | Compute/memory phase separation |
+| 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
+
+**Cumulative target (n=2^22, single NTT):**
+- v1.1.0 (current): 25.2 ms
+- v1.2.0: ~22 ms (Barrett saves ~3 ms conversion) + dramatically better batch throughput
+- v1.3.0: ~13-16 ms (4-step eliminates outer-stage DRAM passes)
+- v1.4.0: ~10-14 ms (register optimization + CUDA Graphs)
+
+**Batch throughput target (8× 2^22 NTTs):**
+- v1.1.0: 8 × 25.2 ms = ~202 ms (sequential)
+- v1.2.0: ~120-150 ms (batched kernel, shared twiddles)
+- v1.3.0: ~80-100 ms (4-step batched, all sub-NTTs in shmem)
+- v1.4.0: ~60-80 ms (register opt + CUDA Graphs + phase-aware pipeline)
+
+---
+
+## References
+
+- **MoMA**: Zhang & Franchetti, "Code Generation for Cryptographic Kernels using Multi-word
+  Modular Arithmetic on GPU", CGO 2025. [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
+  [SPIRAL pub](https://spiral.ece.cmu.edu/pub-spiral/abstract.jsp?id=376)
+- **ZKProphet**: Verma et al., IEEE IISWC 2025 — §V-B: open optimization targets
+- **cuZK**: Lu et al., TCHES 2023 — async pipeline methodology
+- **Bailey**: D.H. Bailey (1990) — "FFTs in External or Hierarchical Memory" (4-step FFT)
+- **ICICLE**: Ingonyama, GPU acceleration library for ZKP — [github](https://github.com/ingonyama-zk/icicle)
+- NVIDIA CUDA Programming Guide — §3.2.11 CUDA Graphs, §5.2 Memory Hierarchy
+- Nsight Compute Documentation — L2 cache metrics, roofline analysis

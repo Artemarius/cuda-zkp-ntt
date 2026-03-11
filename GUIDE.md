@@ -715,3 +715,11 @@ public:
 6. **BLS12-381 specification**: https://hackmd.io/@benjaminion/bls12-381
 
 7. **Montgomery Multiplication**: Acar (1996), "The Montgomery Modular Inverse" — canonical reference for CIOS algorithm.
+
+8. **MoMA** (Zhang & Franchetti, ACM CGO 2025): [arXiv:2501.07535](https://arxiv.org/abs/2501.07535), [SPIRAL pub](https://spiral.ece.cmu.edu/pub-spiral/abstract.jsp?id=376)
+   - Multi-word Modular Arithmetic: recursive rewrite rules decompose multi-word operations into native-width instructions. Uses Barrett reduction (no Montgomery domain conversion). Auto-generates NTT kernels via SPIRAL code generator. Achieves 13× over ICICLE for 256-bit NTTs on H100, near-ASIC performance on RTX 4090. Batch size >8 recommended for 128-384 bit inputs.
+
+9. **ICICLE** (Ingonyama): [github.com/ingonyama-zk/icicle](https://github.com/ingonyama-zk/icicle)
+   - GPU acceleration library for ZKP. State-of-the-art baseline that MoMA compares against.
+
+10. **Bailey's 4-Step FFT** (1990): "FFTs in External or Hierarchical Memory" — decomposes n-point FFT into √n × √n sub-FFTs with improved memory locality. Applicable to NTT for eliminating memory-bound outer stages.

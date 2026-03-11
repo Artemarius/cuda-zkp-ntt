@@ -121,6 +121,7 @@ scripts/
     build.yml          — CI: compile on Linux (CUDA 12.8/12.6) + Windows (MSVC)
 
 GUIDE.md               — Deep-dive: ZKP math, NTT, finite fields, GPU optimization
+NTT_OPTIMIZATION_ROADMAP.md — Future release plans (v1.2.0-v1.4.0) with session breakdown
 LICENSE                — MIT License
 ```
 
@@ -153,13 +154,45 @@ LICENSE                — MIT License
 - Twiddle factors: precomputed table in global memory, cached in L1
 - For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
+### NTT Time Breakdown (n=2^22, v1.1.0)
+- Bit-reverse: ~0.3 ms (1%), Montgomery conversions: ~3.0 ms (12%)
+- Fused K=10 (stages 0-9): ~2.5 ms (10%) — **compute-bound** (69%, IPC 2.41)
+- Cooperative outer (stages 10-21): ~19.4 ms (77%) — **memory-bound** (DRAM R-M-W)
+- Outer stages are the dominant bottleneck; see NTT_OPTIMIZATION_ROADMAP.md
+
+### Barrett Reduction (planned, v1.2.0 — MoMA-inspired)
+- Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
+- Eliminates ~3 ms (12%) to/from Montgomery overhead per NTT at n=2^22
+- Barrett: c = a·b mod p via precomputed μ = ⌊2^(2k)/p⌋ and shift-based reduction
+- Trade-off: ~30% more instructions per ff_mul, but zero conversion overhead
+- Reference: MoMA (Zhang & Franchetti, CGO 2025) uses Barrett exclusively
+
+### Batched NTT (planned, v1.2.0)
+- Process B independent NTTs in a single kernel launch (vs current 1-at-a-time)
+- Groth16 needs ~9 NTTs; MoMA recommends batch_size > 8 for 128-384 bit inputs
+- Fused kernel: launch B × (n/1024) blocks; block ID determines NTT and sub-array
+- Twiddle factor sharing: all B NTTs reuse the same precomputed table
+
+### 4-Step NTT (planned, v1.3.0)
+- Bailey's algorithm: decompose n = n1 × n2 into sub-NTTs + transpose + twiddle multiply
+- For n=2^22 with n1=n2=2^11: each sub-NTT is 2048 elements → fully fused in shmem
+- Eliminates outer-stage DRAM passes entirely (~3 DRAM passes vs current 12+)
+- Requires efficient FpElement matrix transpose kernel (shared-memory tiled, coalesced)
+- Natural synergy with batching: B full NTTs = B×n2 sub-NTTs in step 1
+
 ---
 
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
+See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-All phases complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
+Phases 1-8 complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
+
+### Future Releases
+- **v1.2.0** — MoMA-inspired Barrett arithmetic + batched NTT (target: ~22 ms single, better batch throughput)
+- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8)
+- **v1.4.0** — Register optimization + phase-aware pipeline + CUDA Graphs (target: ~10-14 ms)
 
 ---
 
