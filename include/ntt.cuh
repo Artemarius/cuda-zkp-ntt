@@ -7,7 +7,8 @@
 enum class NTTMode {
     NAIVE,      // radix-2, global memory only
     OPTIMIZED,  // radix-256, shared memory twiddles
-    ASYNC       // async double-buffered pipeline (Direction A)
+    ASYNC,      // async double-buffered pipeline (Direction A)
+    BARRETT     // Barrett arithmetic, no Montgomery conversion overhead
 };
 
 // Forward NTT: computes NTT in-place on device buffer

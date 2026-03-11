@@ -18,6 +18,12 @@ extern void ntt_forward_optimized_montgomery(
 extern void ntt_inverse_optimized_montgomery(
     FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
 
+// Barrett NTT dispatch (from ntt_optimized.cu)
+extern void ntt_forward_optimized_barrett(
+    FpElement* d_data, size_t n, const FpElement* d_twiddles, cudaStream_t stream);
+extern void ntt_inverse_optimized_barrett(
+    FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
+
 // ─── Internal Twiddle Cache ──────────────────────────────────────────────────
 // Twiddles are computed on CPU (using ff_ref) and uploaded to device.
 // Forward: twiddles[k] = omega_n^k  for k = 0..n/2-1
@@ -29,10 +35,22 @@ static FpElement* s_d_inv_twiddles = nullptr;
 static FpElement  s_n_inv;          // n^{-1} in Montgomery form (host copy)
 static size_t     s_cached_n = 0;
 
+// Barrett twiddle cache: twiddles in standard form (no Montgomery)
+static FpElement* s_d_fwd_twiddles_barrett = nullptr;
+static FpElement* s_d_inv_twiddles_barrett = nullptr;
+static FpElement  s_n_inv_barrett;  // n^{-1} in standard form (host copy)
+static size_t     s_cached_n_barrett = 0;
+
 static void free_cached_twiddles() {
     if (s_d_fwd_twiddles) { cudaFree(s_d_fwd_twiddles); s_d_fwd_twiddles = nullptr; }
     if (s_d_inv_twiddles) { cudaFree(s_d_inv_twiddles); s_d_inv_twiddles = nullptr; }
     s_cached_n = 0;
+}
+
+static void free_cached_twiddles_barrett() {
+    if (s_d_fwd_twiddles_barrett) { cudaFree(s_d_fwd_twiddles_barrett); s_d_fwd_twiddles_barrett = nullptr; }
+    if (s_d_inv_twiddles_barrett) { cudaFree(s_d_inv_twiddles_barrett); s_d_inv_twiddles_barrett = nullptr; }
+    s_cached_n_barrett = 0;
 }
 
 static int compute_log2(size_t n) {
@@ -79,6 +97,53 @@ static void ensure_twiddles(size_t n) {
     n_inv_ref.to_u32(s_n_inv.limbs);
 
     s_cached_n = n;
+}
+
+// Precompute twiddle factors in STANDARD form for Barrett NTT path.
+// Computes in Montgomery domain (well-tested), then converts to standard form.
+static void ensure_twiddles_barrett(size_t n) {
+    if (s_cached_n_barrett == n) return;
+    free_cached_twiddles_barrett();
+
+    size_t half = n / 2;
+
+    // Compute twiddles in Montgomery form (reuse existing logic)
+    ff_ref::FpRef omega     = ff_ref::get_root_of_unity(n);
+    ff_ref::FpRef omega_inv = ff_ref::fp_inv(omega);
+    ff_ref::FpRef one_mont;
+    one_mont.limbs = ff_ref::R_MOD;  // Montgomery(1)
+
+    std::vector<FpElement> h_fwd(half), h_inv(half);
+
+    ff_ref::FpRef wk     = one_mont;
+    ff_ref::FpRef wk_inv = one_mont;
+    for (size_t k = 0; k < half; ++k) {
+        // Convert from Montgomery to standard form for Barrett path
+        ff_ref::FpRef wk_std     = ff_ref::from_montgomery(wk);
+        ff_ref::FpRef wk_inv_std = ff_ref::from_montgomery(wk_inv);
+
+        wk_std.to_u32(h_fwd[k].limbs);
+        wk_inv_std.to_u32(h_inv[k].limbs);
+
+        wk     = ff_ref::fp_mul(wk, omega);
+        wk_inv = ff_ref::fp_mul(wk_inv, omega_inv);
+    }
+
+    // Upload to device
+    CUDA_CHECK(cudaMalloc(&s_d_fwd_twiddles_barrett, half * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&s_d_inv_twiddles_barrett, half * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(s_d_fwd_twiddles_barrett, h_fwd.data(),
+                          half * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s_d_inv_twiddles_barrett, h_inv.data(),
+                          half * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    // Compute n^{-1} in standard form
+    ff_ref::FpRef n_mont     = ff_ref::to_montgomery(ff_ref::FpRef::from_u64(static_cast<uint64_t>(n)));
+    ff_ref::FpRef n_inv_mont = ff_ref::fp_inv(n_mont);
+    ff_ref::FpRef n_inv_std  = ff_ref::from_montgomery(n_inv_mont);
+    n_inv_std.to_u32(s_n_inv_barrett.limbs);
+
+    s_cached_n_barrett = n;
 }
 
 // ─── Kernels ────────────────────────────────────────────────────────────────
@@ -227,6 +292,13 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             break;
         }
+        case NTTMode::BARRETT: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_barrett(n);
+            // No Montgomery conversion — Barrett operates in standard form
+            ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
+            break;
+        }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_forward(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
             break;
@@ -260,6 +332,13 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             ntt_inverse_optimized_montgomery(d_data, n, s_d_inv_twiddles, s_n_inv, stream);
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
+            break;
+        }
+        case NTTMode::BARRETT: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_barrett(n);
+            // No Montgomery conversion — Barrett operates in standard form
+            ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             break;
         }
         case NTTMode::ASYNC:

@@ -13,6 +13,7 @@
 // Stages 5..K-1 use shared memory + __syncthreads() (cross-warp).
 
 #include "ff_arithmetic.cuh"
+#include "ff_barrett.cuh"
 #include "cuda_utils.cuh"
 
 // ─── Warp-Shuffle Helper ─────────────────────────────────────────────────────
@@ -172,5 +173,123 @@ void launch_fused_k10(
 ) {
     constexpr int THREADS = 1 << (10 - 1);  // 512
     ntt_fused_stages_kernel<10>
+        <<<num_blocks, THREADS, 0, stream>>>(d_data, d_twiddles, n);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Barrett Variants — use ff_mul_barrett instead of ff_mul (Montgomery).
+// Standard-form data + twiddles; no Montgomery domain conversion needed.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Barrett warp-shuffle butterfly helper
+__device__ __forceinline__
+FpElement butterfly_shfl_barrett(const FpElement& my_elem, const FpElement& twiddle,
+                                 int xor_mask, bool is_top) {
+    FpElement partner = fp_shfl_xor(my_elem, xor_mask);
+
+    FpElement A = is_top ? my_elem : partner;
+    FpElement B = is_top ? partner : my_elem;
+
+    FpElement v = ff_mul_barrett(B, twiddle);
+
+    return is_top ? ff_add(A, v) : ff_sub(A, v);
+}
+
+// Barrett fused kernel: same structure as Montgomery, uses ff_mul_barrett
+template <int K>
+__global__ void ntt_fused_stages_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n
+) {
+    constexpr int ELEMS   = 1 << K;
+    constexpr int THREADS = ELEMS >> 1;
+    constexpr int SHFL_STAGES = (K < 5) ? K : 5;
+
+    __shared__ FpElement sdata[ELEMS];
+
+    const uint32_t boff = blockIdx.x * ELEMS;
+    const uint32_t t = threadIdx.x;
+
+    // Load from global memory into registers
+    FpElement reg_lo = data[boff + t];
+    FpElement reg_hi = data[boff + t + THREADS];
+
+    // Stages 0-4: warp-shuffle butterfly (intra-warp)
+    #pragma unroll
+    for (int s = 0; s < SHFL_STAGES; ++s) {
+        const uint32_t half   = 1u << s;
+        const uint32_t stride = n >> (s + 1);
+        const uint32_t j      = t & (half - 1);
+        const bool is_top     = (t & half) == 0;
+        const int xor_mask    = static_cast<int>(half);
+
+        FpElement w = twiddles[j * stride];
+
+        reg_lo = butterfly_shfl_barrett(reg_lo, w, xor_mask, is_top);
+        reg_hi = butterfly_shfl_barrett(reg_hi, w, xor_mask, is_top);
+    }
+
+    // Stages 5..K-1: shared-memory butterfly (cross-warp)
+    sdata[t]           = reg_lo;
+    sdata[t + THREADS] = reg_hi;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = SHFL_STAGES; s < K; ++s) {
+        const uint32_t half   = 1u << s;
+        const uint32_t stride = n >> (s + 1);
+
+        const uint32_t group   = t >> s;
+        const uint32_t j       = t & (half - 1);
+        const uint32_t idx_top = (group << (s + 1)) + j;
+        const uint32_t idx_bot = idx_top + half;
+
+        FpElement w = twiddles[j * stride];
+        FpElement u = sdata[idx_top];
+        FpElement v = ff_mul_barrett(sdata[idx_bot], w);
+        sdata[idx_top] = ff_add(u, v);
+        sdata[idx_bot] = ff_sub(u, v);
+        __syncthreads();
+    }
+
+    // Store to global memory
+    data[boff + t]           = sdata[t];
+    data[boff + t + THREADS] = sdata[t + THREADS];
+}
+
+// Explicit template instantiations (Barrett)
+template __global__ void ntt_fused_stages_barrett_kernel<8>(
+    FpElement* __restrict__, const FpElement* __restrict__, uint32_t);
+template __global__ void ntt_fused_stages_barrett_kernel<9>(
+    FpElement* __restrict__, const FpElement* __restrict__, uint32_t);
+template __global__ void ntt_fused_stages_barrett_kernel<10>(
+    FpElement* __restrict__, const FpElement* __restrict__, uint32_t);
+
+// Barrett launcher functions
+void launch_fused_barrett_k8(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream
+) {
+    constexpr int THREADS = 1 << (8 - 1);  // 128
+    ntt_fused_stages_barrett_kernel<8>
+        <<<num_blocks, THREADS, 0, stream>>>(d_data, d_twiddles, n);
+}
+
+void launch_fused_barrett_k9(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream
+) {
+    constexpr int THREADS = 1 << (9 - 1);  // 256
+    ntt_fused_stages_barrett_kernel<9>
+        <<<num_blocks, THREADS, 0, stream>>>(d_data, d_twiddles, n);
+}
+
+void launch_fused_barrett_k10(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, uint32_t num_blocks, cudaStream_t stream
+) {
+    constexpr int THREADS = 1 << (10 - 1);  // 512
+    ntt_fused_stages_barrett_kernel<10>
         <<<num_blocks, THREADS, 0, stream>>>(d_data, d_twiddles, n);
 }

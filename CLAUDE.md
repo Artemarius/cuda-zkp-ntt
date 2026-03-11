@@ -162,7 +162,7 @@ LICENSE                — MIT License
 - Cooperative outer (stages 10-21): ~19.4 ms (77%) — **memory-bound** (DRAM R-M-W)
 - Outer stages are the dominant bottleneck; see NTT_OPTIMIZATION_ROADMAP.md
 
-### Barrett Reduction (implemented, v1.2.0 Session 1 — MoMA-inspired)
+### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
 - Eliminates ~3 ms (12%) to/from Montgomery overhead per NTT at n=2^22
 - Barrett: c = a·b mod p via precomputed μ = ⌊2^512/p⌋ (HAC 14.42, 8×32-bit limbs)
@@ -170,8 +170,16 @@ LICENSE                — MIT License
 - Instruction cost: ~188 MADs vs Montgomery CIOS ~128 MADs (~47% more multiply ops)
 - SASS: Barrett 888 instructions vs Montgomery v2 528 (1.68×), baseline 592 (1.50×)
 - Microbench: identical throughput to Montgomery (both hit 91% DRAM ceiling — memory-bound)
-- Projected NTT impact: -3.0 ms (conversion savings) + ~1.2 ms (fused kernel overhead) ≈ net -1.8 ms
+- **NTT integration (Session 2):** `NTTMode::BARRETT` — full NTT pipeline using Barrett
+  - Standard-form twiddles (separate cache from Montgomery twiddles)
+  - Barrett fused kernels (K=8/9/10) + Barrett cooperative outer kernels
+  - Measured NTT impact (n=2^22, RTX 3060): 28.0 ms → 27.3 ms = **-0.7 ms (2.5% faster)**
+  - Small sizes (2^15-2^16) ~15% slower (fused kernel is compute-bound, Barrett +68% instructions)
+  - 2^18: approximately equal; 2^20+: Barrett slightly faster
+  - Net improvement smaller than projected (-0.7ms vs -1.8ms) because fused kernel overhead
+    is ~2.3ms (not 1.2ms) — Barrett's extra instructions hit harder at 69% compute utilization
 - Implementation: `include/ff_barrett.cuh` (GPU), `tests/ff_reference.h` (CPU reference)
+- NTT integration: `NTTMode::BARRETT` in all kernel files, standard-form twiddle cache
 - Reference: MoMA (Zhang & Franchetti, CGO 2025) uses Barrett exclusively
 
 ### Batched NTT (planned, v1.2.0)
@@ -196,7 +204,7 @@ See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
 Phases 1-8 complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
 
-**v1.2.0 progress:** Session 1 (Barrett arithmetic) complete. Sessions 2-4 remaining.
+**v1.2.0 progress:** Sessions 1-2 (Barrett arithmetic + NTT integration) complete. Sessions 3-4 remaining.
 
 ### Future Releases
 - **v1.2.0** — MoMA-inspired Barrett arithmetic + batched NTT (target: ~22 ms single, better batch throughput)

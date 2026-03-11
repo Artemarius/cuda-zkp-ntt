@@ -609,6 +609,7 @@ static const char* mode_name(NTTMode m) {
         case NTTMode::NAIVE:     return "NAIVE";
         case NTTMode::OPTIMIZED: return "OPTIMIZED";
         case NTTMode::ASYNC:     return "ASYNC";
+        case NTTMode::BARRETT:   return "BARRETT";
         default:                 return "UNKNOWN";
     }
 }
@@ -1154,6 +1155,118 @@ void test_ff_mul_barrett_edge_cases() {
     CUDA_CHECK(cudaFree(d_out));
 }
 
+// ─── v1.2.0 Session 2: Barrett NTT cross-validation ─────────────────────────
+// Barrett NTT and Montgomery NTT must produce bitwise-identical output
+// for the same standard-form input.
+
+void test_ntt_barrett_vs_montgomery(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_ntt_barrett_vs_montgomery (n=2^%d=%zu)...\n", log_n, n);
+
+    // Generate test data in standard form
+    std::vector<FpElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+        h_data[i].limbs[1] = static_cast<uint32_t>((i * 54321u + 9876u) % 999999937u);
+    }
+
+    // Run Montgomery NTT
+    FpElement* d_mont;
+    CUDA_CHECK(cudaMalloc(&d_mont, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_mont, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_mont, n, NTTMode::OPTIMIZED);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_mont(n);
+    CUDA_CHECK(cudaMemcpy(h_mont.data(), d_mont, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_mont));
+
+    // Run Barrett NTT
+    FpElement* d_barrett;
+    CUDA_CHECK(cudaMalloc(&d_barrett, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_barrett, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_barrett, n, NTTMode::BARRETT);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_barrett(n);
+    CUDA_CHECK(cudaMemcpy(h_barrett.data(), d_barrett, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_barrett));
+
+    // Compare bitwise
+    int pass_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (h_barrett[i] == h_mont[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(n),
+        "Barrett NTT vs Montgomery NTT mismatch");
+    printf("  Barrett vs Montgomery NTT (n=2^%d): %d/%zu matched\n",
+           log_n, pass_count, n);
+
+    if (pass_count != static_cast<int>(n) && n <= 4096) {
+        int printed = 0;
+        for (size_t i = 0; i < n && printed < 5; ++i) {
+            if (h_barrett[i] != h_mont[i]) {
+                printf("    [%zu] Barrett: %08x%08x... Montgomery: %08x%08x...\n",
+                    i, h_barrett[i].limbs[7], h_barrett[i].limbs[6],
+                    h_mont[i].limbs[7], h_mont[i].limbs[6]);
+                ++printed;
+            }
+        }
+    }
+}
+
+// Barrett NTT inverse roundtrip cross-validation with Montgomery
+void test_ntt_barrett_roundtrip_vs_montgomery(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_ntt_barrett_roundtrip_vs_montgomery (n=2^%d=%zu)...\n", log_n, n);
+
+    // Generate multi-limb test data
+    std::vector<FpElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+        h_data[i].limbs[1] = static_cast<uint32_t>((i * 54321u + 9876u) % 999999937u);
+    }
+
+    // Montgomery roundtrip
+    FpElement* d_mont;
+    CUDA_CHECK(cudaMalloc(&d_mont, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_mont, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_mont, n, NTTMode::OPTIMIZED);
+    ntt_inverse(d_mont, n, NTTMode::OPTIMIZED);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_mont_rt(n);
+    CUDA_CHECK(cudaMemcpy(h_mont_rt.data(), d_mont, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_mont));
+
+    // Barrett roundtrip
+    FpElement* d_barrett;
+    CUDA_CHECK(cudaMalloc(&d_barrett, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_barrett, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_barrett, n, NTTMode::BARRETT);
+    ntt_inverse(d_barrett, n, NTTMode::BARRETT);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_barrett_rt(n);
+    CUDA_CHECK(cudaMemcpy(h_barrett_rt.data(), d_barrett, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_barrett));
+
+    // Both roundtrips should match original data
+    int mont_pass = 0, barrett_pass = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (h_mont_rt[i] == h_data[i]) ++mont_pass;
+        if (h_barrett_rt[i] == h_data[i]) ++barrett_pass;
+    }
+
+    TEST_ASSERT(barrett_pass == static_cast<int>(n),
+        "Barrett roundtrip mismatch");
+    printf("  Barrett roundtrip (n=2^%d): %d/%zu, Montgomery: %d/%zu\n",
+           log_n, barrett_pass, n, mont_pass, n);
+}
+
 void test_ff_mul_barrett_algebraic() {
     printf("test_ff_mul_barrett_algebraic...\n");
 
@@ -1342,13 +1455,49 @@ int main() {
         CUDA_CHECK(cudaFreeHost(h_out));
     }
 
-    // v1.2.0: Barrett arithmetic correctness tests
+    // v1.2.0 Session 1: Barrett arithmetic correctness tests
     test_cpu_barrett_self_test();
     test_ff_mul_barrett_gpu();
     test_ff_sqr_barrett_gpu();
     test_ff_mul_barrett_vs_montgomery();
     test_ff_mul_barrett_edge_cases();
     test_ff_mul_barrett_algebraic();
+
+    // v1.2.0 Session 2: Barrett NTT integration tests
+    // Forward correctness: Barrett NTT vs CPU reference
+    test_ntt_forward_gpu(10, NTTMode::BARRETT);   // K=10 fused only (1024 elements)
+    test_ntt_forward_gpu(12, NTTMode::BARRETT);   // K=10 + outer stages
+    test_ntt_forward_gpu(15, NTTMode::BARRETT);
+    test_ntt_forward_gpu(17, NTTMode::BARRETT);
+    test_ntt_forward_gpu(20, NTTMode::BARRETT);
+
+    // Roundtrip: INTT(NTT(x)) = x for Barrett path
+    test_ntt_roundtrip_gpu(10, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(12, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(15, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(17, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(20, NTTMode::BARRETT);
+
+    // Fused kernel path tests (K=8, K=9)
+    test_ntt_forward_gpu(8, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(8, NTTMode::BARRETT);
+    test_ntt_forward_gpu(9, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(9, NTTMode::BARRETT);
+
+    // Large-scale: K=10 + cooperative outer (2^22)
+    test_ntt_forward_gpu(22, NTTMode::BARRETT);
+    test_ntt_roundtrip_gpu(22, NTTMode::BARRETT);
+
+    // Cross-validation: Barrett NTT == Montgomery NTT (bitwise)
+    test_ntt_barrett_vs_montgomery(10);
+    test_ntt_barrett_vs_montgomery(15);
+    test_ntt_barrett_vs_montgomery(20);
+    test_ntt_barrett_vs_montgomery(22);
+
+    // Roundtrip cross-validation: both paths recover original data
+    test_ntt_barrett_roundtrip_vs_montgomery(10);
+    test_ntt_barrett_roundtrip_vs_montgomery(15);
+    test_ntt_barrett_roundtrip_vs_montgomery(20);
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
