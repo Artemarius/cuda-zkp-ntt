@@ -24,6 +24,20 @@ extern void ntt_forward_optimized_barrett(
 extern void ntt_inverse_optimized_barrett(
     FpElement* d_data, size_t n, const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
 
+// Batched NTT dispatch (from ntt_optimized.cu)
+extern void ntt_forward_batch_montgomery(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles, cudaStream_t stream);
+extern void ntt_inverse_batch_montgomery(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
+extern void ntt_forward_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles, cudaStream_t stream);
+extern void ntt_inverse_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream);
+
 // ─── Internal Twiddle Cache ──────────────────────────────────────────────────
 // Twiddles are computed on CPU (using ff_ref) and uploaded to device.
 // Forward: twiddles[k] = omega_n^k  for k = 0..n/2-1
@@ -159,6 +173,27 @@ __global__ void ntt_bit_reverse_kernel(FpElement* data, uint32_t n, uint32_t log
         FpElement temp = data[i];
         data[i] = data[j];
         data[j] = temp;
+    }
+}
+
+// Batched bit-reversal permutation: each NTT in the batch is bit-reversed independently.
+// total_elements = batch_size * n.
+__global__ void ntt_bit_reverse_batch_kernel(
+    FpElement* data, uint32_t n, uint32_t log_n, uint32_t total_elements
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_elements) return;
+
+    uint32_t batch_id = tid / n;
+    uint32_t i = tid - batch_id * n;  // local index within this NTT
+
+    uint32_t j = __brev(i) >> (32 - log_n);
+
+    if (i < j) {
+        uint32_t base = batch_id * n;
+        FpElement temp = data[base + i];
+        data[base + i] = data[base + j];
+        data[base + j] = temp;
     }
 }
 
@@ -343,6 +378,74 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         }
         case NTTMode::ASYNC:
             fprintf(stderr, "ntt_inverse(ASYNC): use AsyncNTTPipeline class for async pipeline NTT\n");
+            break;
+    }
+}
+
+// ─── Batched Public API ──────────────────────────────────────────────────────
+
+void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode, cudaStream_t stream) {
+    if (batch_size <= 0) return;
+    if (batch_size == 1) { ntt_forward(d_data, n, mode, stream); return; }
+
+    switch (mode) {
+        case NTTMode::OPTIMIZED: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles(n);
+            uint32_t N = static_cast<uint32_t>(n);
+            uint32_t total = static_cast<uint32_t>(batch_size) * N;
+            uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
+
+            // Convert all elements to Montgomery form
+            ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+
+            // Batched NTT on Montgomery-form data
+            ntt_forward_batch_montgomery(d_data, batch_size, n, s_d_fwd_twiddles, stream);
+
+            // Convert back to standard form
+            ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+            break;
+        }
+        case NTTMode::BARRETT: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_barrett(n);
+            ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
+            break;
+        }
+        default:
+            fprintf(stderr, "ntt_forward_batch: mode %d not supported for batching\n",
+                    static_cast<int>(mode));
+            break;
+    }
+}
+
+void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode, cudaStream_t stream) {
+    if (batch_size <= 0) return;
+    if (batch_size == 1) { ntt_inverse(d_data, n, mode, stream); return; }
+
+    switch (mode) {
+        case NTTMode::OPTIMIZED: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles(n);
+            uint32_t N = static_cast<uint32_t>(n);
+            uint32_t total = static_cast<uint32_t>(batch_size) * N;
+            uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
+
+            ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+            ntt_inverse_batch_montgomery(d_data, batch_size, n, s_d_inv_twiddles, s_n_inv, stream);
+            ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+            break;
+        }
+        case NTTMode::BARRETT: {
+            assert(n >= 2 && (n & (n - 1)) == 0);
+            ensure_twiddles_barrett(n);
+            ntt_inverse_batch_barrett(d_data, batch_size, n,
+                s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            break;
+        }
+        default:
+            fprintf(stderr, "ntt_inverse_batch: mode %d not supported for batching\n",
+                    static_cast<int>(mode));
             break;
     }
 }

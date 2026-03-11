@@ -1351,6 +1351,259 @@ void test_ff_mul_barrett_algebraic() {
     }
 }
 
+// ─── v1.2.0 Session 3: Batched NTT Tests ─────────────────────────────────────
+
+// Batched NTT forward: each NTT in the batch must match sequential single NTT
+void test_ntt_batch_vs_sequential(int log_n, int batch_size, NTTMode mode) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_ntt_batch_vs_sequential (n=2^%d, B=%d, %s)...\n",
+           log_n, batch_size, mode_name(mode));
+
+    // Generate distinct random input for each NTT in the batch
+    std::vector<FpElement> h_data(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+        h_data[i].limbs[1] = static_cast<uint32_t>((i * 54321u + 9876u) % 999999937u);
+    }
+
+    // Run batched NTT
+    FpElement* d_batch;
+    CUDA_CHECK(cudaMalloc(&d_batch, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_batch, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch(d_batch, batch_size, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_batch(total);
+    CUDA_CHECK(cudaMemcpy(h_batch.data(), d_batch, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_batch));
+
+    // Run sequential single NTTs for reference
+    std::vector<FpElement> h_seq(total);
+    FpElement* d_single;
+    CUDA_CHECK(cudaMalloc(&d_single, n * sizeof(FpElement)));
+    for (int b = 0; b < batch_size; ++b) {
+        CUDA_CHECK(cudaMemcpy(d_single, h_data.data() + b * n,
+                              n * sizeof(FpElement), cudaMemcpyHostToDevice));
+        ntt_forward(d_single, n, mode);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_seq.data() + b * n, d_single,
+                              n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaFree(d_single));
+
+    // Compare: batch output must be bitwise identical to sequential
+    int pass_count = 0;
+    for (size_t i = 0; i < total; ++i) {
+        if (h_batch[i] == h_seq[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(total),
+        "Batched NTT vs sequential mismatch");
+    printf("  Batch vs sequential (%s, n=2^%d, B=%d): %d/%zu matched\n",
+           mode_name(mode), log_n, batch_size, pass_count, total);
+
+    if (pass_count != static_cast<int>(total)) {
+        int printed = 0;
+        for (size_t i = 0; i < total && printed < 5; ++i) {
+            if (h_batch[i] != h_seq[i]) {
+                int b = static_cast<int>(i / n);
+                size_t local = i % n;
+                printf("    NTT[%d][%zu] batch: %08x%08x seq: %08x%08x\n",
+                    b, local,
+                    h_batch[i].limbs[7], h_batch[i].limbs[6],
+                    h_seq[i].limbs[7], h_seq[i].limbs[6]);
+                ++printed;
+            }
+        }
+    }
+}
+
+// Batched NTT roundtrip: INTT(NTT(x)) = x for all B arrays
+void test_ntt_batch_roundtrip(int log_n, int batch_size, NTTMode mode) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_ntt_batch_roundtrip (n=2^%d, B=%d, %s)...\n",
+           log_n, batch_size, mode_name(mode));
+
+    std::vector<FpElement> h_original(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_original[i] = FpElement::zero();
+        h_original[i].limbs[0] = static_cast<uint32_t>((i * 7919u + 104729u) % 1000000007u);
+        h_original[i].limbs[1] = static_cast<uint32_t>((i * 6271u + 299993u) % 999999937u);
+    }
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_original.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_forward_batch(d_data, batch_size, n, mode);
+    ntt_inverse_batch(d_data, batch_size, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_result(total);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_data));
+
+    int pass_count = 0;
+    for (size_t i = 0; i < total; ++i) {
+        if (h_result[i] == h_original[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(total),
+        "Batched NTT roundtrip mismatch");
+    printf("  Batch roundtrip (%s, n=2^%d, B=%d): %d/%zu matched\n",
+           mode_name(mode), log_n, batch_size, pass_count, total);
+}
+
+// Batched Barrett NTT == Batched Montgomery NTT (cross-validation)
+void test_ntt_batch_barrett_vs_montgomery(int log_n, int batch_size) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_ntt_batch_barrett_vs_montgomery (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+    std::vector<FpElement> h_data(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 31337u + 42u) % 1000000007u);
+        h_data[i].limbs[1] = static_cast<uint32_t>((i * 65537u + 7u) % 999999937u);
+    }
+
+    // Batched Montgomery
+    FpElement* d_mont;
+    CUDA_CHECK(cudaMalloc(&d_mont, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_mont, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch(d_mont, batch_size, n, NTTMode::OPTIMIZED);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_mont(total);
+    CUDA_CHECK(cudaMemcpy(h_mont.data(), d_mont, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_mont));
+
+    // Batched Barrett
+    FpElement* d_barrett;
+    CUDA_CHECK(cudaMalloc(&d_barrett, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_barrett, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch(d_barrett, batch_size, n, NTTMode::BARRETT);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_barrett(total);
+    CUDA_CHECK(cudaMemcpy(h_barrett.data(), d_barrett, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_barrett));
+
+    int pass_count = 0;
+    for (size_t i = 0; i < total; ++i) {
+        if (h_barrett[i] == h_mont[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(total),
+        "Batched Barrett vs Montgomery mismatch");
+    printf("  Batch Barrett vs Montgomery (n=2^%d, B=%d): %d/%zu matched\n",
+           log_n, batch_size, pass_count, total);
+}
+
+// Batch isolation test: corrupting one NTT should not affect others
+void test_ntt_batch_isolation(int log_n, NTTMode mode) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    int batch_size = 4;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_ntt_batch_isolation (n=2^%d, B=%d, %s)...\n",
+           log_n, batch_size, mode_name(mode));
+
+    // Create two identical input arrays
+    std::vector<FpElement> h_clean(total), h_dirty(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_clean[i] = FpElement::zero();
+        h_clean[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+        h_dirty[i] = h_clean[i];
+    }
+
+    // Corrupt NTT #2 in the dirty copy (set all elements to p-1)
+    for (size_t i = 2 * n; i < 3 * n; ++i) {
+        h_dirty[i] = FpElement::zero();
+        h_dirty[i].limbs[0] = 0x00000000u;  // p-1 (limbs[0])
+        h_dirty[i].limbs[7] = 0x73eda753u;  // different high limb
+    }
+
+    // Run batched NTT on both
+    FpElement *d_clean, *d_dirty;
+    CUDA_CHECK(cudaMalloc(&d_clean, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_dirty, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_clean, h_clean.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dirty, h_dirty.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_forward_batch(d_clean, batch_size, n, mode);
+    ntt_forward_batch(d_dirty, batch_size, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_clean_out(total), h_dirty_out(total);
+    CUDA_CHECK(cudaMemcpy(h_clean_out.data(), d_clean, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dirty_out.data(), d_dirty, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_clean));
+    CUDA_CHECK(cudaFree(d_dirty));
+
+    // NTTs #0, #1, #3 should be identical in both runs (NTT #2 was corrupted)
+    int pass_count = 0;
+    int total_checked = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (b == 2) continue;  // skip the corrupted one
+        for (size_t i = 0; i < n; ++i) {
+            if (h_clean_out[b * n + i] == h_dirty_out[b * n + i]) ++pass_count;
+            ++total_checked;
+        }
+    }
+
+    TEST_ASSERT(pass_count == total_checked,
+        "Batched NTT isolation failure: corrupting one NTT affected others");
+    printf("  Batch isolation (%s, n=2^%d): %d/%d unaffected elements matched\n",
+           mode_name(mode), log_n, pass_count, total_checked);
+}
+
+// Batch size=1 must match single NTT exactly
+void test_ntt_batch_size_one(int log_n, NTTMode mode) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_ntt_batch_size_one (n=2^%d, %s)...\n", log_n, mode_name(mode));
+
+    std::vector<FpElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 12345u + 6789u) % 1000000007u);
+    }
+
+    // Single NTT
+    FpElement* d_single;
+    CUDA_CHECK(cudaMalloc(&d_single, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_single, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_single, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_single(n);
+    CUDA_CHECK(cudaMemcpy(h_single.data(), d_single, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_single));
+
+    // Batch size=1
+    FpElement* d_batch;
+    CUDA_CHECK(cudaMalloc(&d_batch, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_batch, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch(d_batch, 1, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_batch(n);
+    CUDA_CHECK(cudaMemcpy(h_batch.data(), d_batch, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_batch));
+
+    int pass_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (h_single[i] == h_batch[i]) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == static_cast<int>(n),
+        "Batch size=1 vs single NTT mismatch");
+    printf("  Batch B=1 vs single (%s, n=2^%d): %d/%zu matched\n",
+           mode_name(mode), log_n, pass_count, n);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -1498,6 +1751,51 @@ int main() {
     test_ntt_barrett_roundtrip_vs_montgomery(10);
     test_ntt_barrett_roundtrip_vs_montgomery(15);
     test_ntt_barrett_roundtrip_vs_montgomery(20);
+
+    // v1.2.0 Session 3: Batched NTT tests
+    // Batch vs sequential equivalence (Montgomery)
+    test_ntt_batch_vs_sequential(10, 4, NTTMode::OPTIMIZED);   // K=10, no outer
+    test_ntt_batch_vs_sequential(15, 4, NTTMode::OPTIMIZED);   // K=10 + outer
+    test_ntt_batch_vs_sequential(18, 2, NTTMode::OPTIMIZED);   // larger size
+    test_ntt_batch_vs_sequential(20, 2, NTTMode::OPTIMIZED);
+
+    // Batch vs sequential equivalence (Barrett)
+    test_ntt_batch_vs_sequential(10, 4, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential(15, 4, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential(18, 2, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential(20, 2, NTTMode::BARRETT);
+
+    // Batch roundtrip (Montgomery)
+    test_ntt_batch_roundtrip(10, 4, NTTMode::OPTIMIZED);
+    test_ntt_batch_roundtrip(15, 4, NTTMode::OPTIMIZED);
+    test_ntt_batch_roundtrip(20, 2, NTTMode::OPTIMIZED);
+
+    // Batch roundtrip (Barrett)
+    test_ntt_batch_roundtrip(10, 4, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(15, 4, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(20, 2, NTTMode::BARRETT);
+
+    // Batch Barrett vs Montgomery cross-validation
+    test_ntt_batch_barrett_vs_montgomery(10, 4);
+    test_ntt_batch_barrett_vs_montgomery(15, 4);
+    test_ntt_batch_barrett_vs_montgomery(20, 2);
+
+    // Batch size=1 degenerate case
+    test_ntt_batch_size_one(15, NTTMode::OPTIMIZED);
+    test_ntt_batch_size_one(15, NTTMode::BARRETT);
+
+    // Batch isolation: corrupting one NTT doesn't affect others
+    test_ntt_batch_isolation(15, NTTMode::OPTIMIZED);
+    test_ntt_batch_isolation(15, NTTMode::BARRETT);
+
+    // Larger batch sizes
+    test_ntt_batch_vs_sequential(15, 8, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(15, 8, NTTMode::BARRETT);
+
+    // Large-scale batch test (2^22, B=2)
+    test_ntt_batch_vs_sequential(22, 2, NTTMode::OPTIMIZED);
+    test_ntt_batch_vs_sequential(22, 2, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(22, 2, NTTMode::BARRETT);
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

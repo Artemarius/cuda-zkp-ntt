@@ -140,6 +140,148 @@ BENCHMARK(BM_NttForwardBarrett)
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 
+// ─── Batched NTT Benchmarks ──────────────────────────────────────────────────
+// Args: (ntt_size, batch_size)
+
+static void BM_NttBatchOptimized(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+    int batch_size = static_cast<int>(state.range(1));
+    size_t total = static_cast<size_t>(batch_size) * n;
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, total * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    ntt_forward_batch(d_data, batch_size, n, NTTMode::OPTIMIZED);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        ntt_forward_batch(d_data, batch_size, n, NTTMode::OPTIMIZED);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(total));
+    state.counters["ntt_size"] = static_cast<double>(n);
+    state.counters["batch"] = static_cast<double>(batch_size);
+    state.counters["per_ntt_ms"] = benchmark::Counter(0, benchmark::Counter::kAvgIterations);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttBatchOptimized)
+    ->Args({1 << 15, 1})->Args({1 << 15, 4})->Args({1 << 15, 8})->Args({1 << 15, 16})
+    ->Args({1 << 18, 1})->Args({1 << 18, 4})->Args({1 << 18, 8})
+    ->Args({1 << 20, 1})->Args({1 << 20, 4})->Args({1 << 20, 8})
+    ->Args({1 << 22, 1})->Args({1 << 22, 2})->Args({1 << 22, 4})->Args({1 << 22, 8})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
+static void BM_NttBatchBarrett(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+    int batch_size = static_cast<int>(state.range(1));
+    size_t total = static_cast<size_t>(batch_size) * n;
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, total * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    ntt_forward_batch(d_data, batch_size, n, NTTMode::BARRETT);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        ntt_forward_batch(d_data, batch_size, n, NTTMode::BARRETT);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(total));
+    state.counters["ntt_size"] = static_cast<double>(n);
+    state.counters["batch"] = static_cast<double>(batch_size);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttBatchBarrett)
+    ->Args({1 << 15, 1})->Args({1 << 15, 4})->Args({1 << 15, 8})->Args({1 << 15, 16})
+    ->Args({1 << 18, 1})->Args({1 << 18, 4})->Args({1 << 18, 8})
+    ->Args({1 << 20, 1})->Args({1 << 20, 4})->Args({1 << 20, 8})
+    ->Args({1 << 22, 1})->Args({1 << 22, 2})->Args({1 << 22, 4})->Args({1 << 22, 8})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
+// Sequential baseline: B separate ntt_forward calls
+static void BM_NttSequentialLoop(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+    int batch_size = static_cast<int>(state.range(1));
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, batch_size * n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, batch_size * n * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    for (int b = 0; b < batch_size; ++b)
+        ntt_forward(d_data + b * n, n, NTTMode::BARRETT);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int b = 0; b < batch_size; ++b)
+            ntt_forward(d_data + b * n, n, NTTMode::BARRETT);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(batch_size) * static_cast<int64_t>(n));
+    state.counters["ntt_size"] = static_cast<double>(n);
+    state.counters["batch"] = static_cast<double>(batch_size);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttSequentialLoop)
+    ->Args({1 << 15, 8})->Args({1 << 18, 8})
+    ->Args({1 << 20, 8})->Args({1 << 22, 8})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
 // ─── Phase 6: Pipelined NTT Benchmark ────────────────────────────────────────
 // Measures end-to-end latency including H2D + NTT compute + D2H transfers.
 // Args: (ntt_size, num_batches)

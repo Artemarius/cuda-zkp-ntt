@@ -72,7 +72,10 @@ CMake targets:
 - Input/output in standard (non-Montgomery) form
 - Two arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead)
   and `NTTMode::BARRETT` (standard-form throughout, no conversion)
+- Batched NTT: `ntt_forward_batch()` / `ntt_inverse_batch()` process B independent NTTs
+  in a single set of kernel launches. Contiguous memory layout: `d_data[b*n..(b+1)*n-1]`
 - Twiddle factors precomputed on device: Montgomery twiddles + separate standard-form cache
+  Shared across all NTTs in a batch (single precomputation, B× reuse)
 - NTT size must be power of 2, range [2^8 .. 2^26]
 - Butterfly operation: `A[i] += w * A[j]; A[j] = A[i] - 2*w*A[j]` (in-place Cooley-Tukey)
 
@@ -85,7 +88,7 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
-  ntt.cuh             — NTT public interface (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC)
+  ntt.cuh             — NTT public interface (single + batched, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC)
   pipeline.cuh        — AsyncNTTPipeline class interface
 
 src/
@@ -184,11 +187,26 @@ LICENSE                — MIT License
 - NTT integration: `NTTMode::BARRETT` in all kernel files, standard-form twiddle cache
 - Reference: MoMA (Zhang & Franchetti, CGO 2025) uses Barrett exclusively
 
-### Batched NTT (planned, v1.2.0)
-- Process B independent NTTs in a single kernel launch (vs current 1-at-a-time)
+### Batched NTT (implemented, v1.2.0 Session 3)
+- Process B independent NTTs in a single set of kernel launches (vs B separate calls)
 - Groth16 needs ~9 NTTs; MoMA recommends batch_size > 8 for 128-384 bit inputs
-- Fused kernel: launch B × (n/1024) blocks; block ID determines NTT and sub-array
+- API: `ntt_forward_batch(d_data, batch_size, n, mode)` — contiguous layout, B*n elements
+- Fused kernel: existing kernel unchanged — launch B × (n/1024) blocks. `boff = blockIdx.x * ELEMS`
+  naturally addresses correct sub-array because butterfly addressing partitions by NTT boundaries
+  (n/2 is always a multiple of half = 2^s, so the integer division decomposes cleanly)
+- Outer cooperative kernel: new batched kernel with `total_butterflies = B * n/2`. Same butterfly
+  formula; strided loop handles more iterations. One cooperative launch for all B NTTs.
+- Bit-reverse: new batched kernel maps `tid / n` to batch_id, `tid % n` to local index
+- Scale/conversion kernels: element-wise, work unchanged with B*n total elements
 - Twiddle factor sharing: all B NTTs reuse the same precomputed table
+- **Kernel launches**: 3-4 per batch (vs B × 4 sequential = 32 for B=8)
+- **Measured batch throughput (RTX 3060, 8× NTTs, Barrett, median):**
+  - 2^15: 1.03 ms batched vs 1.64 ms sequential → **1.59x (37% faster)**
+  - 2^18: 9.73 ms vs 10.8 ms → **1.11x (10% faster)**
+  - 2^20: 44.9 ms vs 46.8 ms → **1.04x (4% faster)**
+  - 2^22: 200 ms vs 205 ms → **1.02x (2% faster)**
+- Small sizes benefit most: single NTT at 2^15 barely fills 30 SMs; batch of 8 gives 8× blocks
+- Large sizes (2^22): GPU already saturated; batching saves launch overhead only
 
 ### 4-Step NTT (planned, v1.3.0)
 - Bailey's algorithm: decompose n = n1 × n2 into sub-NTTs + transpose + twiddle multiply
@@ -206,7 +224,7 @@ See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
 Phases 1-8 complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
 
-**v1.2.0 progress:** Sessions 1-2 (Barrett arithmetic + NTT integration) complete. Sessions 3-4 remaining.
+**v1.2.0 progress:** Sessions 1-3 (Barrett arithmetic + NTT integration + batched NTT) complete. Session 4 remaining.
 
 ### Future Releases
 - **v1.2.0** — MoMA-inspired Barrett arithmetic + batched NTT (target: ~22 ms single, better batch throughput)

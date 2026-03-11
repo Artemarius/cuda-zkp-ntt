@@ -31,6 +31,9 @@
 extern __global__ void ntt_bit_reverse_kernel(
     FpElement* data, uint32_t n, uint32_t log_n);
 
+extern __global__ void ntt_bit_reverse_batch_kernel(
+    FpElement* data, uint32_t n, uint32_t log_n, uint32_t total_elements);
+
 extern __global__ void ntt_butterfly_kernel(
     FpElement* __restrict__ data,
     const FpElement* __restrict__ twiddles,
@@ -521,6 +524,449 @@ void ntt_forward_optimized_barrett(
                 d_data, d_twiddles, N, half, stride);
         }
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Batched NTT — process B independent NTTs in a single set of kernel launches
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Data layout: contiguous, d_data[b*n .. (b+1)*n - 1] is NTT #b.
+// Twiddle factors are shared across all NTTs (same size n).
+//
+// Key insight: the butterfly addressing formula (group*2*half + j, +half)
+// naturally partitions by NTT boundaries for contiguous data because n/2
+// is always a multiple of half = 2^s. Proof: n is power-of-2, s < log_n,
+// so half <= n/2, and n/2 / half = n / 2^(s+1) is an integer.
+//
+// Fused kernel: existing kernel works unchanged — just launch with
+// batch_size * (n/ELEMS) blocks. boff = blockIdx.x * ELEMS gives the
+// correct offset into the contiguous batched array.
+//
+// Outer cooperative kernel: new kernel with total_butterflies parameter
+// (= batch_size * n/2). Same butterfly formula, more iterations per thread.
+
+// ─── Batched Outer Cooperative Kernel (Montgomery) ───────────────────────────
+
+__global__ void ntt_outer_fused_batch_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_butterflies,
+    int start_stage,
+    int end_stage
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int s = start_stage; s < end_stage; ++s) {
+        const uint32_t half   = 1u << s;
+        const uint32_t stride = n / (2u * half);
+
+        for (uint32_t tid = global_tid; tid < total_butterflies; tid += total_threads) {
+            uint32_t group   = tid / half;
+            uint32_t j       = tid % half;
+            uint32_t idx_top = group * (2u * half) + j;
+            uint32_t idx_bot = idx_top + half;
+            uint32_t tw_idx  = j * stride;
+
+            FpElement u = data[idx_top];
+            FpElement v = ff_mul(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add(u, v);
+            data[idx_bot] = ff_sub(u, v);
+        }
+
+        if (s + 1 < end_stage) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Batched Outer Cooperative Kernel (Barrett) ──────────────────────────────
+
+__global__ void ntt_outer_fused_batch_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_butterflies,
+    int start_stage,
+    int end_stage
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int s = start_stage; s < end_stage; ++s) {
+        const uint32_t half   = 1u << s;
+        const uint32_t stride = n / (2u * half);
+
+        for (uint32_t tid = global_tid; tid < total_butterflies; tid += total_threads) {
+            uint32_t group   = tid / half;
+            uint32_t j       = tid % half;
+            uint32_t idx_top = group * (2u * half) + j;
+            uint32_t idx_bot = idx_top + half;
+            uint32_t tw_idx  = j * stride;
+
+            FpElement u = data[idx_top];
+            FpElement v = ff_mul_barrett(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add(u, v);
+            data[idx_bot] = ff_sub(u, v);
+        }
+
+        if (s + 1 < end_stage) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Batched Cooperative Launch Helpers ───────────────────────────────────────
+
+static int s_coop_max_blocks_batch = 0;
+static int s_coop_max_blocks_batch_barrett = 0;
+
+static __host__ int get_coop_max_blocks_batch() {
+    if (s_coop_max_blocks_batch > 0) return s_coop_max_blocks_batch;
+
+    int num_blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_fused_batch_kernel,
+        OPT_BLOCK,
+        0
+    ));
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_batch = num_blocks_per_sm * prop.multiProcessorCount;
+
+    if (!prop.cooperativeLaunch) {
+        s_coop_max_blocks_batch = 0;
+    }
+
+    return s_coop_max_blocks_batch;
+}
+
+static __host__ int get_coop_max_blocks_batch_barrett() {
+    if (s_coop_max_blocks_batch_barrett > 0) return s_coop_max_blocks_batch_barrett;
+
+    int num_blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_fused_batch_barrett_kernel,
+        OPT_BLOCK,
+        0
+    ));
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_batch_barrett = num_blocks_per_sm * prop.multiProcessorCount;
+
+    if (!prop.cooperativeLaunch) {
+        s_coop_max_blocks_batch_barrett = 0;
+    }
+
+    return s_coop_max_blocks_batch_barrett;
+}
+
+// ─── Batched Outer Stage Dispatch (Montgomery) ──────────────────────────────
+
+static __host__ void dispatch_outer_stages_batch(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t N, int batch_size, int outer_start, int outer_end,
+    cudaStream_t stream
+) {
+    uint32_t total_butterflies = static_cast<uint32_t>(batch_size) * (N >> 1);
+    int max_blocks = get_coop_max_blocks_batch();
+
+    if (max_blocks > 0) {
+        uint32_t needed_blocks = (total_butterflies + OPT_BLOCK - 1) / OPT_BLOCK;
+        uint32_t grid_size = (static_cast<uint32_t>(max_blocks) < needed_blocks)
+                             ? static_cast<uint32_t>(max_blocks)
+                             : needed_blocks;
+
+        for (int s = outer_start; s < outer_end; ) {
+            int batch_end = s + MAX_STAGES_PER_COOP_LAUNCH;
+            if (batch_end > outer_end) batch_end = outer_end;
+
+            int ss = s;
+            int se = batch_end;
+            void* args[] = {
+                &d_data, &d_twiddles, &N, &total_butterflies, &ss, &se
+            };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_fused_batch_kernel,
+                dim3(grid_size), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+
+            if (err != cudaSuccess) {
+                // Fallback: process each NTT separately
+                uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+                for (int b = 0; b < batch_size; ++b) {
+                    FpElement* d_ntt = d_data + b * N;
+                    for (int ss2 = s; ss2 < outer_end; ++ss2) {
+                        uint32_t half   = 1u << ss2;
+                        uint32_t stride = N / (2u * half);
+                        ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                            d_ntt, d_twiddles, N, half, stride);
+                    }
+                }
+                return;
+            }
+            s = batch_end;
+        }
+    } else {
+        // No cooperative launch: process each NTT separately
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int ss = outer_start; ss < outer_end; ++ss) {
+                uint32_t half   = 1u << ss;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_twiddles, N, half, stride);
+            }
+        }
+    }
+}
+
+// ─── Batched Outer Stage Dispatch (Barrett) ─────────────────────────────────
+
+static __host__ void dispatch_outer_stages_batch_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t N, int batch_size, int outer_start, int outer_end,
+    cudaStream_t stream
+) {
+    uint32_t total_butterflies = static_cast<uint32_t>(batch_size) * (N >> 1);
+    int max_blocks = get_coop_max_blocks_batch_barrett();
+
+    if (max_blocks > 0) {
+        uint32_t needed_blocks = (total_butterflies + OPT_BLOCK - 1) / OPT_BLOCK;
+        uint32_t grid_size = (static_cast<uint32_t>(max_blocks) < needed_blocks)
+                             ? static_cast<uint32_t>(max_blocks)
+                             : needed_blocks;
+
+        for (int s = outer_start; s < outer_end; ) {
+            int batch_end = s + MAX_STAGES_PER_COOP_LAUNCH;
+            if (batch_end > outer_end) batch_end = outer_end;
+
+            int ss = s;
+            int se = batch_end;
+            void* args[] = {
+                &d_data, &d_twiddles, &N, &total_butterflies, &ss, &se
+            };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_fused_batch_barrett_kernel,
+                dim3(grid_size), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+
+            if (err != cudaSuccess) {
+                uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+                for (int b = 0; b < batch_size; ++b) {
+                    FpElement* d_ntt = d_data + b * N;
+                    for (int ss2 = s; ss2 < outer_end; ++ss2) {
+                        uint32_t half   = 1u << ss2;
+                        uint32_t stride = N / (2u * half);
+                        ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                            d_ntt, d_twiddles, N, half, stride);
+                    }
+                }
+                return;
+            }
+            s = batch_end;
+        }
+    } else {
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int ss = outer_start; ss < outer_end; ++ss) {
+                uint32_t half   = 1u << ss;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_twiddles, N, half, stride);
+            }
+        }
+    }
+}
+
+// ─── Batched Forward NTT (Montgomery, in-place) ─────────────────────────────
+
+void ntt_forward_batch_montgomery(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles, cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const int log_n = log2_of(n);
+    const uint32_t total_elements = static_cast<uint32_t>(batch_size) * N;
+    const uint32_t grid_total = (total_elements + OPT_BLOCK - 1) / OPT_BLOCK;
+
+    // Step 1: Batched bit-reverse permutation
+    ntt_bit_reverse_batch_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(
+        d_data, N, log_n, total_elements);
+
+    // Step 2: Fused inner stages (existing kernel, B * blocks)
+    const int fused_k = select_fused_k(log_n);
+
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = static_cast<uint32_t>(batch_size) * (N / elems);
+
+        launch_fused(fused_k, d_data, d_twiddles, N, num_blocks, stream);
+
+        // Step 3: Batched outer stages
+        dispatch_outer_stages_batch(d_data, d_twiddles, N, batch_size,
+                                    fused_k, log_n, stream);
+    } else {
+        // Small NTT fallback: process each NTT separately
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int s = 0; s < log_n; ++s) {
+                uint32_t half   = 1u << s;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_twiddles, N, half, stride);
+            }
+        }
+    }
+}
+
+// ─── Batched Inverse NTT (Montgomery, in-place) ─────────────────────────────
+
+void ntt_inverse_batch_montgomery(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const int log_n = log2_of(n);
+    const uint32_t total_elements = static_cast<uint32_t>(batch_size) * N;
+    const uint32_t grid_total = (total_elements + OPT_BLOCK - 1) / OPT_BLOCK;
+
+    // Step 1: Batched bit-reverse permutation
+    ntt_bit_reverse_batch_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(
+        d_data, N, log_n, total_elements);
+
+    // Step 2: Fused inner stages
+    const int fused_k = select_fused_k(log_n);
+
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = static_cast<uint32_t>(batch_size) * (N / elems);
+
+        launch_fused(fused_k, d_data, d_inv_twiddles, N, num_blocks, stream);
+
+        dispatch_outer_stages_batch(d_data, d_inv_twiddles, N, batch_size,
+                                    fused_k, log_n, stream);
+    } else {
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int s = 0; s < log_n; ++s) {
+                uint32_t half   = 1u << s;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_inv_twiddles, N, half, stride);
+            }
+        }
+    }
+
+    // Step 3: Scale by n^{-1} (element-wise, process all B*N elements)
+    ntt_scale_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(d_data, n_inv, total_elements);
+}
+
+// ─── Batched Forward NTT (Barrett, standard-form, in-place) ─────────────────
+
+void ntt_forward_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_twiddles, cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const int log_n = log2_of(n);
+    const uint32_t total_elements = static_cast<uint32_t>(batch_size) * N;
+    const uint32_t grid_total = (total_elements + OPT_BLOCK - 1) / OPT_BLOCK;
+
+    // Step 1: Batched bit-reverse permutation (domain-agnostic)
+    ntt_bit_reverse_batch_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(
+        d_data, N, log_n, total_elements);
+
+    // Step 2: Fused inner stages (Barrett, B * blocks)
+    const int fused_k = select_fused_k(log_n);
+
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = static_cast<uint32_t>(batch_size) * (N / elems);
+
+        launch_fused_barrett(fused_k, d_data, d_twiddles, N, num_blocks, stream);
+
+        // Step 3: Batched outer stages (Barrett)
+        dispatch_outer_stages_batch_barrett(d_data, d_twiddles, N, batch_size,
+                                            fused_k, log_n, stream);
+    } else {
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int s = 0; s < log_n; ++s) {
+                uint32_t half   = 1u << s;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_twiddles, N, half, stride);
+            }
+        }
+    }
+}
+
+// ─── Batched Inverse NTT (Barrett, standard-form, in-place) ─────────────────
+
+void ntt_inverse_batch_barrett(
+    FpElement* d_data, int batch_size, size_t n,
+    const FpElement* d_inv_twiddles, FpElement n_inv, cudaStream_t stream
+) {
+    const uint32_t N = static_cast<uint32_t>(n);
+    const int log_n = log2_of(n);
+    const uint32_t total_elements = static_cast<uint32_t>(batch_size) * N;
+    const uint32_t grid_total = (total_elements + OPT_BLOCK - 1) / OPT_BLOCK;
+
+    // Step 1: Batched bit-reverse permutation
+    ntt_bit_reverse_batch_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(
+        d_data, N, log_n, total_elements);
+
+    // Step 2: Fused inner stages (Barrett)
+    const int fused_k = select_fused_k(log_n);
+
+    if (log_n >= fused_k) {
+        const int elems = 1 << fused_k;
+        const uint32_t num_blocks = static_cast<uint32_t>(batch_size) * (N / elems);
+
+        launch_fused_barrett(fused_k, d_data, d_inv_twiddles, N, num_blocks, stream);
+
+        dispatch_outer_stages_batch_barrett(d_data, d_inv_twiddles, N, batch_size,
+                                            fused_k, log_n, stream);
+    } else {
+        uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            FpElement* d_ntt = d_data + b * N;
+            for (int s = 0; s < log_n; ++s) {
+                uint32_t half   = 1u << s;
+                uint32_t stride = N / (2u * half);
+                ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_ntt, d_inv_twiddles, N, half, stride);
+            }
+        }
+    }
+
+    // Step 3: Scale by n^{-1} using Barrett multiply (element-wise)
+    ntt_scale_barrett_kernel<<<grid_total, OPT_BLOCK, 0, stream>>>(d_data, n_inv, total_elements);
 }
 
 // ─── Inverse NTT (Barrett, standard-form, in-place) ─────────────────────────

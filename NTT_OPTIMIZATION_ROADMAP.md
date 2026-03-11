@@ -192,7 +192,7 @@ Barrett and Montgomery outputs are **bitwise identical** at all tested sizes (2^
 
 ---
 
-### Session 3 — Batched NTT Kernel
+### Session 3 — Batched NTT Kernel ✅ COMPLETE
 
 **Objective:** Process multiple independent NTTs in a single kernel launch for
 dramatically better GPU utilization.
@@ -261,6 +261,36 @@ Batching improves GPU utilization in two ways:
 - Batched NTT API and kernel implementations
 - Correctness tests for batch mode (equivalence + edge cases + isolation)
 - Throughput benchmark: NTTs/second for varying batch sizes
+
+**Measured results (RTX 3060 Laptop, batch of 8 NTTs, Barrett, median of 3 reps):**
+
+| Size | Batched 8× | Sequential 8× | Speedup | Per-NTT (batch) | Per-NTT (single) |
+|---|---|---|---|---|---|
+| 2^15 | 1.03 ms | 1.64 ms | **1.59x (37%)** | 0.129 ms | 0.158 ms |
+| 2^18 | 9.73 ms | 10.8 ms | **1.11x (10%)** | 1.22 ms | 1.27 ms |
+| 2^20 | 44.9 ms | 46.8 ms | **1.04x (4%)** | 5.61 ms | 5.64 ms |
+| 2^22 | 200 ms | 205 ms | **1.02x (2%)** | 25.0 ms | 25.0 ms |
+
+**Per-NTT cost with batch scaling (Montgomery, 2^15):**
+
+| Batch | Total | Per-NTT | vs Single |
+|---|---|---|---|
+| B=1 | 0.131 ms | 0.131 ms | baseline |
+| B=4 | 0.493 ms | 0.123 ms | -6% |
+| B=8 | 0.962 ms | 0.120 ms | -8% |
+| B=16 | 1.91 ms | 0.119 ms | -9% |
+
+**Analysis:**
+- Biggest wins at small sizes: single 2^15 NTT only fills ~32 blocks for 30 SMs.
+  Batching with B=8 gives 256 blocks → much better SM occupancy.
+- At 2^22, GPU is already saturated by a single NTT (4096 fused blocks for 30 SMs).
+  Batching saves kernel launch overhead only (3-4 launches vs 32).
+- Key design insight: existing fused kernel works for batching with zero changes —
+  `boff = blockIdx.x * ELEMS` naturally addresses the right sub-array for contiguous
+  batched data. Only the outer cooperative kernel and bit-reverse kernel needed new
+  batched versions.
+- Batching reduces total kernel launches from B×4 = 32 to 3-4 per batch.
+- Tests: 119/119 pass (93 existing + 26 new batched NTT tests).
 
 ---
 
