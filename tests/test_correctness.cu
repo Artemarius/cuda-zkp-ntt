@@ -1604,6 +1604,253 @@ void test_ntt_batch_size_one(int log_n, NTTMode mode) {
            mode_name(mode), log_n, pass_count, n);
 }
 
+// ─── v1.3.0 Session 5: Transpose Kernel Tests ────────────────────────────────
+
+// Extern declarations for transpose and split functions (from ntt_4step.cu)
+extern void ntt_transpose(
+    const FpElement* d_src, FpElement* d_dst,
+    uint32_t rows, uint32_t cols, cudaStream_t stream);
+extern void ntt_transpose_batch(
+    const FpElement* d_src, FpElement* d_dst,
+    uint32_t rows, uint32_t cols, uint32_t batch_size, cudaStream_t stream);
+extern void ntt_4step_get_split(uint32_t n, uint32_t& n1, uint32_t& n2);
+
+// Test: transpose a small matrix and verify on CPU
+void test_transpose_square(uint32_t dim) {
+    uint32_t rows = dim, cols = dim;
+    uint32_t total = rows * cols;
+    printf("test_transpose_square (%ux%u)...\n", rows, cols);
+
+    std::vector<FpElement> h_src(total), h_dst(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        h_src[i] = FpElement::zero();
+        h_src[i].limbs[0] = i;
+        h_src[i].limbs[1] = i * 7 + 3;
+    }
+
+    FpElement *d_src, *d_dst;
+    CUDA_CHECK(cudaMalloc(&d_src, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_dst, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_src, h_src.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_transpose(d_src, d_dst, rows, cols, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_dst.data(), d_dst, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Verify: dst[j*rows + i] == src[i*cols + j]
+    int pass = 0;
+    for (uint32_t i = 0; i < rows; ++i) {
+        for (uint32_t j = 0; j < cols; ++j) {
+            if (h_dst[j * rows + i] == h_src[i * cols + j]) ++pass;
+        }
+    }
+
+    TEST_ASSERT(pass == static_cast<int>(total), "Square transpose mismatch");
+    printf("  Square transpose %ux%u: %d/%u correct\n", rows, cols, pass, total);
+
+    CUDA_CHECK(cudaFree(d_src));
+    CUDA_CHECK(cudaFree(d_dst));
+}
+
+// Test: transpose a non-square matrix
+void test_transpose_rect(uint32_t rows, uint32_t cols) {
+    uint32_t total = rows * cols;
+    printf("test_transpose_rect (%ux%u)...\n", rows, cols);
+
+    std::vector<FpElement> h_src(total), h_dst(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        h_src[i] = FpElement::zero();
+        h_src[i].limbs[0] = i;
+        h_src[i].limbs[1] = i ^ 0xDEADBEEF;
+    }
+
+    FpElement *d_src, *d_dst;
+    CUDA_CHECK(cudaMalloc(&d_src, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_dst, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_src, h_src.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_transpose(d_src, d_dst, rows, cols, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_dst.data(), d_dst, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < rows; ++i) {
+        for (uint32_t j = 0; j < cols; ++j) {
+            if (h_dst[j * rows + i] == h_src[i * cols + j]) ++pass;
+        }
+    }
+
+    TEST_ASSERT(pass == static_cast<int>(total), "Rect transpose mismatch");
+    printf("  Rect transpose %ux%u: %d/%u correct\n", rows, cols, pass, total);
+
+    CUDA_CHECK(cudaFree(d_src));
+    CUDA_CHECK(cudaFree(d_dst));
+}
+
+// Test: double transpose (transpose twice = identity)
+void test_transpose_roundtrip(uint32_t rows, uint32_t cols) {
+    uint32_t total = rows * cols;
+    printf("test_transpose_roundtrip (%ux%u)...\n", rows, cols);
+
+    std::vector<FpElement> h_src(total), h_result(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        h_src[i] = FpElement::zero();
+        h_src[i].limbs[0] = i * 12345u + 6789u;
+        h_src[i].limbs[3] = i ^ 0xCAFEBABE;
+        h_src[i].limbs[7] = (i * 31337u) & 0x73eda752u;
+    }
+
+    FpElement *d_src, *d_tmp, *d_result;
+    CUDA_CHECK(cudaMalloc(&d_src, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_tmp, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_result, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_src, h_src.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    // First transpose: rows x cols → cols x rows
+    ntt_transpose(d_src, d_tmp, rows, cols, 0);
+    // Second transpose: cols x rows → rows x cols (should recover original)
+    ntt_transpose(d_tmp, d_result, cols, rows, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_result, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < total; ++i) {
+        if (h_result[i] == h_src[i]) ++pass;
+    }
+
+    TEST_ASSERT(pass == static_cast<int>(total), "Transpose roundtrip mismatch");
+    printf("  Roundtrip %ux%u: %d/%u recovered\n", rows, cols, pass, total);
+
+    CUDA_CHECK(cudaFree(d_src));
+    CUDA_CHECK(cudaFree(d_tmp));
+    CUDA_CHECK(cudaFree(d_result));
+}
+
+// Test: batched transpose
+void test_transpose_batch(uint32_t rows, uint32_t cols, uint32_t batch_size) {
+    uint32_t mat_size = rows * cols;
+    uint32_t total = batch_size * mat_size;
+    printf("test_transpose_batch (%ux%u, B=%u)...\n", rows, cols, batch_size);
+
+    std::vector<FpElement> h_src(total), h_dst(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        h_src[i] = FpElement::zero();
+        h_src[i].limbs[0] = i;
+        h_src[i].limbs[1] = i * 17 + 5;
+    }
+
+    FpElement *d_src, *d_dst;
+    CUDA_CHECK(cudaMalloc(&d_src, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_dst, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_src, h_src.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_transpose_batch(d_src, d_dst, rows, cols, batch_size, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_dst.data(), d_dst, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        uint32_t base = b * mat_size;
+        for (uint32_t i = 0; i < rows; ++i) {
+            for (uint32_t j = 0; j < cols; ++j) {
+                if (h_dst[base + j * rows + i] == h_src[base + i * cols + j]) ++pass;
+            }
+        }
+    }
+
+    TEST_ASSERT(pass == static_cast<int>(total), "Batched transpose mismatch");
+    printf("  Batch transpose %ux%u B=%u: %d/%u correct\n", rows, cols, batch_size, pass, total);
+
+    CUDA_CHECK(cudaFree(d_src));
+    CUDA_CHECK(cudaFree(d_dst));
+}
+
+// Test: 4-step split computation
+void test_4step_split() {
+    printf("test_4step_split...\n");
+
+    struct SplitCase { uint32_t n; uint32_t expected_n1; uint32_t expected_n2; };
+    SplitCase cases[] = {
+        {1u << 16, 1u << 8,  1u << 8},   // even: 16 → 8, 8
+        {1u << 18, 1u << 9,  1u << 9},   // even: 18 → 9, 9
+        {1u << 20, 1u << 10, 1u << 10},  // even: 20 → 10, 10
+        {1u << 22, 1u << 11, 1u << 11},  // even: 22 → 11, 11
+        {1u << 17, 1u << 8,  1u << 9},   // odd: 17 → 8, 9
+        {1u << 19, 1u << 9,  1u << 10},  // odd: 19 → 9, 10
+        {1u << 21, 1u << 10, 1u << 11},  // odd: 21 → 10, 11
+    };
+
+    int pass = 0;
+    int total = sizeof(cases) / sizeof(cases[0]);
+    for (int c = 0; c < total; ++c) {
+        uint32_t n1, n2;
+        ntt_4step_get_split(cases[c].n, n1, n2);
+        bool ok = (n1 == cases[c].expected_n1 && n2 == cases[c].expected_n2 && n1 * n2 == cases[c].n);
+        if (ok) {
+            ++pass;
+        } else {
+            printf("  FAIL: n=%u → got (%u, %u), expected (%u, %u)\n",
+                   cases[c].n, n1, n2, cases[c].expected_n1, cases[c].expected_n2);
+        }
+    }
+
+    TEST_ASSERT(pass == total, "4-step split computation mismatch");
+    printf("  4-step split: %d/%d correct\n", pass, total);
+}
+
+// Test: large transpose matching 4-step decomposition sizes
+void test_transpose_4step_sizes() {
+    printf("test_transpose_4step_sizes...\n");
+
+    // Test transpose at the exact sizes used by 4-step NTT
+    // n=2^22: n1=n2=2^11=2048 → transpose 2048x2048 matrix
+    uint32_t n1 = 2048, n2 = 2048;
+    uint32_t total = n1 * n2;  // 4M elements = 128 MB
+
+    std::vector<FpElement> h_src(total), h_dst(total);
+    for (uint32_t i = 0; i < total; ++i) {
+        h_src[i] = FpElement::zero();
+        h_src[i].limbs[0] = i;
+        h_src[i].limbs[7] = i >> 16;
+    }
+
+    FpElement *d_src, *d_dst;
+    CUDA_CHECK(cudaMalloc(&d_src, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_dst, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_src, h_src.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ntt_transpose(d_src, d_dst, n1, n2, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_dst.data(), d_dst, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Spot-check corners and random positions (full check is 4M comparisons)
+    int pass = 0;
+    int checks = 0;
+    // Check corners
+    auto verify = [&](uint32_t r, uint32_t c) {
+        if (r < n1 && c < n2) {
+            if (h_dst[c * n1 + r] == h_src[r * n2 + c]) ++pass;
+            ++checks;
+        }
+    };
+    verify(0, 0);
+    verify(0, n2 - 1);
+    verify(n1 - 1, 0);
+    verify(n1 - 1, n2 - 1);
+    // Check some interior points
+    for (uint32_t k = 0; k < 1000; ++k) {
+        uint32_t r = (k * 12345u + 67u) % n1;
+        uint32_t c = (k * 54321u + 89u) % n2;
+        verify(r, c);
+    }
+
+    TEST_ASSERT(pass == checks, "4-step size transpose spot-check mismatch");
+    printf("  Transpose 2048x2048: %d/%d spot checks passed\n", pass, checks);
+
+    CUDA_CHECK(cudaFree(d_src));
+    CUDA_CHECK(cudaFree(d_dst));
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -1796,6 +2043,23 @@ int main() {
     test_ntt_batch_vs_sequential(22, 2, NTTMode::OPTIMIZED);
     test_ntt_batch_vs_sequential(22, 2, NTTMode::BARRETT);
     test_ntt_batch_roundtrip(22, 2, NTTMode::BARRETT);
+
+    // v1.3.0 Session 5: Transpose kernel tests
+    test_4step_split();
+    test_transpose_square(16);     // exactly one tile
+    test_transpose_square(32);     // 2x2 tiles
+    test_transpose_square(64);     // 4x4 tiles
+    test_transpose_rect(16, 32);   // non-square (n1 < n2)
+    test_transpose_rect(32, 16);   // non-square (n1 > n2)
+    test_transpose_rect(256, 512); // 4-step odd log_n sizes
+    test_transpose_rect(512, 1024);// 4-step sub-NTT sizes
+    test_transpose_roundtrip(16, 32);
+    test_transpose_roundtrip(64, 64);
+    test_transpose_roundtrip(256, 512);
+    test_transpose_roundtrip(1024, 2048);
+    test_transpose_batch(16, 32, 4);
+    test_transpose_batch(64, 64, 8);
+    test_transpose_4step_sizes();  // 2048x2048 (actual 4-step decomposition)
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

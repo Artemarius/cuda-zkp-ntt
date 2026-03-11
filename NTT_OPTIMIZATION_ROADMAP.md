@@ -393,7 +393,7 @@ utilization even on large GPUs.
 multiply (step 2) is a standalone kernel with n pointwise multiplications — having data
 in standard form avoids any conversion.
 
-### Session 5 — 4-Step NTT: Transpose Kernel + Architecture
+### Session 5 — 4-Step NTT: Transpose Kernel + Architecture ✅ COMPLETE
 
 **Objective:** Design the 4-step decomposition and implement the transpose kernel.
 
@@ -402,19 +402,37 @@ in standard form avoids any conversion.
   - Choose n1, n2 split strategy (prefer n1=n2=√n when possible)
   - Handle non-square cases (n1 ≠ n2) for odd log_n
 - Implement efficient matrix transpose kernel for FpElement data:
-  - Shared-memory tiled transpose (32×32 tiles to avoid bank conflicts)
+  - Shared-memory tiled transpose (16×16 tiles with +1 padding to avoid bank conflicts)
   - Coalesced reads + coalesced writes (classic GPU transpose pattern)
   - Handle non-square transpose (n1 ≠ n2)
-- Implement twiddle factor precomputation for 4-step:
-  - Twiddle table: ω^(i·j) for 0 ≤ i < n1, 0 ≤ j < n2
-  - Can reuse existing twiddle infrastructure with index remapping
+- Implement twiddle multiply kernels for the middle step:
+  - Barrett + Montgomery variants, single + batched
 - Skeleton of `ntt_4step_forward` / `ntt_4step_inverse` host functions
 - Unit tests for transpose kernel correctness
 
+**Implementation details:**
+- **Split strategy**: balanced — n1 = 2^(log_n/2), n2 = 2^(log_n - log_n/2)
+  - Even log_n: n1 = n2 = sqrt(n) (e.g., 2^22 → 2048×2048)
+  - Odd log_n: n1 < n2 (e.g., 2^21 → 1024×2048)
+- **Transpose kernel**: TILE=16, 256 threads/block, shmem padded 16×17 (FpElement is 32B,
+  so TILE=16 uses 8.5 KB shmem — TILE=32 would use 34 KB). Supports arbitrary n1×n2.
+- **Batched transpose**: uses z-dimension gridDim for batch index
+- **4-step skeleton**: forward + inverse Barrett paths. Currently uses 4 transposes
+  (will optimize to 2 in Session 6). Reuses existing batched sub-NTT infrastructure.
+- **Twiddle multiply kernels**: pointwise data[i] *= omega_n^(i*j), Barrett and Montgomery
+
 **Deliverables:**
-- New `src/ntt_4step.cu` with transpose kernel and host dispatch skeleton
-- Transpose correctness tests
+- `src/ntt_4step.cu` with transpose kernel, twiddle multiply, and host dispatch skeleton
+- Transpose correctness tests (15 new tests)
 - Design doc in code comments explaining the decomposition
+
+**Tests:** 134/134 pass (119 existing + 15 new):
+- 4-step split computation (7 cases: even/odd log_n)
+- Square transpose (16², 32², 64²)
+- Rectangular transpose (16×32, 32×16, 256×512, 512×1024)
+- Double-transpose roundtrip (4 sizes up to 1024×2048 = 2M elements)
+- Batched transpose (16×32 B=4, 64×64 B=8)
+- Large-scale 2048×2048 spot-check (actual 4-step decomposition size for n=2^22)
 
 ---
 
@@ -628,7 +646,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | 2 | v1.2.0 | Barrett NTT integration + benchmarking | Eliminate Montgomery overhead |
 | 3 | v1.2.0 | Batched NTT kernel | MoMA batch processing pattern |
 | 4 | v1.2.0 | Benchmark, profile, release | — |
-| 5 | v1.3.0 | 4-step NTT: transpose kernel + architecture | Bailey's algorithm |
+| **5** | **v1.3.0** | **4-step NTT: transpose kernel + architecture** ✅ | **Bailey's algorithm** |
 | 6 | v1.3.0 | 4-step NTT: sub-NTT integration (+ batch) | Sub-NTTs fit in shmem |
 | 7 | v1.3.0 | 4-step NTT: correctness + edge cases | — |
 | 8 | v1.3.0 | Benchmark, profile, release | — |
