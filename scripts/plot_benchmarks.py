@@ -310,6 +310,125 @@ def plot_batch_scaling():
     print(f"  {path}")
 
 
+def plot_four_step_vs_barrett():
+    """4-Step NTT vs Barrett single NTT latency comparison (v1.3.0)."""
+    scales = ["2^15", "2^16", "2^18", "2^20", "2^22"]
+    barrett =    [0.158, 0.300, 1.27,  5.60, 24.9]
+    four_step =  [0.160, 0.491, 1.66,  7.03, 29.5]
+
+    x = np.arange(len(scales))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bars1 = ax.bar(x - w/2, barrett, w, label="Barrett (cooperative outer)", color="#70AD47", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x + w/2, four_step, w, label="4-Step (Bailey's algorithm)", color="#9B59B6", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Single NTT Latency — Barrett vs 4-Step (v1.3.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.set_ylim(0.1, 50)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Annotate delta (4-step overhead)
+    for i in range(len(scales)):
+        delta = (four_step[i] / barrett[i] - 1) * 100
+        if delta > 1:
+            ax.annotate(f"+{delta:.0f}%",
+                        xy=(x[i] + w/2, four_step[i]),
+                        xytext=(0, 6), textcoords="offset points",
+                        ha="center", fontsize=8, fontweight="bold", color="#C00000")
+        else:
+            ax.annotate(f"~0%",
+                        xy=(x[i] + w/2, four_step[i]),
+                        xytext=(0, 6), textcoords="offset points",
+                        ha="center", fontsize=8, fontweight="bold", color="#666666")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "four_step_vs_barrett.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_four_step_batch():
+    """4-Step batched NTT vs Barrett batched (v1.3.0)."""
+    sizes = ["2^15", "2^18", "2^20", "2^22"]
+    barrett_batch =    [1.01, 9.65,  44.6, 199]
+    four_step_batch =  [1.01, 11.4,  53.1, 241]
+
+    x = np.arange(len(sizes))
+    w = 0.35
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), gridspec_kw={"width_ratios": [2, 1]})
+
+    # Left: latency bars
+    bars1 = ax1.bar(x - w/2, barrett_batch, w, label="Barrett batched 8x", color="#70AD47", edgecolor="white", linewidth=0.5)
+    bars2 = ax1.bar(x + w/2, four_step_batch, w, label="4-Step batched 8x", color="#9B59B6", edgecolor="white", linewidth=0.5)
+
+    ax1.set_xlabel("NTT Size (8 NTTs)")
+    ax1.set_ylabel("Total Latency (ms)")
+    ax1.set_title("Batched 8x NTT — Barrett vs 4-Step (v1.3.0)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(sizes)
+    ax1.legend(loc="upper left")
+    ax1.set_yscale("log")
+    ax1.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Right: overhead ratio (how much slower is 4-step)
+    ratios = [f / b for f, b in zip(four_step_batch, barrett_batch)]
+    colors = ["#70AD47" if r <= 1.05 else "#FFC000" if r <= 1.2 else "#C00000" for r in ratios]
+    bars3 = ax2.bar(sizes, ratios, color=colors, edgecolor="white", linewidth=0.5)
+    ax2.set_ylabel("4-Step / Barrett ratio")
+    ax2.set_title("4-Step Overhead")
+    ax2.set_ylim(0.8, 1.5)
+    ax2.axhline(y=1.0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
+    ax2.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, r in zip(bars3, ratios):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                 f"{r:.2f}x", ha="center", fontweight="bold", fontsize=10)
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "four_step_batch.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_all_modes_comparison():
+    """All NTT modes comparison at n=2^22 (v1.3.0 summary)."""
+    modes = ["Naive\n(radix-2)", "Montgomery\n(fused+coop)", "Barrett\n(fused+coop)", "4-Step\n(Bailey's)"]
+    times = [26.2, 25.1, 24.9, 29.5]
+    colors = ["#A5A5A5", "#5B9BD5", "#70AD47", "#9B59B6"]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(modes, times, color=colors, edgecolor="white", linewidth=0.5)
+
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Single NTT at n=2^22 — All Modes (v1.3.0)")
+    ax.set_ylim(0, 35)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f"{t:.1f} ms", ha="center", fontweight="bold", fontsize=10)
+
+    # Highlight best
+    ax.annotate("Best", xy=(2, 24.9), xytext=(2.5, 20),
+                arrowprops=dict(arrowstyle="->", color="#006400"),
+                fontsize=10, fontweight="bold", color="#006400")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "all_modes_comparison.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
 if __name__ == "__main__":
     print("Generating benchmark charts...")
     plot_ntt_compute()
@@ -319,4 +438,7 @@ if __name__ == "__main__":
     plot_barrett_vs_montgomery()
     plot_batch_throughput()
     plot_batch_scaling()
+    plot_four_step_vs_barrett()
+    plot_four_step_batch()
+    plot_all_modes_comparison()
     print("Done.")

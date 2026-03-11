@@ -11,13 +11,14 @@
 
 ## Highlights
 
+- **4-Step NTT (Bailey's algorithm)**: fully implemented and tested; negative result documented — cooperative outer approach remains faster (see [analysis](results/analysis.md#section-6--v130-results-4-step-ntt-algorithm))
 - **Barrett + Montgomery dual arithmetic**: Barrett NTT eliminates 12% Montgomery conversion overhead; 1% faster at n=2^22
 - **Batched NTT**: process 8 independent NTTs in 3-4 kernel launches (vs 32 sequential); **1.52x throughput** at 2^15
 - **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT (Direction A)
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
 - **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
 - **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
-- **119 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **221 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - BLS12-381 scalar field, 255-bit Montgomery + Barrett arithmetic, production-grade modulus
 
 ---
@@ -70,6 +71,7 @@ Key implementation choices:
 | Naive GPU NTT (radix-2) | 1.34 ms | 5.88 ms | 26.2 ms | 1.0x |
 | v1.1 Montgomery (fused K=10 + coop outer) | 1.21 ms | 5.51 ms | 25.1 ms | **1.04x** |
 | **v1.2 Barrett** (no Montgomery conversion) | 1.27 ms | 5.61 ms | **24.9 ms** | **1.05x** |
+| v1.3 4-Step (Bailey's algorithm) | 1.66 ms | 7.03 ms | 29.5 ms | 0.89x |
 
 **Async Pipeline (end-to-end including H2D + compute + D2H, 8 batches, pinned memory):**
 
@@ -91,6 +93,18 @@ Key implementation choices:
 | **Speedup** | **1.52x** | **1.08x** | ~1.0x | ~1.0x |
 
 *Batching wins at small sizes where single NTT underutilizes the GPU (32 blocks for 30 SMs). At 2^22, the GPU is already saturated.*
+
+**4-Step NTT — Negative Result (v1.3.0):**
+
+The 4-step NTT (Bailey's algorithm) was fully implemented and tested (221 tests) but is **slower
+than the cooperative approach** at all sizes. At n=2^22: 29.5 ms (4-step) vs 24.9 ms (Barrett) =
++18%. Root cause: 3 transpose passes add DRAM overhead; sub-NTTs of 2048 elements still have 1
+cooperative outer stage hitting DRAM. See [analysis](results/analysis.md#section-6--v130-results-4-step-ntt-algorithm).
+
+<p align="center">
+  <img src="results/charts/four_step_vs_barrett.png" width="48%" alt="4-Step vs Barrett NTT latency">
+  <img src="results/charts/all_modes_comparison.png" width="48%" alt="All NTT modes comparison at 2^22">
+</p>
 
 <p align="center">
   <img src="results/charts/barrett_vs_montgomery.png" width="48%" alt="Barrett vs Montgomery NTT latency">
@@ -138,13 +152,14 @@ cuda-zkp-ntt/
 │   ├── cuda_utils.cuh         # CUDA_CHECK macro, GPU timer
 │   ├── ff_arithmetic.cuh      # Finite-field types and Montgomery mul
 │   ├── ff_barrett.cuh         # Barrett modular arithmetic (standard-form)
-│   ├── ntt.cuh                # NTT interface (single + batched, 4 modes)
+│   ├── ntt.cuh                # NTT interface (single + batched, 5 modes)
 │   └── pipeline.cuh           # Async pipeline infrastructure
 ├── src/
 │   ├── ff_mul.cu              # Montgomery multiplication kernels
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
 │   ├── ntt_optimized.cu       # NTT host dispatch: K selection + cooperative outer fusion
 │   ├── ntt_fused_kernels.cu   # Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC)
+│   ├── ntt_4step.cu           # 4-Step NTT: transpose, twiddle multiply, Bailey's algorithm
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
@@ -255,7 +270,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. Future releases (see [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md)) continue with 4-step NTT, register-centric kernel design, and CUDA Graphs.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. Future releases (see [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md)) target register-centric kernel optimization and CUDA Graphs.
 
 ---
 

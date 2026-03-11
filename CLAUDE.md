@@ -210,10 +210,13 @@ LICENSE                — MIT License
 - Small sizes benefit most: single NTT at 2^15 barely fills 30 SMs; batch of 8 gives 8× blocks
 - Large sizes (2^22): GPU already saturated; batching saves launch overhead only
 
-### 4-Step NTT (in progress, v1.3.0 — Session 7 complete)
+### 4-Step NTT (complete, v1.3.0 — **negative result**)
 - Bailey's algorithm: decompose n = n1 × n2 into sub-NTTs + transpose + twiddle multiply
 - For n=2^22 with n1=n2=2^11: each sub-NTT is 2048 elements → mostly fused in shmem
-- Eliminates outer-stage DRAM passes (sub-NTTs at 2048 elements have ≤1 outer stage, L2-resident)
+- **Measured (n=2^22)**: 29.5 ms (4-step) vs 24.9 ms (Barrett) = **+18% slower**
+- **Root cause**: 3 transpose passes add ~11n DRAM ops; sub-NTTs of 2048 still have 1 outer
+  stage hitting DRAM (128 MB total >> 4 MB L2 when batched); cooperative approach has zero
+  structural overhead
 - Natural synergy with batching: B full NTTs = B×n2 sub-NTTs in step 1
 - **Session 5 (complete):** Transpose kernel + architecture skeleton
   - Transpose kernel: TILE=16, shmem padded 16×(16+1), coalesced R/W, supports non-square
@@ -238,6 +241,11 @@ LICENSE                — MIT License
   - 4-step vs Barrett cross-validation at 11 sizes (bitwise identical)
   - Batched B=8 vs sequential at 2^16, 2^18; batched at 9 additional size×B configurations
   - Batched 4-step vs batched Barrett cross-validation at 5 size×B configurations
+- **Session 8 (complete):** Benchmark + analysis + release v1.3.0
+  - 4-step slower than Barrett at all sizes (n ≥ 2^16): +64% at 2^16, +18% at 2^22
+  - Batched 8× 4-step: 241 ms vs 199 ms Barrett (2^22); 4-step benefits more from batching
+    (1.16x batch speedup vs Barrett's 1.05x) but still slower in absolute terms
+  - Root cause documented: transpose overhead + sub-NTT outer stages + L2 thrashing
 
 ---
 
@@ -246,17 +254,15 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-Phases 1-8 complete. Current version: **v1.2.0**.
+Phases 1-8 complete. Current version: **v1.3.0**.
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
-
-### In Progress
-- **v1.3.0** — 4-Step NTT algorithm (target: ≤16 ms single, ~80-100 ms batch-of-8). Session 7 complete (exhaustive correctness + fallback). 221 tests.
+- **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 
 ### Future Releases
-- **v1.4.0** — Register optimization + phase-aware pipeline + CUDA Graphs (target: ~10-14 ms)
+- **v1.4.0** — Register optimization + CUDA Graphs (target: ~10-14 ms)
 
 ---
 

@@ -62,7 +62,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s --mode <mode> [--size N]\n", prog);
     fprintf(stderr, "  --mode   ff_mul | ff_add | ff_sub | ff_sqr\n");
     fprintf(stderr, "           ff_mul_v2 | ff_add_v2 | ff_sub_v2 | ff_sqr_v2\n");
-    fprintf(stderr, "           naive | optimized | async\n");
+    fprintf(stderr, "           naive | optimized | barrett | four_step | async\n");
     fprintf(stderr, "           device_info  (PCIe bandwidth + copy engine count)\n");
     fprintf(stderr, "  --size   log2 of element count (default: 20)\n");
 }
@@ -199,11 +199,14 @@ int main(int argc, char** argv) {
     } else if (strncmp(mode_str, "ff_", 3) == 0) {
         profile_ff(mode_str, n);
     } else if (strcmp(mode_str, "naive") == 0 ||
-               strcmp(mode_str, "optimized") == 0) {
+               strcmp(mode_str, "optimized") == 0 ||
+               strcmp(mode_str, "barrett") == 0 ||
+               strcmp(mode_str, "four_step") == 0) {
         // ─── Single NTT Profiling (Phase 7) ─────────────────────────────
-        NTTMode ntt_mode = (strcmp(mode_str, "naive") == 0)
-                               ? NTTMode::NAIVE
-                               : NTTMode::OPTIMIZED;
+        NTTMode ntt_mode = NTTMode::NAIVE;
+        if (strcmp(mode_str, "optimized") == 0) ntt_mode = NTTMode::OPTIMIZED;
+        else if (strcmp(mode_str, "barrett") == 0) ntt_mode = NTTMode::BARRETT;
+        else if (strcmp(mode_str, "four_step") == 0) ntt_mode = NTTMode::FOUR_STEP;
 
         size_t bytes = (size_t)n * sizeof(FpElement);
 

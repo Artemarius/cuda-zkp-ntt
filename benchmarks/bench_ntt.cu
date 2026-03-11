@@ -140,6 +140,51 @@ BENCHMARK(BM_NttForwardBarrett)
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 
+// ─── 4-Step NTT Benchmark ──────────────────────────────────────────────────
+// Bailey's algorithm: sub-NTTs in shmem, no outer-stage DRAM passes.
+// Falls back to Barrett for n < 2^16.
+
+static void BM_NttForwardFourStep(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, n * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    ntt_forward(d_data, n, NTTMode::FOUR_STEP);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        ntt_forward(d_data, n, NTTMode::FOUR_STEP);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(n));
+    state.counters["elements"] = static_cast<double>(n);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttForwardFourStep)
+    ->RangeMultiplier(4)
+    ->Range(1 << 15, 1 << 22)
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
 // ─── Batched NTT Benchmarks ──────────────────────────────────────────────────
 // Args: (ntt_size, batch_size)
 
@@ -236,7 +281,55 @@ BENCHMARK(BM_NttBatchBarrett)
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 
-// Sequential baseline: B separate ntt_forward calls
+// ─── Batched 4-Step NTT ─────────────────────────────────────────────────────
+
+static void BM_NttBatchFourStep(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+    int batch_size = static_cast<int>(state.range(1));
+    size_t total = static_cast<size_t>(batch_size) * n;
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, total * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    ntt_forward_batch(d_data, batch_size, n, NTTMode::FOUR_STEP);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        ntt_forward_batch(d_data, batch_size, n, NTTMode::FOUR_STEP);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(total));
+    state.counters["ntt_size"] = static_cast<double>(n);
+    state.counters["batch"] = static_cast<double>(batch_size);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttBatchFourStep)
+    ->Args({1 << 15, 1})->Args({1 << 15, 4})->Args({1 << 15, 8})->Args({1 << 15, 16})
+    ->Args({1 << 18, 1})->Args({1 << 18, 4})->Args({1 << 18, 8})
+    ->Args({1 << 20, 1})->Args({1 << 20, 4})->Args({1 << 20, 8})
+    ->Args({1 << 22, 1})->Args({1 << 22, 2})->Args({1 << 22, 4})->Args({1 << 22, 8})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
+// Sequential baseline: B separate ntt_forward calls (Barrett)
 static void BM_NttSequentialLoop(benchmark::State& state) {
     size_t n = static_cast<size_t>(state.range(0));
     int batch_size = static_cast<int>(state.range(1));
@@ -277,6 +370,52 @@ static void BM_NttSequentialLoop(benchmark::State& state) {
     CUDA_CHECK(cudaFree(d_data));
 }
 BENCHMARK(BM_NttSequentialLoop)
+    ->Args({1 << 15, 8})->Args({1 << 18, 8})
+    ->Args({1 << 20, 8})->Args({1 << 22, 8})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
+// Sequential baseline: B separate ntt_forward calls (4-Step)
+static void BM_NttSequentialLoopFourStep(benchmark::State& state) {
+    size_t n = static_cast<size_t>(state.range(0));
+    int batch_size = static_cast<int>(state.range(1));
+
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, batch_size * n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemset(d_data, 0, batch_size * n * sizeof(FpElement)));
+
+    ntt_precompute_twiddles(n);
+
+    // Warm up
+    for (int b = 0; b < batch_size; ++b)
+        ntt_forward(d_data + b * n, n, NTTMode::FOUR_STEP);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (auto _ : state) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int b = 0; b < batch_size; ++b)
+            ntt_forward(d_data + b * n, n, NTTMode::FOUR_STEP);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        state.SetIterationTime(ms / 1000.0);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(batch_size) * static_cast<int64_t>(n));
+    state.counters["ntt_size"] = static_cast<double>(n);
+    state.counters["batch"] = static_cast<double>(batch_size);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+}
+BENCHMARK(BM_NttSequentialLoopFourStep)
     ->Args({1 << 15, 8})->Args({1 << 18, 8})
     ->Args({1 << 20, 8})->Args({1 << 22, 8})
     ->Unit(benchmark::kMillisecond)

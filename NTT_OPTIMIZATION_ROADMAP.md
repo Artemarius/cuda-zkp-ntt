@@ -534,26 +534,50 @@ in standard form avoids any conversion.
 
 ---
 
-### Session 8 — 4-Step NTT: Benchmark, Profile, Release v1.3.0
+### Session 8 — 4-Step NTT: Benchmark, Profile, Release v1.3.0 ✅ COMPLETE
 
 **Objective:** Quantify the 4-step improvement and release.
 
-**Tasks:**
-- Benchmark 4-step vs cooperative (v1.1) for all sizes (single + batched)
-- Profile with ncu: capture roofline for sub-NTT kernels, transpose, twiddle multiply
-  - Expect sub-NTTs to be compute-bound (like current fused kernel)
-  - Expect transpose to be memory-bound but with coalesced access (high DRAM efficiency)
-  - Expect twiddle multiply to be compute-bound (embarrassingly parallel ff_mul)
-- Measure total DRAM traffic: 4-step should be ~3 full passes (load + twiddle + store)
-  vs current 12+ passes (one per outer stage)
-- Capture screenshots: roofline for 4-step sub-NTT, transpose, and twiddle kernels
-- Update analysis.md, README, CLAUDE.md
-- Update plot_benchmarks.py with new data
-- Tag v1.3.0 release
+**Result: NEGATIVE — 4-step is slower than cooperative approach at all sizes.**
+
+**Measured results (RTX 3060 Laptop, 5-rep median):**
+
+Single NTT forward:
+
+| Size | Naive | Montgomery | Barrett | 4-Step | 4-Step vs Barrett |
+|---|---|---|---|---|---|
+| 2^15 | 0.122 ms | 0.132 ms | 0.158 ms | 0.160 ms | ~0% (Barrett fallback) |
+| 2^16 | 0.228 ms | 0.245 ms | 0.300 ms | **0.491 ms** | **+64% slower** |
+| 2^18 | 1.34 ms | 1.21 ms | 1.27 ms | **1.66 ms** | **+31% slower** |
+| 2^20 | 5.88 ms | 5.50 ms | 5.60 ms | **7.03 ms** | **+26% slower** |
+| **2^22** | **26.2 ms** | **25.1 ms** | **24.9 ms** | **29.5 ms** | **+18% slower** |
+
+Batched 8× NTTs:
+
+| Size | Barrett batch | Barrett seq | 4-Step batch | 4-Step seq |
+|---|---|---|---|---|
+| 2^15 | 1.01 ms | 1.54 ms | 1.01 ms | 1.61 ms |
+| 2^18 | 9.65 ms | 10.8 ms | 11.4 ms | 17.2 ms |
+| 2^20 | 44.6 ms | 47.5 ms | 53.1 ms | 66.9 ms |
+| 2^22 | 199 ms | 208 ms | 241 ms | 279 ms |
+
+**Root cause analysis:**
+1. **Sub-NTTs still have outer stages**: 2048-element sub-NTTs need 11 stages; K=10 fuses
+   10, but 1 cooperative outer stage remains per sub-NTT batch.
+2. **L2 thrashing**: Batched sub-NTTs access the full n-element array (128 MB at 2^22),
+   far exceeding the 4 MB L2 cache. The outer stage hits DRAM on every access.
+3. **3 transpose passes**: Each reads and writes the full array — ~6n DRAM ops of pure overhead.
+4. **Additional overhead**: twiddle multiply (3n), memcpy (2n), kernel launch (7 ops vs 4).
+5. **CPU dispatch overhead**: 33.7 ms CPU time vs 25.0 ms for Barrett (complex host-side logic).
+
+**Positive finding**: 4-step benefits more from batching than Barrett (1.16x vs 1.05x at 2^22)
+due to internal batch structure. But in absolute terms, Barrett batched is still faster.
 
 **Deliverables:**
-- Updated benchmark tables (single + batch throughput)
-- New ncu screenshots and analysis
+- Benchmark data saved to `results/data/bench_v130.json`
+- 3 new charts in `results/charts/` (four_step_vs_barrett, four_step_batch, all_modes_comparison)
+- Updated analysis.md (Section 6), README.md, CLAUDE.md, roadmap
+- All 221 tests pass (no regressions)
 - Git tag v1.3.0
 
 ---
@@ -697,7 +721,7 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 | **5** | **v1.3.0** | **4-step NTT: transpose kernel + architecture** ✅ | **Bailey's algorithm** |
 | **6** | **v1.3.0** | **4-step NTT: sub-NTT integration (+ batch)** ✅ | **Sub-NTTs fit in shmem** |
 | **7** | **v1.3.0** | **4-step NTT: correctness + edge cases** ✅ | **Fallback + 221 tests** |
-| 8 | v1.3.0 | Benchmark, profile, release | — |
+| **8** | **v1.3.0** | **Benchmark + release (negative result)** ✅ | **+18% slower than Barrett** |
 | 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |
 | 10 | v1.4.0 | Phase-aware async pipeline | Compute/memory phase separation |
 | 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
@@ -705,15 +729,17 @@ solving the v1.1 pipeline's DMA interference problem at n=2^22.
 **Cumulative results (n=2^22, single NTT, 5-rep median):**
 - v1.1.0: 25.1 ms (Montgomery, fused K=10 + cooperative outer)
 - **v1.2.0: 24.9 ms (Barrett, -0.8%)** — minimal single-NTT gain; outer stages still dominate
-- v1.3.0 target: ~13-16 ms (4-step eliminates outer-stage DRAM passes)
-- v1.4.0 target: ~10-14 ms (register optimization + CUDA Graphs)
+- **v1.3.0: 29.5 ms (4-Step, +18% SLOWER)** — 3 transposes + sub-NTT outer stages add overhead.
+  **Best mode remains Barrett at 24.9 ms.** 4-step is a negative result.
+- v1.4.0 target: ~10-14 ms (register optimization + CUDA Graphs on cooperative approach)
 
 **Batch throughput (8× 2^22 NTTs):**
 - v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
 - **v1.2.0: 219 ms batched (~1.0x) / 216 ms sequential** — GPU saturated, no gain at 2^22.
   Batching helps at 2^15 (1.52x) where GPU is underutilized.
-- v1.3.0 target: ~80-100 ms (4-step batched, all sub-NTTs in shmem)
-- v1.4.0 target: ~60-80 ms (register opt + CUDA Graphs + phase-aware pipeline)
+- **v1.3.0: 241 ms (4-step batched) vs 199 ms (Barrett batched)** — 4-step +21% slower.
+  4-step benefits more from batching (1.16x vs 1.05x) but still slower in absolute terms.
+- v1.4.0 target: ~60-80 ms (register opt + CUDA Graphs on cooperative approach)
 
 ---
 

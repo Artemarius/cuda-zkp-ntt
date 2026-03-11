@@ -502,6 +502,122 @@ The primary v1.2.0 contribution is **infrastructure for future releases**: Barre
 
 ---
 
+## Section 6 — v1.3.0 Results (4-Step NTT Algorithm)
+
+### 6.1 4-Step NTT vs Barrett — Single NTT
+
+**Method**: Google Benchmark, cudaEvent_t timing, 5-repetition median, Release build.
+
+The 4-step NTT (Bailey's algorithm) decomposes an n-point NTT into sub-NTTs + transpose +
+twiddle multiply. For n=2^22: n1=n2=2^11 → 2048 independent 2048-point sub-NTTs per step.
+Falls back to Barrett for n < 2^16 (sub-NTTs need K=8 minimum = 256 elements).
+
+| Size | Naive | Montgomery | Barrett | **4-Step** | 4-Step vs Barrett |
+|---|---|---|---|---|---|
+| 2^15 | 0.122 ms | 0.132 ms | 0.158 ms | 0.160 ms | ~0% (Barrett fallback) |
+| 2^16 | 0.228 ms | 0.245 ms | 0.300 ms | **0.491 ms** | **+64% slower** |
+| 2^18 | 1.34 ms | 1.21 ms | 1.27 ms | **1.66 ms** | **+31% slower** |
+| 2^20 | 5.88 ms | 5.50 ms | 5.60 ms | **7.03 ms** | **+26% slower** |
+| **2^22** | **26.2 ms** | **25.1 ms** | **24.9 ms** | **29.5 ms** | **+18% slower** |
+
+**Key finding**: The 4-step NTT is **slower at all sizes** where true 4-step execution occurs
+(n ≥ 2^16). The target of ≤16 ms at n=2^22 was not met.
+
+### 6.2 Root Cause Analysis — Why 4-Step is Slower
+
+The roadmap assumed that 4-step would eliminate memory-bound outer-stage DRAM passes by keeping
+all butterfly stages within shmem-resident sub-NTTs. **This assumption was partially incorrect:**
+
+1. **Sub-NTTs still have outer stages**: For n=2^22, sub-NTTs are size 2048=2^11 (11 stages).
+   K=10 fuses stages 0-9 in shared memory, but **1 cooperative outer stage remains** per sub-NTT
+   batch. This outer stage accesses the full n-element array from DRAM.
+
+2. **L2 residency assumption was wrong**: The roadmap assumed "sub-NTTs at 2048 elements have
+   ≤1 outer stage, L2-resident". A single 2048-element sub-NTT is 64 KB (fits in 4 MB L2).
+   But when batching 2048 sub-NTTs, the total data is 2048×2048×32B = **128 MB >> 4 MB L2**.
+   The sub-NTT outer stage still hits DRAM on every access.
+
+3. **3 transpose passes add pure overhead**: Each transpose reads and writes the full n-element
+   array (2×n DRAM operations). Three transposes = 6n DRAM ops — substantial overhead that
+   the original cooperative approach does not incur.
+
+4. **Additional overhead sources**:
+   - Twiddle multiply: n reads + n writes + n twiddle reads = 3n DRAM ops
+   - Final memcpy: 2n DRAM ops
+   - Kernel launch overhead: 7 operations per NTT vs 4 for cooperative
+   - CPU-side dispatch: 33.7 ms CPU time vs 25.0 ms (complex host-side logic)
+
+**DRAM traffic comparison (estimated, n=2^22):**
+
+| Approach | Operation | DRAM ops |
+|---|---|---|
+| Cooperative (v1.2) | 12 outer stages × ~5n per stage | ~60n |
+| 4-Step (v1.3) | 3 transposes (6n) + twiddle (3n) + memcpy (2n) + 2 sub-NTT outer stages (10n) | ~21n + sub-NTT overhead |
+
+The 4-step's ~21n base DRAM traffic is lower than the cooperative's ~60n, but the sub-NTT
+infrastructure adds significant constant overhead that dominates at these sizes. The fused
+kernel in sub-NTTs also has lower block occupancy (4096 blocks for 2048 sub-NTTs of 2048
+elements → 2 blocks per sub-NTT → 4096 total, same as cooperative) while requiring more
+complex dispatch logic.
+
+**The fundamental problem**: To fully eliminate outer stages, sub-NTTs must be ≤ 2^10 = 1024
+elements (fully fused by K=10). For n=2^22, this requires n1×n2 = 2^22 with both ≤ 2^10 —
+impossible. A multi-level (3-step) decomposition would be needed: e.g., 1024 × 1024 × 4,
+which adds yet more transpose overhead.
+
+### 6.3 Batched 4-Step vs Barrett — 8× NTTs
+
+| Size | Barrett batch 8× | Barrett seq 8× | 4-Step batch 8× | 4-Step seq 8× |
+|---|---|---|---|---|
+| 2^15 | 1.01 ms | 1.54 ms | 1.01 ms | 1.61 ms |
+| 2^18 | 9.65 ms | 10.8 ms | 11.4 ms | 17.2 ms |
+| 2^20 | 44.6 ms | 47.5 ms | 53.1 ms | 66.9 ms |
+| 2^22 | 199 ms | 208 ms | 241 ms | 279 ms |
+
+**Batch speedup (batch/sequential):**
+
+| Size | Barrett | 4-Step |
+|---|---|---|
+| 2^15 | 1.52x | 1.59x |
+| 2^18 | 1.12x | **1.51x** |
+| 2^20 | 1.07x | **1.26x** |
+| 2^22 | 1.05x | **1.16x** |
+
+**Observation**: The 4-step benefits MORE from batching than Barrett at medium-large sizes
+(2^18-2^22). The 4-step's internal structure (2048 sub-NTTs per step) creates natural batch
+parallelism. When external batching adds B more NTTs, sub-NTT batches grow from 2048 to
+B×2048, improving GPU utilization for the cooperative outer stage.
+
+However, in **absolute terms**, Barrett batched remains faster at all sizes. The 4-step's
+inherent transpose overhead outweighs its batching advantage.
+
+### 6.4 Summary — v1.3.0 Performance
+
+| Metric | v1.2.0 Barrett | v1.3.0 4-Step | Delta |
+|---|---|---|---|
+| Single NTT 2^22 | 24.9 ms | 29.5 ms | **+18% slower** |
+| Batch 8× 2^22 | 199 ms | 241 ms | **+21% slower** |
+| Batch 8× 2^18 | 9.65 ms | 11.4 ms | **+18% slower** |
+| Best single NTT mode | Barrett | Barrett | unchanged |
+
+**v1.3.0 is a negative performance result.** The 4-step algorithm, while correct and fully
+tested (221 tests), does not improve performance on RTX 3060 with our implementation. The
+cooperative outer approach (v1.2.0 Barrett) remains the fastest path.
+
+**Lessons learned:**
+1. Transpose overhead is substantial for 256-bit elements (32 bytes per element, 3 full passes)
+2. Sub-NTT outer stages still access full DRAM when batched (L2 too small for aggregate data)
+3. The cooperative approach's advantage: zero structural overhead, direct butterfly access pattern
+4. 4-step may work better on GPUs with larger L2 (e.g., H100 with 50 MB L2) or with sub-NTTs
+   small enough to be fully fused (requires multi-level decomposition)
+
+**Future directions for v1.4.0**: Register-centric butterfly optimization and CUDA Graphs
+remain viable — they target the cooperative outer stages directly without adding transpose
+overhead. The 4-step infrastructure may be revisited with L2-aware sub-NTT batch scheduling
+in a future release.
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)
