@@ -99,6 +99,32 @@ __global__ void ff_sqr_v2_kernel(
     out[tid] = ff_mul_ptx(val, val);
 }
 
+// ─── Barrett Kernels ─────────────────────────────────────────────────────────
+// Standard-form in/out — no Montgomery conversion needed.
+
+#include "ff_barrett.cuh"
+
+__global__ void ff_mul_barrett_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = ff_mul_barrett(a[tid], b[tid]);
+}
+
+__global__ void ff_sqr_barrett_kernel(
+    const FpElement* __restrict__ a,
+    FpElement* __restrict__ out,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = ff_sqr_barrett(a[tid]);
+}
+
 // ─── SoA (Structure-of-Arrays) Kernel Variants ─────────────────────────────
 // Memory layout: limbs[limb_idx * n + element_idx]
 // This gives perfectly coalesced 4-byte accesses across a warp.

@@ -48,7 +48,7 @@ on GPU" — [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
 **Expected improvement:** 20-40% throughput for batch workloads; ~3 ms saving per
 single NTT from eliminating Montgomery conversion.
 
-### Session 1 — Barrett Reduction for BLS12-381
+### Session 1 — Barrett Reduction for BLS12-381 ✅ COMPLETE
 
 **Objective:** Implement Barrett modular arithmetic as alternative to Montgomery,
 eliminating the to/from Montgomery conversion overhead.
@@ -76,8 +76,30 @@ Barrett avoids two full-array conversion passes.
 - Implement `ff_add_barrett` / `ff_sub_barrett` (same as current — no Montgomery needed)
 - Device functions: `__device__ __forceinline__` in new `include/ff_barrett.cuh`
 - CPU reference Barrett implementation in `tests/ff_reference.h` for validation
-- Correctness tests: Barrett vs Montgomery output for 10^6 random inputs
+- Correctness tests (see test plan below)
 - Microbenchmark: Barrett vs Montgomery isolated throughput
+
+**Test plan — Barrett arithmetic (GPU + CPU reference):**
+- **Edge-case inputs (GPU and CPU reference must agree):**
+  - Identity: `a * 1 mod p = a`, `a * 0 mod p = 0` for random `a`
+  - Boundary: `(p-1) * (p-1) mod p`, `(p-1) * 2 mod p`, `(p-2) * (p-1) mod p`
+  - Zero: `0 * a`, `a * 0`, `0 * 0`
+  - Small: `1 * 1`, `2 * 3`, values that fit in a single limb
+  - Max limbs: all limbs `0xFFFFFFFF` reduced mod p (i.e., `(2^256 - 1) mod p`)
+  - Near-modulus: `p-1`, `p-2`, and values in `[p - 2^32, p-1]` (reduction boundary)
+  - Power-of-two: `2^k` for k = 0..255 (exercises different limb positions)
+- **Cross-validation (GPU Barrett vs GPU Montgomery):**
+  - Convert Barrett result to Montgomery domain, compare with Montgomery result
+  - 10^6 random input pairs (uniform over `[0, p)`)
+  - 10^4 random inputs for `ff_add` and `ff_sub` (should be bitwise identical)
+- **Algebraic properties (Barrett path only):**
+  - Commutativity: `a*b = b*a` for 10^4 random pairs
+  - Associativity: `(a*b)*c = a*(b*c)` for 10^3 random triples
+  - Distributivity: `a*(b+c) = a*b + a*c` for 10^3 random triples
+  - Squaring consistency: `a*a = ff_sqr_barrett(a)` (if ff_sqr_barrett implemented)
+- **CPU reference self-tests:**
+  - Barrett CPU vs Montgomery CPU for 10^4 random pairs (in `ff_reference.h`)
+  - Known test vectors: hand-computed small values
 
 **Key analysis point:** Barrett requires a wider intermediate product (512-bit) and
 an extra multiply by μ, vs Montgomery's cheaper CIOS reduction. The question is whether
@@ -93,7 +115,8 @@ eliminating the conversion overhead compensates. Profile both paths.
 **Deliverables:**
 - `include/ff_barrett.cuh` with Barrett arithmetic device functions
 - CPU reference Barrett in `tests/ff_reference.h`
-- Correctness tests + microbenchmark comparison
+- Correctness tests (edge cases + cross-validation + algebraic properties)
+- Microbenchmark comparison
 - Analysis: Barrett vs Montgomery instruction count (cuobjdump SASS comparison)
 
 ---
@@ -111,10 +134,27 @@ eliminating the conversion overhead compensates. Profile both paths.
 - Add `NTTMode::BARRETT` to public API (keep Montgomery path as baseline)
 - Integrate into fused K=10 kernel: swap ff_mul_mont → ff_mul_barrett
 - Integrate into cooperative outer kernel: same swap
-- Correctness: test Barrett NTT against CPU reference for all sizes
+- Correctness tests (see test plan below)
 - Benchmark: Barrett vs Montgomery NTT for sizes 2^15 through 2^22
 - Profile with ncu: compare instruction mix, DRAM throughput, IPC
 - Key metric: is the per-butterfly overhead of Barrett > or < conversion saving?
+
+**Test plan — Barrett NTT integration:**
+- **Forward NTT correctness (Barrett vs CPU reference):**
+  - All sizes 2^10 through 2^22 (CPU reference as oracle)
+  - Known input vectors: all-zeros, all-ones, single non-zero element, ascending sequence
+- **Roundtrip (INTT(NTT(x)) = x) for Barrett path:**
+  - All sizes 2^10 through 2^22 with random input
+  - Edge inputs: all-zeros, single-element, all `p-1`
+- **Cross-validation (Barrett NTT vs Montgomery NTT on GPU):**
+  - Both paths must produce identical output for same input at all sizes 2^15..2^22
+  - This catches GPU-specific bugs that CPU reference wouldn't reveal
+- **Inverse NTT correctness (Barrett path):**
+  - Verify `ntt_inverse_barrett(ntt_forward_barrett(x)) = x` explicitly
+  - Verify `ntt_forward_barrett(ntt_inverse_barrett(x)) = x` (inverse direction)
+- **Kernel-level checks:**
+  - Fused K=10 Barrett kernel: test in isolation for n=2^10 (single fused pass)
+  - Cooperative outer Barrett kernel: test for n=2^15 (outer stages exercised)
 
 **Deliverables:**
 - Barrett-path NTT (fused + outer kernels)
@@ -156,7 +196,7 @@ Batching improves GPU utilization in two ways:
 - **Bit-reverse batching**: Trivially parallelizable across B arrays.
 - **Twiddle factor sharing**: All B NTTs of the same size share the same twiddle table.
   Single precomputation, B× reuse — better cache utilization.
-- Correctness: batch of 8 NTTs vs 8 sequential single NTTs
+- Correctness tests (see test plan below)
 - Benchmark: batch throughput vs sequential for batch_size = 1, 2, 4, 8, 16, 32
 
 **Expected results:**
@@ -164,9 +204,34 @@ Batching improves GPU utilization in two ways:
 - At n=2^22 (large): moderate improvement (single NTT already fills SMs, but
   twiddle cache reuse and launch amortization still help)
 
+**Test plan — Batched NTT:**
+- **Batch vs sequential equivalence:**
+  - Batch of B NTTs must produce identical output to B sequential single NTTs
+  - Test for B = 1, 2, 4, 8, 16 at sizes 2^15, 2^18, 2^20, 2^22
+  - Each NTT in the batch uses different random input data
+- **Batch + Barrett cross-product:**
+  - Batched Montgomery vs sequential Montgomery (same output)
+  - Batched Barrett vs sequential Barrett (same output)
+  - Batched Barrett vs batched Montgomery (same output)
+- **Roundtrip for batched path:**
+  - `batch_inverse(batch_forward(x)) = x` for all B arrays
+  - Test for B = 1, 4, 8 at sizes 2^15, 2^20, 2^22
+- **Edge cases:**
+  - B = 1 (degenerate batch, must match single-NTT output exactly)
+  - B = max that fits in 6 GB VRAM (stress test, verify no OOM or corruption)
+  - Different input patterns per batch element (zeros, ones, random, p-1)
+  - All-identical inputs across batch elements (detect cross-batch interference)
+- **Independence / isolation:**
+  - Corrupt one input array in batch, verify other outputs are unaffected
+  - Verify no cross-NTT data leakage: batch element [i] output depends only on
+    input [i], not on neighboring arrays
+- **Twiddle sharing validation:**
+  - Verify that batch mode and single mode use the same twiddle factors
+    (no off-by-one in twiddle indexing due to batch offset arithmetic)
+
 **Deliverables:**
 - Batched NTT API and kernel implementations
-- Correctness tests for batch mode
+- Correctness tests for batch mode (equivalence + edge cases + isolation)
 - Throughput benchmark: NTTs/second for varying batch sizes
 
 ---
@@ -180,15 +245,31 @@ Batching improves GPU utilization in two ways:
 - Profile batched kernel with ncu: occupancy, SM utilization, memory throughput
 - Profile Barrett vs Montgomery: instruction mix comparison (SASS)
 - Capture screenshots: batched NTT occupancy, Barrett vs Montgomery roofline
+- **Full regression sweep** (see test plan below)
 - Update analysis.md with new sections on Barrett arithmetic and batching
 - Update README performance tables (add batch throughput table)
 - Update CLAUDE.md, GUIDE.md (add Barrett reduction section)
 - Update plot_benchmarks.py with new data
 - Tag v1.2.0 release
 
+**Test plan — v1.2.0 release regression sweep:**
+- **All existing v1.1.0 tests pass** (55/55 — no regressions in Montgomery path)
+- **Full test matrix** (every combination must pass):
+  | Mode | Single | Batch-1 | Batch-8 |
+  |---|---|---|---|
+  | Montgomery forward | sizes 2^10..2^22 | sizes 2^15..2^22 | sizes 2^15..2^22 |
+  | Montgomery roundtrip | sizes 2^10..2^22 | sizes 2^15..2^22 | sizes 2^15..2^22 |
+  | Barrett forward | sizes 2^10..2^22 | sizes 2^15..2^22 | sizes 2^15..2^22 |
+  | Barrett roundtrip | sizes 2^10..2^22 | sizes 2^15..2^22 | sizes 2^15..2^22 |
+- **Cross-path agreement**: Barrett single output = Montgomery single output for all sizes
+- **Async pipeline**: verify pipeline still works with both Barrett and Montgomery modes
+- **Test count target**: ≥100 total tests (55 existing + Barrett arithmetic + Barrett NTT
+  + batched NTT + cross-validation + edge cases)
+
 **Deliverables:**
 - Updated benchmark tables + charts
 - New ncu screenshots
+- Full regression pass (all tests green)
 - Git tag v1.2.0
 
 ---

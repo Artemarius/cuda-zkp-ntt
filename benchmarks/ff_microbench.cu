@@ -46,6 +46,10 @@ extern __global__ void ff_add_v2_kernel(const FpElement* __restrict__ a, const F
 extern __global__ void ff_sub_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sqr_v2_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
 
+// Barrett kernel declarations
+extern __global__ void ff_mul_barrett_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_sqr_barrett_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
+
 // ─── Helper: fill host arrays with deterministic nonzero data ───────────────
 
 static void fill_test_data(std::vector<FpElement>& h_a,
@@ -494,6 +498,61 @@ BENCHMARK(BM_FfSqr_SoA)
     ->Arg(1 << 18)
     ->Arg(1 << 20)
     ->Arg(1 << 22);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Barrett benchmarks — standard-form modular multiplication (no Montgomery)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void BM_FfMul_Barrett(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<FpElement> h_a, h_b;
+    fill_test_data(h_a, h_b, N);
+
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    const int blockSize = 256;
+    const int gridSize = (N + blockSize - 1) / blockSize;
+    for (auto _ : state) {
+        ff_mul_barrett_kernel<<<gridSize, blockSize>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_FfMul_Barrett)
+    ->Unit(benchmark::kMicrosecond)
+    ->Arg(1 << 16)->Arg(1 << 18)->Arg(1 << 20)->Arg(1 << 22);
+
+static void BM_FfSqr_Barrett(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<FpElement> h_a, h_b;
+    fill_test_data(h_a, h_b, N);
+
+    FpElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    const int blockSize = 256;
+    const int gridSize = (N + blockSize - 1) / blockSize;
+    for (auto _ : state) {
+        ff_sqr_barrett_kernel<<<gridSize, blockSize>>>(d_a, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_FfSqr_Barrett)
+    ->Unit(benchmark::kMicrosecond)
+    ->Arg(1 << 16)->Arg(1 << 18)->Arg(1 << 20)->Arg(1 << 22);
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 

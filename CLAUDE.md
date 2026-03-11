@@ -61,9 +61,10 @@ CMake targets:
 
 ### Finite Field
 - Field modulus: BLS12-381 scalar field `r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001`
-- Representation: 8 × uint32_t limbs in Montgomery form
+- Representation: 8 × uint32_t limbs in Montgomery form (or standard form for Barrett)
 - Montgomery constant: R = 2^256 mod r
-- All finite-field types live in `include/ff_arithmetic.cuh`
+- Montgomery arithmetic: `include/ff_arithmetic.cuh` (CIOS, PTX intrinsics)
+- Barrett arithmetic: `include/ff_barrett.cuh` (standard-form, no domain conversion)
 - CPU reference implementation in `tests/ff_reference.h` (plain C++, no CUDA)
 
 ### NTT
@@ -81,6 +82,7 @@ CMake targets:
 include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
+  ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
   ntt.cuh             — NTT public interface (all variants)
   pipeline.cuh        — AsyncNTTPipeline class interface
 
@@ -160,11 +162,16 @@ LICENSE                — MIT License
 - Cooperative outer (stages 10-21): ~19.4 ms (77%) — **memory-bound** (DRAM R-M-W)
 - Outer stages are the dominant bottleneck; see NTT_OPTIMIZATION_ROADMAP.md
 
-### Barrett Reduction (planned, v1.2.0 — MoMA-inspired)
+### Barrett Reduction (implemented, v1.2.0 Session 1 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
 - Eliminates ~3 ms (12%) to/from Montgomery overhead per NTT at n=2^22
-- Barrett: c = a·b mod p via precomputed μ = ⌊2^(2k)/p⌋ and shift-based reduction
-- Trade-off: ~30% more instructions per ff_mul, but zero conversion overhead
+- Barrett: c = a·b mod p via precomputed μ = ⌊2^512/p⌋ (HAC 14.42, 8×32-bit limbs)
+- μ = 0x2355094edfede377c38b5dcb707e08ed365043eb4be4bad7142737a020c0d6393 (9 × uint32_t)
+- Instruction cost: ~188 MADs vs Montgomery CIOS ~128 MADs (~47% more multiply ops)
+- SASS: Barrett 888 instructions vs Montgomery v2 528 (1.68×), baseline 592 (1.50×)
+- Microbench: identical throughput to Montgomery (both hit 91% DRAM ceiling — memory-bound)
+- Projected NTT impact: -3.0 ms (conversion savings) + ~1.2 ms (fused kernel overhead) ≈ net -1.8 ms
+- Implementation: `include/ff_barrett.cuh` (GPU), `tests/ff_reference.h` (CPU reference)
 - Reference: MoMA (Zhang & Franchetti, CGO 2025) uses Barrett exclusively
 
 ### Batched NTT (planned, v1.2.0)
@@ -188,6 +195,8 @@ See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
 Phases 1-8 complete. Current version: **v1.1.0** (v1.0.0 tagged and [released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0)).
+
+**v1.2.0 progress:** Session 1 (Barrett arithmetic) complete. Sessions 2-4 remaining.
 
 ### Future Releases
 - **v1.2.0** — MoMA-inspired Barrett arithmetic + batched NTT (target: ~22 ms single, better batch throughput)

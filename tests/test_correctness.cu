@@ -18,6 +18,8 @@
 extern __global__ void ff_mul_throughput_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_add_throughput_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sub_throughput_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_mul_barrett_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+extern __global__ void ff_sqr_barrett_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sqr_throughput_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
 
 // SoA kernel declarations
@@ -806,6 +808,436 @@ void test_async_pipeline_vs_sequential(int log_n) {
         log_n, pass_count, total_n);
 }
 
+// ─── v1.2.0: Barrett Arithmetic Correctness Tests ────────────────────────────
+
+// Generate a standard-form field element from a seed (NOT Montgomery form)
+static FpElement make_standard_fp(uint32_t seed) {
+    FpElement fp = FpElement::zero();
+    fp.limbs[0] = seed;
+    return fp;
+}
+
+// Generate a large standard-form element (all limbs populated, but < p)
+static FpElement make_large_standard_fp(uint32_t seed) {
+    FpElement fp;
+    // Fill limbs with pseudo-random data derived from seed
+    uint32_t state = seed;
+    for (int i = 0; i < 8; ++i) {
+        state = state * 1664525u + 1013904223u;  // LCG
+        fp.limbs[i] = state;
+    }
+    // Ensure < p: clear top 2 bits of MSB (p starts with 0x73 = 0111_0011)
+    fp.limbs[7] &= 0x3FFFFFFFu;
+    return fp;
+}
+
+// CPU reference: Barrett mul on standard-form elements
+static FpElement cpu_barrett_mul(const FpElement& a, const FpElement& b) {
+    ff_ref::FpRef ra = ff_ref::FpRef::from_u32(a.limbs);
+    ff_ref::FpRef rb = ff_ref::FpRef::from_u32(b.limbs);
+    ff_ref::FpRef rc = ff_ref::fp_mul_barrett(ra, rb);
+    FpElement result;
+    rc.to_u32(result.limbs);
+    return result;
+}
+
+void test_cpu_barrett_self_test() {
+    using namespace ff_ref;
+    printf("test_cpu_barrett_self_test...\n");
+
+    // Test 1: Barrett(a, 1) = a for small a
+    {
+        FpRef a = FpRef::from_u64(42);
+        FpRef one = FpRef::from_u64(1);
+        FpRef result = fp_mul_barrett(a, one);
+        TEST_ASSERT(result == a, "Barrett: a * 1 = a");
+    }
+
+    // Test 2: Barrett(a, 0) = 0
+    {
+        FpRef a = FpRef::from_u64(12345);
+        FpRef zero = FpRef::zero();
+        FpRef result = fp_mul_barrett(a, zero);
+        TEST_ASSERT(result == zero, "Barrett: a * 0 = 0");
+    }
+
+    // Test 3: Barrett matches Montgomery for small values
+    {
+        FpRef a_std = FpRef::from_u64(12345);
+        FpRef b_std = FpRef::from_u64(67890);
+        FpRef barrett_result = fp_mul_barrett(a_std, b_std);
+
+        // Montgomery: convert to mont, multiply, convert back
+        FpRef a_mont = to_montgomery(a_std);
+        FpRef b_mont = to_montgomery(b_std);
+        FpRef mont_result = from_montgomery(fp_mul(a_mont, b_mont));
+
+        TEST_ASSERT(barrett_result == mont_result,
+            "Barrett matches Montgomery: 12345 * 67890");
+    }
+
+    // Test 4: Barrett matches Montgomery for 1000 random pairs
+    {
+        int pass = 0;
+        for (int i = 0; i < 1000; ++i) {
+            FpRef a_std = FpRef::from_u64(static_cast<uint64_t>(i * 7919 + 104729));
+            FpRef b_std = FpRef::from_u64(static_cast<uint64_t>(i * 6271 + 299993));
+            FpRef barrett = fp_mul_barrett(a_std, b_std);
+            FpRef mont = from_montgomery(fp_mul(to_montgomery(a_std), to_montgomery(b_std)));
+            if (barrett == mont) ++pass;
+        }
+        TEST_ASSERT(pass == 1000, "Barrett vs Montgomery: 1000 random pairs");
+    }
+
+    // Test 5: Commutativity a*b = b*a
+    {
+        FpRef a = FpRef::from_u64(999999937);
+        FpRef b = FpRef::from_u64(1000000007);
+        TEST_ASSERT(fp_mul_barrett(a, b) == fp_mul_barrett(b, a),
+            "Barrett commutativity");
+    }
+
+    // Test 6: (p-1) * (p-1) mod p
+    {
+        FpRef pm1;
+        pm1.limbs = MOD;
+        // p - 1
+        uint128_t borrow = 0;
+        borrow = uint128_t(pm1.limbs[0]) - 1 - borrow;
+        pm1.limbs[0] = static_cast<uint64_t>(borrow);
+        borrow = (borrow >> 64) & 1;
+        for (int i = 1; i < 4; ++i) {
+            borrow = uint128_t(pm1.limbs[i]) - borrow;
+            pm1.limbs[i] = static_cast<uint64_t>(borrow);
+            borrow = (borrow >> 64) & 1;
+        }
+        // (p-1)^2 mod p = 1  (since (p-1) = -1 mod p, (-1)^2 = 1)
+        FpRef result = fp_mul_barrett(pm1, pm1);
+        TEST_ASSERT(result == FpRef::from_u64(1), "Barrett: (p-1)*(p-1) = 1");
+    }
+
+    // Test 7: Associativity (a*b)*c = a*(b*c)
+    {
+        FpRef a = FpRef::from_u64(111111);
+        FpRef b = FpRef::from_u64(222222);
+        FpRef c = FpRef::from_u64(333333);
+        FpRef lhs = fp_mul_barrett(fp_mul_barrett(a, b), c);
+        FpRef rhs = fp_mul_barrett(a, fp_mul_barrett(b, c));
+        TEST_ASSERT(lhs == rhs, "Barrett associativity");
+    }
+
+    // Test 8: Distributivity a*(b+c) = a*b + a*c
+    {
+        FpRef a = FpRef::from_u64(12345);
+        FpRef b = FpRef::from_u64(67890);
+        FpRef c = FpRef::from_u64(11111);
+        FpRef lhs = fp_mul_barrett(a, fp_add(b, c));
+        FpRef rhs = fp_add(fp_mul_barrett(a, b), fp_mul_barrett(a, c));
+        TEST_ASSERT(lhs == rhs, "Barrett distributivity");
+    }
+}
+
+void test_ff_mul_barrett_gpu() {
+    printf("test_ff_mul_barrett_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_b(N), h_out(N);
+
+    // Standard-form inputs (not Montgomery)
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_large_standard_fp(i * 2 + 1);
+        h_b[i] = make_large_standard_fp(i * 2 + 1000);
+    }
+
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FpElement expected = cpu_barrett_mul(h_a[i], h_b[i]);
+        if (h_out[i] == expected) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == (int)N, "ff_mul_barrett GPU vs CPU reference mismatch");
+    printf("  ff_mul_barrett: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_sqr_barrett_gpu() {
+    printf("test_ff_sqr_barrett_gpu...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_large_standard_fp(i * 2 + 1);
+    }
+
+    FpElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ff_sqr_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FpElement expected = cpu_barrett_mul(h_a[i], h_a[i]);
+        if (h_out[i] == expected) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == (int)N, "ff_sqr_barrett GPU vs CPU reference mismatch");
+    printf("  ff_sqr_barrett: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_mul_barrett_vs_montgomery() {
+    printf("test_ff_mul_barrett_vs_montgomery...\n");
+
+    // Barrett(a, b) in standard form should equal
+    // from_montgomery(Montgomery(to_mont(a), to_mont(b)))
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a_std(N), h_b_std(N), h_barrett_out(N);
+    std::vector<FpElement> h_a_mont(N), h_b_mont(N), h_mont_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a_std[i] = make_large_standard_fp(i * 3 + 7);
+        h_b_std[i] = make_large_standard_fp(i * 3 + 2000);
+        // Convert to Montgomery form on CPU for Montgomery path
+        ff_ref::FpRef ra = ff_ref::to_montgomery(ff_ref::FpRef::from_u32(h_a_std[i].limbs));
+        ff_ref::FpRef rb = ff_ref::to_montgomery(ff_ref::FpRef::from_u32(h_b_std[i].limbs));
+        ra.to_u32(h_a_mont[i].limbs);
+        rb.to_u32(h_b_mont[i].limbs);
+    }
+
+    // Barrett GPU path
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_std.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_std.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_barrett_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Montgomery GPU path
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_mont.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_mont.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ff_mul_throughput_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_mont_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Convert Montgomery result back to standard form and compare
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        ff_ref::FpRef mont_result = ff_ref::from_montgomery(
+            ff_ref::FpRef::from_u32(h_mont_out[i].limbs));
+        FpElement mont_std;
+        mont_result.to_u32(mont_std.limbs);
+        if (h_barrett_out[i] == mont_std) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == (int)N,
+        "Barrett vs Montgomery GPU cross-validation mismatch");
+    printf("  Barrett vs Montgomery: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_mul_barrett_edge_cases() {
+    printf("test_ff_mul_barrett_edge_cases...\n");
+
+    // Prepare edge-case pairs on CPU, run on GPU, compare
+    struct TestCase {
+        FpElement a, b;
+        const char* name;
+    };
+
+    std::vector<TestCase> cases;
+
+    // Zero * anything = 0
+    cases.push_back({FpElement::zero(), make_large_standard_fp(42), "0 * a"});
+    cases.push_back({make_large_standard_fp(42), FpElement::zero(), "a * 0"});
+    cases.push_back({FpElement::zero(), FpElement::zero(), "0 * 0"});
+
+    // Identity: a * 1 = a
+    {
+        FpElement one = FpElement::zero();
+        one.limbs[0] = 1;
+        cases.push_back({make_large_standard_fp(42), one, "a * 1"});
+        cases.push_back({one, make_large_standard_fp(42), "1 * a"});
+        cases.push_back({one, one, "1 * 1"});
+    }
+
+    // Small values
+    {
+        FpElement two = FpElement::zero(); two.limbs[0] = 2;
+        FpElement three = FpElement::zero(); three.limbs[0] = 3;
+        cases.push_back({two, three, "2 * 3"});
+    }
+
+    // Near-modulus: p-1
+    {
+        FpElement pm1;
+        for (int i = 0; i < 8; ++i) pm1.limbs[i] = 0; // will be set below
+        ff_ref::FpRef pm1_ref;
+        pm1_ref.limbs = ff_ref::MOD;
+        pm1_ref = ff_ref::fp_sub(pm1_ref, ff_ref::FpRef::from_u64(1));
+        pm1_ref.to_u32(pm1.limbs);
+
+        FpElement pm2;
+        ff_ref::FpRef pm2_ref;
+        pm2_ref.limbs = ff_ref::MOD;
+        pm2_ref = ff_ref::fp_sub(pm2_ref, ff_ref::FpRef::from_u64(2));
+        pm2_ref.to_u32(pm2.limbs);
+
+        cases.push_back({pm1, pm1, "(p-1)*(p-1)"});
+        cases.push_back({pm1, pm2, "(p-1)*(p-2)"});
+
+        FpElement two = FpElement::zero(); two.limbs[0] = 2;
+        cases.push_back({pm1, two, "(p-1)*2"});
+    }
+
+    const uint32_t N = static_cast<uint32_t>(cases.size());
+    std::vector<FpElement> h_a(N), h_b(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = cases[i].a;
+        h_b[i] = cases[i].b;
+    }
+
+    FpElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FpElement expected = cpu_barrett_mul(h_a[i], h_b[i]);
+        if (h_out[i] == expected) {
+            ++pass_count;
+        } else {
+            printf("  FAIL: %s — GPU[0]: %08x, CPU[0]: %08x\n",
+                cases[i].name, h_out[i].limbs[0], expected.limbs[0]);
+        }
+    }
+
+    TEST_ASSERT(pass_count == (int)N, "Barrett edge cases mismatch");
+    printf("  Barrett edge cases: %d/%u passed\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_ff_mul_barrett_algebraic() {
+    printf("test_ff_mul_barrett_algebraic...\n");
+
+    // Test commutativity, associativity, distributivity on GPU
+    // using large elements that exercise all limbs
+    const uint32_t N = 256;
+    std::vector<FpElement> h_a(N), h_b(N), h_c(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_large_standard_fp(i * 5 + 1);
+        h_b[i] = make_large_standard_fp(i * 5 + 2);
+        h_c[i] = make_large_standard_fp(i * 5 + 3);
+    }
+
+    // Commutativity: a*b = b*a
+    {
+        std::vector<FpElement> h_ab(N), h_ba(N);
+        FpElement *d_a, *d_b, *d_out;
+        CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&d_b,   N * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+        CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+        ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_ab.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_b, d_a, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_ba.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (uint32_t i = 0; i < N; ++i)
+            if (h_ab[i] == h_ba[i]) ++pass;
+        TEST_ASSERT(pass == (int)N, "Barrett GPU commutativity");
+        printf("  Commutativity: %d/%u\n", pass, N);
+
+        CUDA_CHECK(cudaFree(d_a));
+        CUDA_CHECK(cudaFree(d_b));
+        CUDA_CHECK(cudaFree(d_out));
+    }
+
+    // Associativity: (a*b)*c = a*(b*c) — on CPU (GPU would need two kernel launches)
+    {
+        int pass = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            FpElement ab = cpu_barrett_mul(h_a[i], h_b[i]);
+            FpElement ab_c = cpu_barrett_mul(ab, h_c[i]);
+            FpElement bc = cpu_barrett_mul(h_b[i], h_c[i]);
+            FpElement a_bc = cpu_barrett_mul(h_a[i], bc);
+            if (ab_c == a_bc) ++pass;
+        }
+        TEST_ASSERT(pass == (int)N, "Barrett associativity (CPU)");
+        printf("  Associativity: %d/%u\n", pass, N);
+    }
+
+    // Distributivity: a*(b+c) = a*b + a*c — on CPU
+    {
+        int pass = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            // b + c in standard form via CPU reference
+            ff_ref::FpRef rb = ff_ref::FpRef::from_u32(h_b[i].limbs);
+            ff_ref::FpRef rc = ff_ref::FpRef::from_u32(h_c[i].limbs);
+            ff_ref::FpRef bc_sum = ff_ref::fp_add(rb, rc);
+            FpElement bpc;
+            bc_sum.to_u32(bpc.limbs);
+
+            FpElement lhs = cpu_barrett_mul(h_a[i], bpc);
+            FpElement ab = cpu_barrett_mul(h_a[i], h_b[i]);
+            FpElement ac = cpu_barrett_mul(h_a[i], h_c[i]);
+
+            ff_ref::FpRef rab = ff_ref::FpRef::from_u32(ab.limbs);
+            ff_ref::FpRef rac = ff_ref::FpRef::from_u32(ac.limbs);
+            ff_ref::FpRef rhs_ref = ff_ref::fp_add(rab, rac);
+            FpElement rhs;
+            rhs_ref.to_u32(rhs.limbs);
+
+            if (lhs == rhs) ++pass;
+        }
+        TEST_ASSERT(pass == (int)N, "Barrett distributivity (CPU)");
+        printf("  Distributivity: %d/%u\n", pass, N);
+    }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -909,6 +1341,14 @@ int main() {
         CUDA_CHECK(cudaFreeHost(h_in));
         CUDA_CHECK(cudaFreeHost(h_out));
     }
+
+    // v1.2.0: Barrett arithmetic correctness tests
+    test_cpu_barrett_self_test();
+    test_ff_mul_barrett_gpu();
+    test_ff_sqr_barrett_gpu();
+    test_ff_mul_barrett_vs_montgomery();
+    test_ff_mul_barrett_edge_cases();
+    test_ff_mul_barrett_algebraic();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

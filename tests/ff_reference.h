@@ -441,4 +441,136 @@ inline std::vector<FpRef> dft_naive(const std::vector<FpRef>& data, size_t n) {
     return out;
 }
 
+// ─── Barrett Modular Arithmetic ──────────────────────────────────────────────
+// Standard-form in/out — no Montgomery domain conversion.
+// Uses Barrett reduction: c = a*b mod p via precomputed mu = floor(2^512 / p).
+
+// Barrett constant: mu = floor(2^512 / p), 5 x uint64_t little-endian
+// mu = 0x2355094edfede377c38b5dcb707e08ed365043eb4be4bad7142737a020c0d6393
+static constexpr std::array<uint64_t, 5> BARRETT_MU = {{
+    0x42737a020c0d6393ULL,
+    0x65043eb4be4bad71ULL,
+    0x38b5dcb707e08ed3ULL,
+    0x355094edfede377cULL,
+    0x0000000000000002ULL
+}};
+
+// 512-bit intermediate type (8 x uint64_t, little-endian)
+struct Wide512 {
+    uint64_t limbs[8];
+};
+
+// Full 256x256 -> 512-bit product (schoolbook)
+inline Wide512 fp_wide_mul(const FpRef& a, const FpRef& b) {
+    Wide512 z;
+    for (int i = 0; i < 8; ++i) z.limbs[i] = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        uint128_t carry = 0;
+        for (int j = 0; j < 4; ++j) {
+            carry += uint128_t(a.limbs[j]) * b.limbs[i] + z.limbs[i + j];
+            z.limbs[i + j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        z.limbs[i + 4] = static_cast<uint64_t>(carry);
+    }
+    return z;
+}
+
+// Barrett reduction of a 512-bit value mod p
+// Algorithm (HAC 14.42, 64-bit base, k=4):
+//   q1 = z >> 192 (shift right by 3 words)
+//   q2 = q1 * mu  (5 x 5 -> 10 words)
+//   q3 = q2 >> 320 (shift right by 5 words)
+//   r1 = z mod 2^320 (low 5 words)
+//   r2 = (q3 * p) mod 2^320
+//   r = r1 - r2
+//   while r >= p: r -= p (at most 2 times)
+inline FpRef fp_barrett_reduce(const Wide512& z) {
+    // q1 = z >> 192 = z.limbs[3..7] (5 words)
+    uint64_t q1[5];
+    for (int i = 0; i < 5; ++i) q1[i] = z.limbs[3 + i];
+
+    // q2 = q1 * mu (5 x 5 -> 10 words)
+    uint64_t q2[10];
+    for (int i = 0; i < 10; ++i) q2[i] = 0;
+
+    for (int i = 0; i < 5; ++i) {
+        uint128_t carry = 0;
+        for (int j = 0; j < 5; ++j) {
+            carry += uint128_t(q1[j]) * BARRETT_MU[i] + q2[i + j];
+            q2[i + j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        q2[i + 5] = static_cast<uint64_t>(carry);
+    }
+
+    // q3 = q2[5..8] (4 words)
+
+    // r2 = (q3 * p) mod 2^320 (low 5 words)
+    uint64_t r2[5];
+    for (int i = 0; i < 5; ++i) r2[i] = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        uint128_t carry = 0;
+        int j_limit = (5 - i) < 4 ? (5 - i) : 4;
+        for (int j = 0; j < j_limit; ++j) {
+            carry += uint128_t(q2[5 + i]) * MOD[j] + r2[i + j];
+            r2[i + j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        if (i + j_limit < 5) {
+            r2[i + j_limit] += static_cast<uint64_t>(carry);
+        }
+    }
+
+    // r = z[0..4] - r2[0..4] (mod 2^320)
+    uint64_t r[5];
+    {
+        uint128_t borrow = 0;
+        for (int i = 0; i < 5; ++i) {
+            borrow = uint128_t(z.limbs[i]) - r2[i] - borrow;
+            r[i] = static_cast<uint64_t>(borrow);
+            borrow = (borrow >> 64) & 1;
+        }
+    }
+
+    // Conditional subtraction (at most 2 times)
+    for (int iter = 0; iter < 2; ++iter) {
+        bool need_sub = (r[4] != 0);
+        if (!need_sub) {
+            need_sub = true;
+            for (int i = 3; i >= 0; --i) {
+                if (r[i] > MOD[i]) break;
+                if (r[i] < MOD[i]) { need_sub = false; break; }
+            }
+        }
+
+        if (need_sub) {
+            uint128_t borrow = 0;
+            for (int i = 0; i < 5; ++i) {
+                uint64_t mod_i = (i < 4) ? MOD[i] : 0;
+                borrow = uint128_t(r[i]) - mod_i - borrow;
+                r[i] = static_cast<uint64_t>(borrow);
+                borrow = (borrow >> 64) & 1;
+            }
+        }
+    }
+
+    FpRef result;
+    for (int i = 0; i < 4; ++i) result.limbs[i] = r[i];
+    return result;
+}
+
+// Barrett modular multiplication: (a * b) mod p, standard form in/out
+inline FpRef fp_mul_barrett(const FpRef& a, const FpRef& b) {
+    Wide512 z = fp_wide_mul(a, b);
+    return fp_barrett_reduce(z);
+}
+
+// Barrett squaring
+inline FpRef fp_sqr_barrett(const FpRef& a) {
+    return fp_mul_barrett(a, a);
+}
+
 } // namespace ff_ref
