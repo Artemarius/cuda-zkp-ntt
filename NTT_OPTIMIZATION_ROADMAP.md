@@ -1,23 +1,25 @@
 # NTT Optimization Roadmap — Future Releases
 
-## Current State (v1.1.0)
+## Current State (v1.4.0)
 
-**Benchmark (RTX 3060 Laptop, n=2^22):** 25.2 ms (single NTT, compute only)
-**Target:** ≤20 ms (not met — outer stages are memory-bandwidth-limited)
+**Benchmark (RTX 3060 Laptop, n=2^22):** 17.1 ms Montgomery / 17.4 ms Barrett (single NTT, compute only)
+**Previous target:** ≤20 ms — **exceeded** (17.1 ms = −32% vs v1.1.0's 25.2 ms)
 
-### Where Time Goes (n=2^22, 4 kernel launches)
+### Where Time Goes (n=2^22, v1.4.0 — 3 kernel launches)
 
 | Phase | Duration | % of Total | Bottleneck |
 |---|---|---|---|
-| Bit-reverse permutation | ~0.3 ms | 1% | Memory (scatter) |
-| Fused K=10 (stages 0-9) | ~2.5 ms | 10% | **Compute** (69%, IPC 2.41) |
-| Cooperative outer (stages 10-21) | ~19.4 ms | 77% | **Memory** (DRAM R-M-W) |
-| Montgomery conversion (to/from) | ~3.0 ms | 12% | Memory |
+| Bit-reverse permutation | ~0.3 ms | 2% | Memory (scatter) |
+| Fused K=10 (stages 0-9) | ~6 ms | 35% | **Compute** (69%, IPC 2.41) |
+| 6 radix-4 outer passes (stages 10-21) | ~11 ms | 65% | **Memory** (DRAM, ~300 GB/s) |
 
-**Root cause**: Each outer-stage butterfly reads 2 FpElements (64 B) + 1 twiddle (32 B)
-from DRAM, performs 1 ff_mul + 1 ff_add + 1 ff_sub, then writes 2 FpElements back.
-With stride doubling each stage, data quickly exceeds L2 capacity (4 MB on RTX 3060),
-forcing every access to hit DRAM.
+**Roofline gap**: Outer stages at ~11 ms vs theoretical floor of ~0.89 ms (320 MB / 360 GB/s
+peak). **Gap to roofline: ~12×.** Suggests memory-latency-bound (L1/L2 miss penalty), not
+bandwidth-bound. L2 diagnostic planned for Session 12 to confirm.
+
+**Key lesson from v1.1–v1.4**: Every win came from reducing DRAM traffic in outer stages.
+Arithmetic optimizations (Barrett, branchless) gave marginal results. The path forward is
+higher-radix fusion (radix-8) and eliminating twiddle DRAM traffic (OTF computation).
 
 ### Key Gaps vs State-of-the-Art
 
@@ -707,22 +709,767 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 
 ---
 
-## Stretch Goals (v1.5.0+)
+## v1.5.0 — Radix-8 Outer Stages + On-the-Fly Twiddles
+
+**Goal:** Continue the radix-4 strategy to its logical conclusion — fuse triples of outer
+stages into radix-8 butterflies, and eliminate twiddle DRAM traffic via on-the-fly computation.
+Preceded by L2 cache diagnostic to inform this and future releases.
+
+**Expected improvement:** 15–25% additional over v1.4.0. Target: ~13 ms at n=2²².
+
+**Rationale:** v1.4.0's radix-4 gave −30% by halving outer-stage DRAM passes (12→6).
+Radix-8 fuses 3 stages per pass: 12→4 passes (another −33% from radix-4 baseline).
+Each eliminated pass saves ~128 MB DRAM R+W = ~0.7 ms at bandwidth ceiling.
+OTF twiddle computation eliminates an additional 384 MB twiddle-read traffic across
+6 outer passes, worth ~1 ms. The doc recommends deploying OTF as part of a combined
+radix-8 + OTF outer-stage rewrite (standalone OTF is too small to measure above noise).
+
+**Key references:**
+- Özcan, Javeed, Savaş — "High-Performance NTT on GPU", IEEE Access 2025
+- Kim et al. — "Accelerating NTT for Bootstrappable HE on GPUs", 2020 (OTF twiddles)
+
+---
+
+### Session 12 — L2 Diagnostic + Radix-8 Butterfly Design
+
+**Objective:** Profile the outer stages to determine whether they are latency-bound or
+bandwidth-bound (informing Stockham feasibility in v1.8.0), and design + implement the
+radix-8 butterfly device function with register pressure analysis.
+
+**Part A — L2 Hit-Rate Diagnostic:**
+
+This is the 2-line ncu diagnostic from the retrospective doc. Results inform:
+- Whether Stockham (v1.8.0) is worth implementing
+- Optimal register vs. memory tradeoffs for radix-8
+- Whether twiddle traffic is a significant fraction of total DRAM
+
+**Tasks:**
+- Profile radix-4 outer kernel with ncu L1/L2 metrics:
+  ```bash
+  ncu --metrics l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,\
+  dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sectors_srcunit_tex_op_read.sum,\
+  lts__t_sector_op_read_hit_rate.pct \
+      --kernel-name-base function --kernel-id ::ntt_outer_radix4: \
+      ./build/Release/ntt_profile.exe
+  ```
+- Profile at n=2^18, 2^20, 2^22 to see how hit rate changes with array size vs L2 capacity
+- Profile twiddle-specific traffic: is twiddle load a measurable fraction of total DRAM?
+- Document results in `results/analysis.md` (new section: "L2 Cache Behavior at v1.4.0")
+- **Decision point**: If L2 hit rate < 20% at 2^22 → latency-bound (Stockham likely helps).
+  If > 50% → bandwidth-bound (Stockham won't help much). Record for v1.8.0 go/no-go.
+
+**Part B — Radix-8 Butterfly Design:**
+
+**Tasks:**
+- Design `radix8_butterfly_outer()` device function:
+  - Process 8 data elements at indices base+{0, h, 2h, 3h, 4h, 5h, 6h, 7h} where h=2^s
+  - Fuse 3 consecutive outer stages (s, s+1, s+2) into 1 memory pass
+  - 8 loads + 8 stores (vs 24+24 for three radix-2 passes) = **67% DRAM reduction per triple**
+  - Arithmetic: 7 twiddle multiplies + 8 ff_add/ff_sub per radix-8 unit
+  - Twiddle indexing: 7 distinct twiddle values per butterfly:
+    - Stage s: w_s(j) — 4 butterflies of (a0,a4), (a1,a5), (a2,a6), (a3,a7)
+    - Stage s+1: w_{s+1}(j), w_{s+1}(j+h) — 4 butterflies of (a0',a2'), etc.
+    - Stage s+2: w_{s+2}(j), w_{s+2}(j+h), w_{s+2}(j+2h), w_{s+2}(j+3h) — 4 butterflies
+  - Implement for both Montgomery (ff_mul_ptx) and Barrett (ff_mul_barrett_v2)
+- Analyze register pressure with `--ptxas-options=-v`:
+  - Radix-8 needs 8 FpElements in registers = 64 registers for data alone
+  - Plus 7 twiddle values (reusable, not all live simultaneously) + temps
+  - Estimate: 80–100 registers per thread → occupancy ≈ 1 block/SM for K=10
+  - RTX 3060: 65,536 registers per SM ÷ 100 regs/thread = 655 threads max
+  - With OPT_BLOCK=256: 2 blocks/SM (if 100 regs) or 1 block/SM (if >128 regs)
+  - **Fallback plan**: if register pressure kills occupancy, use radix-8 only when
+    num_outer_stages % 3 == 0, and radix-4 for remainder (hybrid approach)
+- Compile test: build a standalone device function, check register count, verify
+  it doesn't spill to local memory
+
+**Deliverables:**
+- L2 diagnostic results + analysis (go/no-go for Stockham)
+- `radix8_butterfly_outer()` device function (Montgomery + Barrett)
+- Register pressure report: actual vs theoretical occupancy
+- Updated `results/analysis.md` with L2 and register sections
+
+---
+
+### Session 13 — Radix-8 Cooperative Kernels + Correctness
+
+**Objective:** Implement the full radix-8 cooperative outer-stage kernels and validate
+correctness at all sizes.
+
+**Tasks:**
+- Implement 4 new cooperative kernels in `src/ntt_optimized.cu`:
+  - `ntt_outer_radix8_kernel` (Montgomery, single)
+  - `ntt_outer_radix8_barrett_kernel` (Barrett, single)
+  - `ntt_outer_radix8_batch_kernel` (Montgomery, batched)
+  - `ntt_outer_radix8_batch_barrett_kernel` (Barrett, batched)
+- Kernel structure (extending the radix-4 pattern):
+  ```cuda
+  for (int pass = 0; pass < num_r8_passes; ++pass) {
+      const int s = start_stage + 3 * pass;  // triple of stages
+      // ... radix-8 butterfly over 8 elements ...
+      if (pass + 1 < num_r8_passes) grid.sync();
+  }
+  ```
+- Stage allocation logic for n=2^22 (12 outer stages, K=10):
+  - Radix-8: 12 / 3 = 4 passes (no remainder) → single cooperative launch
+  - General: `num_r8_passes = num_outer / 3`, leftover = num_outer % 3
+  - Leftover handling:
+    - 0 leftover: all radix-8 (ideal)
+    - 1 leftover: num_r8_passes radix-8 + 1 radix-2 (append to same coop launch)
+    - 2 leftover: num_r8_passes radix-8 + 1 radix-4 (append to same coop launch)
+  - **Hybrid kernel**: single cooperative kernel that does radix-8 passes, then optionally
+    a radix-4 pass, then optionally a radix-2 pass. Avoids extra kernel launches.
+- Modify dispatch logic in all 4 host functions:
+  `ntt_forward`, `ntt_inverse`, `ntt_forward_batch`, `ntt_inverse_batch`
+  - Try radix-8 first; fall back to radix-4 if occupancy insufficient
+  - Occupancy query: `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for radix-8 kernel
+- Handle edge case: n=2^11 has only 1 outer stage (K=10 fuses 10, only stage 10 left)
+  → radix-2 only, no radix-8 possible. Threshold: need ≥3 outer stages for radix-8.
+
+**Test plan — Radix-8 correctness:**
+- **Forward NTT vs CPU reference (radix-8 path exercised):**
+  - All sizes 2^10..2^22 (radix-8 active for sizes where ≥3 outer stages exist)
+  - Radix-8 vs existing radix-4 output: **bitwise identical** at all sizes
+- **Roundtrip INTT(NTT(x)) = x:**
+  - All sizes 2^10..2^22, both Montgomery and Barrett
+- **Cross-validation (radix-8 vs radix-4):**
+  - Force radix-4 path and radix-8 path separately, compare outputs
+  - Sizes 2^13..2^22 (sizes where both paths are meaningful)
+  - Both Montgomery and Barrett
+- **Batched radix-8:**
+  - Batch B=8 vs sequential: 2^15, 2^18, 2^20, 2^22
+  - Batched radix-8 vs batched radix-4: bitwise identical
+- **Leftover handling:**
+  - n where outer stages % 3 == 0 (e.g., 2^22: 12 outer = 4×3, clean)
+  - n where outer stages % 3 == 1 (e.g., 2^14: 4 outer = 1×3 + 1)
+  - n where outer stages % 3 == 2 (e.g., 2^15: 5 outer = 1×3 + 2)
+  - Verify correct fallback to radix-4/radix-2 for leftover stages
+- **Occupancy fallback:**
+  - If radix-8 has insufficient occupancy at some block count, verify graceful
+    fallback to radix-4 path (same output, no crash)
+
+**Deliverables:**
+- 4 new cooperative radix-8 kernels in `ntt_optimized.cu`
+- Updated dispatch logic with radix-8 → radix-4 → radix-2 fallback chain
+- Hybrid kernel handling leftover stages (radix-8 + radix-4/radix-2 tail)
+- Correctness tests: ≥30 new tests (target ~260 total)
+
+---
+
+### Session 14 — On-the-Fly Twiddle Computation
+
+**Objective:** Replace precomputed twiddle table loads with on-the-fly computation in the
+outer-stage radix-8 kernel, eliminating ~384 MB of twiddle DRAM reads.
+
+**Background:**
+Current outer stages load twiddles from a 64 MB precomputed table (n/2 × 32 bytes at n=2^22).
+Access is strided (stage k has stride n/2^(k+1)), defeating L2 cache. OTF replaces this with
+per-thread computation: each thread computes its required twiddle ω^j from a single per-stage
+root ω_stage using a square-and-multiply chain.
+
+**Tasks:**
+- Implement OTF twiddle device function:
+  ```cuda
+  __device__ __forceinline__
+  FpElement compute_twiddle_otf(
+      const FpElement& omega_stage,  // ω^(n / 2^(s+1)) = primitive root for stage s
+      uint32_t j                     // butterfly index within group → twiddle = omega_stage^j
+  ) {
+      // Square-and-multiply: compute omega_stage^j
+      // For j up to 2^21, this is at most 21 ff_mul operations
+      FpElement result = FP_ONE;
+      FpElement base = omega_stage;
+      while (j > 0) {
+          if (j & 1) result = ff_mul(result, base);
+          base = ff_mul(base, base);
+          j >>= 1;
+      }
+      return result;
+  }
+  ```
+- **Optimization**: For radix-8, each butterfly needs 7 twiddles. Many share the same
+  `omega_stage` base. Compute twiddles incrementally where possible:
+  - Stage s twiddles: w, w², w³ → compute w then multiply sequentially
+  - Stage s+1 and s+2 twiddles share structure with stage s
+  - Target: reduce from 7×21 ff_mul worst case to ~3×21 + 4×1 = ~67 ff_mul per butterfly
+- **Precompute stage roots**: Instead of the full n/2 twiddle table, store only
+  `log_n` values: `omega_roots[s] = ω^(n / 2^(s+1))` for s = 0..log_n-1.
+  Total: 22 × 32 bytes = 704 bytes (fits in constant memory `__constant__`)
+- **Apply to outer stages only**: The fused inner kernel (stages 0-9) is compute-bound;
+  adding OTF ff_mul would make it slower. Keep precomputed twiddles for inner kernel.
+- Implement OTF variant of radix-8 kernel: `ntt_outer_radix8_otf_kernel`
+- **Trade-off analysis**: OTF adds ~7 ff_mul per radix-8 butterfly but eliminates 7 global
+  memory twiddle loads. For the memory-bound outer stages, this is a net win. Measure:
+  - With OTF: extra compute time from ff_mul
+  - Without OTF: twiddle DRAM traffic eliminated
+  - Net: should be positive for outer stages (memory-bound → compute is "free")
+- Test: OTF kernel output must be **bitwise identical** to precomputed-twiddle kernel
+  (same twiddle values, just computed differently)
+
+**Test plan — OTF twiddle correctness:**
+- **OTF twiddle values vs precomputed table:**
+  - For each stage s and 1000 random j values, verify compute_twiddle_otf(ω_stage, j)
+    equals twiddles[j * stride] from the precomputed table
+  - Edge values: j=0 (should be 1), j=1 (should be ω_stage), j=max
+- **NTT with OTF vs precomputed twiddles:**
+  - All sizes 2^13..2^22: bitwise identical output
+  - Both Montgomery and Barrett
+  - Batched B=4 at 2^18, 2^22
+- **Roundtrip with OTF twiddles:**
+  - INTT(NTT(x)) = x for 2^15, 2^18, 2^20, 2^22
+- **Stage root correctness:**
+  - Verify omega_roots[s]^(2^s) = ω_n for all s (each root is consistent with ω_n)
+  - Verify omega_roots[s]^(n/2^(s+1)) = 1 (correct order)
+
+**Deliverables:**
+- OTF twiddle device function in `include/ff_arithmetic.cuh` (or new `include/twiddle_otf.cuh`)
+- Stage root precomputation + `__constant__` storage
+- OTF variant of radix-8 outer kernel
+- OTF correctness tests: ~15 new tests
+- Trade-off analysis: OTF compute cost vs DRAM savings
+
+---
+
+### Session 15 — v1.5.0 Benchmark + Profile + Release
+
+**Objective:** Comprehensive benchmarking of radix-8 + OTF, profiling, release.
+
+**Tasks:**
+- Full benchmark matrix: {Montgomery, Barrett} × {radix-4, radix-8, radix-8+OTF} × {2^15..2^22}
+  - Single NTT forward, 7-rep median
+  - Batched 8×, 7-rep median
+- Profile with ncu:
+  - Radix-8 kernel: register usage, occupancy, DRAM throughput, IPC
+  - Compare radix-8 vs radix-4: DRAM bytes read/written (should show ~33% reduction)
+  - OTF vs precomputed: DRAM bytes (twiddle traffic should disappear)
+  - L2 hit rate comparison: does eliminating twiddle traffic improve coefficient caching?
+- Capture screenshots: radix-8 roofline, OTF DRAM comparison
+- Generate benchmark charts: v1.5.0 vs v1.4.0 bar chart at all sizes
+- Full regression sweep: all 230+ existing tests pass + new tests green
+- Update `results/analysis.md` (new section: "Radix-8 + OTF Analysis")
+- Update `results/data/bench_v150.json`
+- Update README performance tables
+- Update CLAUDE.md with radix-8 and OTF documentation
+- Tag v1.5.0 release
+
+**Expected results (n=2^22):**
+- Radix-8 alone: ~13–15 ms (−15–25% vs v1.4.0's 17.1 ms)
+- Radix-8 + OTF: ~12–14 ms (additional −5–10% from twiddle traffic elimination)
+- Batched 8× at 2^22: proportional improvement (~110–130 ms vs v1.4.0's ~150 ms)
+
+**Test plan — v1.5.0 release regression sweep:**
+- All existing v1.4.0 tests pass (230/230 — no regressions)
+- Full test matrix: {NAIVE, OPTIMIZED, BARRETT} × {single, batch-1, batch-8}
+  × {forward, roundtrip} × {2^10..2^22}
+- Radix-8 cross-validation: radix-8 == radix-4 at all sizes (bitwise)
+- OTF cross-validation: OTF == precomputed at all sizes (bitwise)
+- CUDA Graph tests still pass (graphs should use new radix-8 kernels automatically)
+- **Test count target**: ≥275 total
+
+**Deliverables:**
+- Updated benchmark tables + charts (radix-8, OTF comparison)
+- ncu screenshots (radix-8 roofline, OTF DRAM savings)
+- Full regression pass (all tests green)
+- Git tag v1.5.0
+
+---
+
+## v1.6.0 — Multi-Field NTT (Goldilocks + BabyBear)
+
+**Goal:** Add Goldilocks (2^64 − 2^32 + 1) and BabyBear (2^31 − 2^27 + 1) field support,
+enabling 3-way performance comparison across BLS12-381 / Goldilocks / BabyBear — the three
+most relevant fields in the ZKP ecosystem. This is the highest impact-to-effort ratio item
+remaining: ~2-3 days of work, compelling benchmark figure, demonstrates ecosystem breadth.
+
+**Expected improvement:** Not a BLS12-381 speedup — this is a portfolio/insight feature.
+Goldilocks NTT at n=2^22 expected ~1.0–1.5 ms (10–15× faster than BLS12-381).
+BabyBear NTT at n=2^22 expected ~0.3–0.5 ms (~35–50× faster).
+
+**Rationale:** The retrospective doc's key insight: "the whole ZKP community is moving from
+pairing-based to hash-based proofs — it's a 10–15× field arithmetic difference, not an
+algorithmic one." A concrete benchmark proves this claim with data on our hardware.
+
+**References:**
+- Özcan & Savaş (IEEE Access 2025): Goldilocks NTT on RTX 3060Ti
+- RISC Zero: BabyBear for STARKs
+- Plonky2/3 (Polygon): Goldilocks for recursive SNARKs
+
+---
+
+### Session 16 — Goldilocks + BabyBear Field Arithmetic
+
+**Objective:** Implement modular arithmetic for both fields (GPU + CPU reference) and
+validate with exhaustive tests.
+
+**Part A — Goldilocks field (p = 2^64 − 2^32 + 1):**
+
+- Representation: single `uint64_t` (1 limb!)
+- `ff_add_goldilocks(a, b)`: `a + b mod p` — add, conditional subtract p
+  - Branchless: `uint64_t s = a + b; uint64_t c = (s < a); s -= p; s += p & -(s > s+p);`
+  - Or use the Goldilocks trick: `(a + b) mod (2^64 − 2^32 + 1)` via hi/lo split
+- `ff_sub_goldilocks(a, b)`: `a - b mod p` — subtract, conditional add p (branchless)
+- `ff_mul_goldilocks(a, b)`: 64×64→128 bit multiply, then reduce mod p
+  - `uint128 prod = (uint128)a * b; uint64_t lo = prod; uint64_t hi = prod >> 64;`
+  - Goldilocks reduction: `hi * 2^32 - hi + lo mod p` (special form of p enables this)
+  - Or: Barrett with μ fitting in 2 × uint64
+  - Or: Montgomery with R = 2^64
+  - Key: this is ~5–8 instructions vs 528 for BLS12-381
+- GPU implementation: `include/ff_goldilocks.cuh`
+  - Struct: `struct GoldilocksElement { uint64_t val; };`
+  - All functions: `__device__ __forceinline__`
+- CPU reference: `tests/ff_reference.h` (add Goldilocks section)
+  - Use `__uint128_t` (GCC) or `_umul128` (MSVC) for 128-bit product
+
+**Part B — BabyBear field (p = 2^31 − 2^27 + 1 = 0x78000001):**
+
+- Representation: single `uint32_t` (1 limb!)
+- `ff_add_babybear(a, b)`: `a + b mod p` — branchless subtract if overflow
+- `ff_sub_babybear(a, b)`: `a - b mod p` — branchless add if underflow
+- `ff_mul_babybear(a, b)`: 32×32→64 bit multiply, then reduce mod p
+  - From retrospective doc: ~5 instructions total
+  - `uint64_t wide = (uint64_t)a * b;`
+  - Special form: p = 2^31 - 2^27 + 1 allows shift-based reduction
+  - `uint32_t lo = (uint32_t)(wide & 0x7FFFFFFF); uint32_t hi = (uint32_t)(wide >> 31);`
+  - `result = lo + hi * 2^27 - hi;` (since 2^31 ≡ 2^27 - 1 mod p)
+  - Conditional subtract if result ≥ p
+- GPU implementation: `include/ff_babybear.cuh`
+  - Struct: `struct BabyBearElement { uint32_t val; };`
+- CPU reference: straightforward 64-bit arithmetic
+
+**Tasks:**
+- Implement `include/ff_goldilocks.cuh`: add, sub, mul, from_uint64, to_uint64
+- Implement `include/ff_babybear.cuh`: add, sub, mul, from_uint32, to_uint32
+- Implement CPU reference for both in `tests/ff_reference.h`
+- Element types: separate structs (not template — different sizes, different reduction)
+- Microbenchmark: isolated ff_mul throughput for all 3 fields (extend `ff_microbench.cu`)
+
+**Test plan — Field arithmetic correctness:**
+- **Edge-case inputs (GPU and CPU reference must agree, both fields):**
+  - Identity: a * 1 = a, a * 0 = 0 for random a
+  - Boundary: (p-1) * (p-1), (p-1) * 2, 0 * a
+  - Small values: 1*1, 2*3, single-word values
+  - Near-modulus: p-1, p-2
+- **Cross-validation (GPU vs CPU reference):**
+  - 10^6 random pairs for mul, 10^4 for add/sub
+- **Algebraic properties:**
+  - Commutativity: a*b = b*a (10^4 random pairs)
+  - Associativity: (a*b)*c = a*(b*c) (10^3 triples)
+  - Distributivity: a*(b+c) = a*b + a*c (10^3 triples)
+- **Microbenchmark**: throughput comparison chart (ops/sec for all 3 fields)
+
+**Deliverables:**
+- `include/ff_goldilocks.cuh` — Goldilocks field arithmetic
+- `include/ff_babybear.cuh` — BabyBear field arithmetic
+- CPU reference implementations in `tests/ff_reference.h`
+- Field arithmetic tests: ~20 new tests per field (~40 total)
+- Microbenchmark data: 3-field throughput comparison
+
+---
+
+### Session 17 — Multi-Field NTT Integration + Correctness
+
+**Objective:** Implement NTT kernels for Goldilocks and BabyBear fields, validate
+correctness, handle field-specific optimizations.
+
+**Design decision — Separate kernels vs templates:**
+- **Separate kernels** (recommended): Each field has fundamentally different element size
+  (32B vs 8B vs 4B), different shared memory per element, different register pressure.
+  Template instantiation would work but shared memory sizing, thread counts, and K values
+  all differ. Separate implementation is cleaner and allows per-field tuning.
+- Goldilocks: 8 bytes/element → K=10 fuses 1024 elements × 8B = 8 KB shmem (vs 32 KB for BLS)
+  → could potentially go to K=12 (4096 elements × 8B = 32 KB) for deeper fusion
+- BabyBear: 4 bytes/element → K=10 fuses 1024 × 4B = 4 KB → could go to K=13 (8192 × 4B = 32 KB)
+
+**Tasks:**
+- Implement Goldilocks NTT in new `src/ntt_goldilocks.cu`:
+  - Fused inner kernel (K=10 minimum, explore K=12 for deeper fusion)
+  - Cooperative outer-stage kernel (radix-4 or radix-8 depending on v1.5.0 results)
+  - Bit-reverse permutation kernel
+  - Twiddle precomputation: find primitive root for Goldilocks field
+    (p-1 = 2^32 × (2^32 - 1), has large power-of-2 factor → NTT-friendly up to 2^32!)
+  - Forward + inverse, single + batched
+- Implement BabyBear NTT in new `src/ntt_babybear.cu`:
+  - Same structure as Goldilocks
+  - BabyBear p-1 = 2^27 × (2^4 - 1) → NTT-friendly up to 2^27
+  - Explore deeper fusion: K=12 or K=13 (entire NTT may fit in shmem for small sizes)
+- Public API additions to `include/ntt.cuh` (or new headers):
+  ```cpp
+  void ntt_forward_goldilocks(GoldilocksElement* d_data, size_t n, cudaStream_t stream = 0);
+  void ntt_inverse_goldilocks(GoldilocksElement* d_data, size_t n, cudaStream_t stream = 0);
+  void ntt_forward_babybear(BabyBearElement* d_data, size_t n, cudaStream_t stream = 0);
+  void ntt_inverse_babybear(BabyBearElement* d_data, size_t n, cudaStream_t stream = 0);
+  ```
+- CPU reference NTT for both fields in `tests/ff_reference.h`
+  (extend existing CPU NTT with field-generic template or separate functions)
+
+**Test plan — Multi-field NTT correctness:**
+- **Forward NTT vs CPU reference:**
+  - Goldilocks: sizes 2^10..2^22 (13 sizes)
+  - BabyBear: sizes 2^10..2^22 (13 sizes)
+- **Roundtrip INTT(NTT(x)) = x:**
+  - Both fields, sizes 2^10..2^22
+- **Known-vector patterns:**
+  - All-zeros, all-ones, single-nonzero, ascending for both fields (3 sizes each)
+- **Batched:**
+  - B=8 vs sequential at 2^15, 2^18, 2^22 for both fields
+- **Cross-field sanity**: at 2^10 where computation is trivially verifiable by hand,
+  verify all 3 fields produce correct DFT coefficients for a known input vector
+
+**Deliverables:**
+- `src/ntt_goldilocks.cu` — Goldilocks NTT implementation
+- `src/ntt_babybear.cu` — BabyBear NTT implementation
+- Updated `include/ntt.cuh` (or `include/ntt_goldilocks.cuh`, `include/ntt_babybear.cuh`)
+- CPU reference NTT for both fields
+- NTT correctness tests: ~30 new tests per field (~60 total)
+- Target: ~340 total tests
+
+---
+
+### Session 18 — Multi-Field Benchmark + Charts + Release v1.6.0
+
+**Objective:** Comprehensive 3-way benchmark, generate comparison charts, release.
+
+**Tasks:**
+- Full benchmark matrix: {BLS12-381, Goldilocks, BabyBear} × {2^15..2^22} × {single, batch-8}
+  - 7-rep median for each configuration
+  - Record both wall-clock time and throughput (elements/sec, NTTs/sec)
+- Generate comparison charts using `scripts/plot_benchmarks.py`:
+  - **Main chart**: 3 fields × 5 sizes bar chart (wall-clock time, log scale)
+  - **Speedup chart**: Goldilocks and BabyBear speedup factor vs BLS12-381
+  - **Throughput chart**: elements/sec for all 3 fields (shows memory-bound ceiling)
+  - **Batch comparison**: batch efficiency (batch/sequential ratio) per field
+- Profile with ncu:
+  - Compare compute utilization across fields: BLS12-381 (compute-bound inner),
+    Goldilocks (where's the bottleneck?), BabyBear (fully memory-bound?)
+  - Verify BabyBear is indeed fully DRAM-bound end-to-end (both inner + outer)
+- Key analysis question: does smaller element size change the inner/outer bottleneck ratio?
+  - BLS12-381: inner=compute-bound, outer=memory-bound
+  - Goldilocks: inner should be much faster → outer dominates even more?
+  - BabyBear: inner is trivial → outer is essentially entire NTT?
+  - This has implications for which optimizations matter per field
+- Full regression sweep: all tests pass
+- Update `results/analysis.md` (new section: "Multi-Field Comparison")
+- Update README with 3-field comparison table and chart
+- Update CLAUDE.md with Goldilocks/BabyBear documentation
+- Tag v1.6.0 release
+
+**Expected results (n=2^22, single NTT):**
+- BLS12-381 Montgomery: ~13 ms (v1.5.0 target) or ~17 ms (v1.4.0 if radix-8 underperforms)
+- Goldilocks: ~1.0–1.5 ms (10–15× faster — 8B elements, trivial arithmetic)
+- BabyBear: ~0.3–0.5 ms (35–50× faster — 4B elements, ~5 instructions per mul)
+
+**Deliverables:**
+- 3-field benchmark data: `results/data/bench_v160.json`
+- Comparison charts in `results/charts/`
+- Updated README with multi-field performance table
+- All tests green (target: ~340 total)
+- Git tag v1.6.0
+
+---
+
+## v1.7.0 — Plantard Reduction for BLS12-381
+
+**Goal:** Implement Plantard modular reduction as an alternative to Montgomery/Barrett for
+the compute-bound fused inner kernel. Plantard eliminates one big-integer multiplication
+per twiddle multiply by precomputing twiddle-specific Plantard constants.
+
+**Expected improvement:** 5–15% on fused inner kernel → 2–5% total NTT improvement.
+This is a targeted optimization for the inner kernel (now ~35% of total time post-radix-8).
+
+**Rationale:** Unlike MoMA (which requires SPIRAL code generation and has 381-bit efficiency
+problems), Plantard is a clean mathematical technique with proven GPU results. Özcan & Savaş
+(IEEE Access 2025) benchmark Plantard vs Montgomery on RTX 3060Ti, showing 8–15% improvement
+on compute-bound NTT inner stages for 60-bit primes. For 255-bit BLS12-381, the saving is
+less dramatic but still saves one 8-limb multiplication per butterfly.
+
+**References:**
+- Plantard, "Efficient Word Size Modular Arithmetic", IEEE TETC 2021
+- Özcan & Savaş (IEEE Access 2025) §V-C: Plantard benchmark on RTX GPUs
+
+---
+
+### Session 19 — Plantard Arithmetic + Twiddle Precomputation
+
+**Objective:** Implement Plantard reduction for BLS12-381 and precompute Plantard-form
+twiddle factors.
+
+**Background — Plantard reduction:**
+Standard Montgomery butterfly: `t = mont_mul(b, w)` requires 2 big-integer multiplies
+(b×w product + Montgomery correction × p). Plantard precomputes `w' = w × 2^(-2·256) mod p`
+for each twiddle factor w. At runtime: `t = plantard_mul(b, w')` requires only 1 big-integer
+multiply (upper half of b × w') + 1 shift — the correction multiply is eliminated.
+
+For NTT, twiddle factors are **constants** (precomputed once), so the precomputation cost
+is amortized over all NTT invocations.
+
+**Tasks:**
+- Implement Plantard multiplication in `include/ff_plantard.cuh`:
+  ```cuda
+  __device__ __forceinline__
+  FpElement ff_mul_plantard(const FpElement& a, const FpElement& w_prime) {
+      // Step 1: full 512-bit product z = a × w_prime
+      uint32_t z[16];
+      // ... (same schoolbook multiply as Barrett step 1)
+
+      // Step 2: take upper 256 bits: result = z[8..15]
+      // (Plantard property: upper half of a × w' is a × w mod p,
+      //  provided w' = w × 2^(-512) mod p was precomputed correctly)
+
+      // Step 3: conditional reduction (at most 1 subtract)
+      // Plantard output range: [0, 2p) → branchless sub + lop3 select
+      FpElement result;
+      // ... (same branchless pattern as ff_mul_ptx step 3)
+      return result;
+  }
+  ```
+- Implement Plantard twiddle precomputation:
+  - For each twiddle w in the existing table, compute `w' = w × R^(-2) mod p`
+    where R = 2^256
+  - Need: `R^(-2) mod p` = modular inverse of R² mod p
+  - Precompute `R_INV_SQ = (2^256)^(-2) mod p` as a compile-time constant
+  - `w' = w × R_INV_SQ mod p` (can use CPU Barrett or Montgomery for precomputation)
+  - Store Plantard twiddles in separate device array (parallel to Montgomery/Barrett twiddles)
+- CPU reference Plantard in `tests/ff_reference.h` for validation
+- Implement Plantard-specific `ff_add_plantard` / `ff_sub_plantard` if Plantard representation
+  requires different add/sub (check: Plantard output form may differ from standard form)
+  - If Plantard outputs standard-form results, existing ff_add/ff_sub work unchanged
+  - Key: document the representation invariant clearly
+
+**Analysis:**
+- SASS instruction count: Plantard should save ~64 MAD instructions per ff_mul
+  (eliminating the Montgomery correction loop = 8 iterations × 8 limbs)
+- Expected: ~460 SASS instructions vs Montgomery 528 (−13%) or Barrett 888 (−48%)
+- Register pressure: similar to Montgomery (one less 8-limb accumulator)
+
+**Test plan — Plantard arithmetic correctness:**
+- **Edge-case inputs (same suite as Barrett Session 1):**
+  - Identity: a * 1' = a (where 1' is Plantard form of 1)
+  - Boundary: (p-1) * (p-1)', 0 * a, max-limb values
+- **Cross-validation (Plantard vs Montgomery vs Barrett):**
+  - 10^6 random pairs: Plantard result == Montgomery result == Barrett result
+  - Includes conversion between representations if needed
+- **Twiddle precomputation validation:**
+  - For each twiddle w, verify: plantard_mul(a, w') == montgomery_mul(a, w) for random a
+  - All twiddle table entries at n=2^22 (n/2 = 2^21 entries spot-checked)
+- **Algebraic properties:**
+  - Commutativity, associativity, distributivity (10^3 each)
+
+**Deliverables:**
+- `include/ff_plantard.cuh` — Plantard device functions
+- Plantard twiddle precomputation (host-side, stored in device memory)
+- CPU reference Plantard in `tests/ff_reference.h`
+- Plantard constant: `R_INV_SQ mod p` verified
+- Correctness tests: ~15 new tests
+- SASS instruction count comparison
+
+---
+
+### Session 20 — Plantard NTT Integration + Benchmark + Release v1.7.0
+
+**Objective:** Integrate Plantard into the fused inner kernel, benchmark, release.
+
+**Tasks:**
+- Add `NTTMode::PLANTARD` to the NTT API
+- Integrate Plantard into fused K=10 kernel:
+  - New fused kernel variant using `ff_mul_plantard` for twiddle × element multiply
+  - `ff_add_v2` / `ff_sub_v2` remain unchanged (Plantard outputs standard-form)
+  - Add to `ntt_fused_kernels.cu` (separate instantiation, same TU pattern)
+- Integrate into outer stages:
+  - Since outer stages are memory-bound, Plantard's compute savings may not help
+  - Test both: Plantard outer stages vs Montgomery/Barrett outer stages
+  - If no improvement, keep Plantard for inner kernel only + Montgomery/Barrett outer
+  - This "mixed-mode" approach uses the best arithmetic for each kernel's bottleneck
+- Plantard twiddle cache: precompute and cache alongside Montgomery/Barrett twiddles
+- Benchmark: {Montgomery, Barrett, Plantard, Plantard+Montgomery-outer} × {2^15..2^22}
+  - Focus on fused kernel time (use ncu `--kernel-id` to isolate)
+  - Full NTT time for all modes
+- Profile: register usage, IPC, occupancy for Plantard fused kernel vs Montgomery
+- Full regression sweep
+- Update analysis.md, README, CLAUDE.md
+- Tag v1.7.0
+
+**Test plan — Plantard NTT integration:**
+- **Forward NTT vs CPU reference:**
+  - Plantard mode: all sizes 2^10..2^22
+- **Roundtrip INTT(NTT(x)) = x:**
+  - Plantard mode: all sizes 2^10..2^22
+- **Cross-validation (Plantard NTT vs Montgomery NTT vs Barrett NTT):**
+  - Bitwise identical output at all sizes 2^10..2^22
+- **Batched Plantard:**
+  - B=8 vs sequential at 2^15, 2^18, 2^22
+  - Batched Plantard vs batched Montgomery (bitwise identical)
+- **Mixed-mode validation:**
+  - Plantard-inner + Montgomery-outer vs pure Montgomery (should be identical if
+    conversion between representations is correct at kernel boundary)
+
+**Expected results (n=2^22, single NTT):**
+- Pure Plantard: ~12–14 ms (inner kernel 5–15% faster, outer unchanged)
+- Plantard inner + radix-8 outer: ~11–13 ms
+- vs v1.5.0 baseline: 2–5% improvement
+
+**Deliverables:**
+- `NTTMode::PLANTARD` in public API
+- Plantard fused kernels in `ntt_fused_kernels.cu`
+- Plantard twiddle cache
+- Benchmark data: `results/data/bench_v170.json`
+- All tests green (target: ~370 total)
+- Git tag v1.7.0
+
+---
+
+## v1.8.0 — Stockham Outer Stages (Conditional)
+
+**Goal:** Replace Cooley-Tukey outer stages with Stockham auto-sort NTT, eliminating
+the bit-reversal permutation and achieving fully coalesced memory access patterns.
+
+**CONDITIONAL**: Only proceed if Session 12's L2 diagnostic shows **L2 hit rate < 20%**
+at n=2^22 (latency-bound outer stages). If L2 hit rate > 50% (bandwidth-bound), Stockham
+won't help — skip this release and investigate alternative directions.
+
+**Expected improvement:** 10–25% on outer stages if latency-bound (coalesced access
+eliminates miss penalty). Risk: if bandwidth-bound, Stockham wastes 2× VRAM for no gain.
+
+**Rationale:** NTTSuite (Ding et al., 2024) benchmarks 7 NTT variants on GPU, showing
+Stockham trades higher absolute bandwidth for better coalescing efficiency, with 1.2–1.8×
+speedup over Cooley-Tukey on DRAM-bound workloads. Our outer stages have a 12× gap to
+roofline — Stockham's coalesced access could close much of that gap.
+
+**References:**
+- NTTSuite (Ding et al., 2024): https://arxiv.org/abs/2406.16972
+- Stockham auto-sort FFT: Stockham (1966), Gentleman & Sande variant
+
+---
+
+### Session 21 — Stockham Kernel Design + Implementation
+
+**Objective:** Design and implement Stockham outer-stage kernels with ping-pong buffers.
+
+**Background — Stockham vs Cooley-Tukey:**
+Cooley-Tukey (current): in-place, bit-reversal permutation, strided access in outer stages.
+Stockham: out-of-place (ping-pong), no bit-reversal needed, all accesses coalesced.
+
+Key difference for outer stages: in Cooley-Tukey, stage k has butterfly pairs at distance
+2^k — at k=11, that's stride=2048, meaning consecutive warp threads access elements 2048
+apart (65 KB stride × 32 threads = completely non-coalesced). In Stockham, threads always
+read/write contiguous blocks regardless of stage.
+
+**Tasks:**
+- Allocate ping-pong buffer: `cudaMalloc` second n-element array for Stockham outer stages
+  - At n=2^22: 2 × 128 MB = 256 MB (within 6 GB VRAM budget)
+  - Allocate/free as part of NTT call (or cache like twiddle tables)
+- Implement Stockham outer-stage kernel:
+  - `ntt_outer_stockham_kernel(src, dst, twiddles, n, stage)`:
+    reads from `src`, writes to `dst` (out-of-place)
+  - Stockham indexing: thread `t` reads `src[t]` and `src[t + n/2]` (coalesced!)
+    and writes to `dst[stockham_index(t, stage)]` (also coalesced by construction)
+  - Apply to outer stages only (inner kernel stays in-place with shmem)
+- Eliminate bit-reverse permutation:
+  - Stockham auto-sort property means output is already in natural order after all stages
+  - Save ~0.3 ms bit-reverse pass at n=2^22
+- Implement radix-4 and radix-8 Stockham variants:
+  - Stockham radix-8: reads 8 contiguous elements, writes 8 to reordered positions
+  - Combine coalesced access with multi-stage fusion for maximum benefit
+- Support both Montgomery and Barrett arithmetic paths
+- Handle ping-pong: after each stage, swap src/dst pointers. After all outer stages,
+  ensure result is in the original array (or the caller's expected location).
+  If odd number of stages, need one extra copy.
+
+**Deliverables:**
+- Ping-pong buffer allocation + caching
+- Stockham outer-stage cooperative kernels (Montgomery/Barrett × single/batch)
+- Stockham radix-4 and radix-8 variants
+- Bit-reverse elimination (save one kernel launch)
+
+---
+
+### Session 22 — Stockham Correctness + Edge Cases
+
+**Objective:** Exhaustive correctness testing of Stockham path.
+
+**Test plan:**
+- **Forward NTT vs CPU reference:**
+  - Stockham path: all sizes 2^10..2^22
+- **Roundtrip INTT(NTT(x)) = x:**
+  - Stockham: all sizes, both Montgomery and Barrett
+- **Cross-validation (Stockham vs Cooley-Tukey):**
+  - Bitwise identical output at all sizes 2^10..2^22
+  - Both arithmetic modes
+- **Ping-pong correctness:**
+  - Even number of outer stages: result in original buffer
+  - Odd number: result in ping-pong buffer (verify copy-back works)
+  - Test at sizes producing both even and odd outer stage counts
+- **Batched Stockham:**
+  - B=4 and B=8 vs sequential at 2^15, 2^18, 2^22
+  - Batched Stockham vs batched Cooley-Tukey (bitwise identical)
+- **VRAM edge case:**
+  - Large batch at large size: verify ping-pong buffer doesn't cause OOM
+  - B=8 at 2^22 = 8 × 128 MB × 2 buffers = 2048 MB (should fit in 6 GB)
+  - B=16 at 2^22 = 4096 MB → may OOM. Detect and handle gracefully.
+- **Bit-reverse elimination:**
+  - Verify Stockham output is in natural order (no bit-reverse needed)
+  - Compare against Cooley-Tukey with explicit bit-reverse (should be bitwise identical)
+- **Known-vector patterns:**
+  - All-zeros, all-ones, single-nonzero, ascending at 3 sizes
+
+**Deliverables:**
+- Full Stockham correctness test suite (~40 new tests)
+- Edge case handling (OOM detection, odd/even stage count)
+- Target: ~410 total tests
+
+---
+
+### Session 23 — Stockham Benchmark + Release v1.8.0
+
+**Objective:** Benchmark Stockham vs Cooley-Tukey, profile coalescing improvement, release.
+
+**Tasks:**
+- Benchmark matrix: {Cooley-Tukey, Stockham} × {radix-4, radix-8} × {Montgomery, Barrett}
+  × {2^15..2^22} × {single, batch-8}
+- Profile with ncu:
+  - Key metrics: `dram__bytes_read.sum`, `dram__bytes_write.sum` (total traffic)
+  - `l1tex__t_sector_hit_rate.pct`, `lts__t_sector_hit_rate.pct` (cache efficiency)
+  - `smsp__sass_average_data_bytes_per_sector_mem_global_op_st` (coalescing quality)
+  - Compare Stockham vs Cooley-Tukey: coalescing should be ~32× better for outer stages
+- Capture screenshots: Stockham coalescing quality, before/after DRAM traffic comparison
+- Full regression sweep
+- Update analysis.md, README, CLAUDE.md
+- Tag v1.8.0
+
+**Expected results (n=2^22, conditional on L2 diagnostic):**
+- If latency-bound: Stockham ~10 ms (−20% vs v1.5.0's ~13 ms)
+- If bandwidth-bound: Stockham ~12.5 ms (−5%, not worth the complexity)
+- Document the result either way — negative results are valuable
+
+**Deliverables:**
+- Updated benchmark tables + charts
+- ncu coalescing screenshots
+- Full regression pass
+- `results/data/bench_v180.json`
+- Git tag v1.8.0
+
+---
+
+## Stretch Goals (v1.9.0+)
 
 ### SPIRAL/MoMA Code Generation Study
 - Attempt to use SPIRAL (open-source) to generate BLS12-381 NTT kernels
 - Compare auto-generated vs hand-tuned code quality (SASS instruction count, throughput)
 - If SPIRAL-generated code is superior, adopt as primary implementation
 
-### On-the-Fly Twiddle Computation
-- Compute twiddles during butterfly stages instead of precomputing and loading from memory
-- Trades memory bandwidth for compute (beneficial when compute-bound)
-- Uses fast modular exponentiation: ω^k = ω^(k-1) · ω (sequential chain per thread)
-
 ### Multi-GPU NTT
 - Split n-point NTT across 2+ GPUs using the 4-step decomposition
 - Column NTTs on GPU 0, row NTTs on GPU 1 (or split evenly)
 - Requires NVLink or PCIe peer-to-peer for transpose step
+
+### Register-Optimized Inner Kernel (K=11 or K=12)
+- With Goldilocks (8B elements) or BabyBear (4B), shared memory per element is 4-8×
+  smaller → can potentially fuse more stages (K=12 for Goldilocks, K=13 for BabyBear)
+- Would eliminate even more outer stages for smaller fields
+
+### Tensor Core Exploration
+- BabyBear's 31-bit elements can be packed into FP16/BF16 matrix tiles
+- Tensor cores do 16×16 matrix multiply in 1 cycle — could potentially compute
+  NTT butterflies as matrix operations
+- Highly experimental; may not preserve exact integer semantics
 
 ---
 
@@ -741,8 +1488,20 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 | **9** | **v1.4.0** | **Branchless arithmetic** ✅ | **Eliminate warp divergence** |
 | **10** | **v1.4.0** | **Radix-4 outer stages** ✅ | **~45% DRAM traffic reduction** |
 | **11** | **v1.4.0** | **CUDA Graphs + release** ✅ | **Graph replay (negligible gain)** |
+| 12 | v1.5.0 | L2 diagnostic + radix-8 butterfly design | Profile-guided + higher radix |
+| 13 | v1.5.0 | Radix-8 cooperative kernels + correctness | ~67% DRAM traffic reduction/triple |
+| 14 | v1.5.0 | On-the-fly twiddle computation | Eliminate twiddle DRAM traffic |
+| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: ~13 ms at 2^22 |
+| 16 | v1.6.0 | Goldilocks + BabyBear field arithmetic | Multi-field ZKP comparison |
+| 17 | v1.6.0 | Multi-field NTT integration + correctness | Field-specific kernel tuning |
+| 18 | v1.6.0 | 3-way benchmark + charts + release v1.6.0 | Portfolio/insight feature |
+| 19 | v1.7.0 | Plantard arithmetic + twiddle precompute | Eliminate 1 big-int mul/butterfly |
+| 20 | v1.7.0 | Plantard NTT integration + benchmark + release v1.7.0 | ~2–5% total improvement |
+| 21 | v1.8.0 | Stockham kernel design + implementation | Coalesced outer-stage access |
+| 22 | v1.8.0 | Stockham correctness + edge cases | Ping-pong buffer validation |
+| 23 | v1.8.0 | Stockham benchmark + release v1.8.0 | Conditional on L2 diagnostic |
 
-**Cumulative results (n=2^22, single NTT, 7-rep median):**
+**Projected cumulative results (n=2^22, single NTT, 7-rep median):**
 - v1.1.0: 25.1 ms (Montgomery, fused K=10 + cooperative outer)
 - **v1.2.0: 24.9 ms (Barrett, -0.8%)** — minimal single-NTT gain; outer stages still dominate
 - **v1.3.0: 29.5 ms (4-Step, +18% SLOWER)** — 3 transposes + sub-NTT outer stages add overhead.
@@ -750,6 +1509,10 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 - **v1.4.0: 17.1 ms (Montgomery) / 17.4 ms (Barrett)** — branchless arithmetic (-4.4%) +
   radix-4 outer stages (-30%). CUDA Graphs add negligible improvement (within noise).
   **32% faster than v1.1.0, exceeds 18-22 ms target.**
+- v1.5.0: ~13 ms (radix-8 + OTF twiddles, −24% vs v1.4.0) — **projected**
+- v1.6.0: ~13 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
+- v1.7.0: ~12.5 ms (Plantard inner kernel, −4% vs v1.5.0) — **projected**
+- v1.8.0: ~10 ms (Stockham coalesced outer, −20% vs v1.5.0, conditional) — **projected**
 
 **Batch throughput (8× 2^22 NTTs):**
 - v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
@@ -760,6 +1523,38 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
   Best batch mode remains Barrett at 199 ms.
 - **v1.4.0: ~150 ms (Montgomery batched) / ~159 ms (Barrett batched)** — radix-4 outer stages
   reduce batch time by ~20%. Montgomery faster for batched (fewer instructions per ff_mul).
+- v1.5.0: ~100–110 ms (radix-8 batched, projected)
+
+**Honest ceiling for BLS12-381 on RTX 3060 Laptop:**
+~8–9 ms at n=2^22. The 4 MB L2 vs 128 MB array means outer stages can never achieve
+full bandwidth utilization. The multi-field comparison (v1.6.0) will concretely demonstrate
+this ceiling and why the ZKP ecosystem is moving to smaller fields.
+
+---
+
+## Direction Triage Notes
+
+**Direction 3 from retrospective (Warp Shuffle Inner Kernel): ALREADY IMPLEMENTED.**
+The fused inner kernel in `ntt_fused_kernels.cu` already uses `__shfl_xor_sync` for stages
+0-4 via `butterfly_shfl()` + `fp_shfl_xor()`. Stages 5-9 require cross-warp communication
+(stride ≥ 32) and must use shared memory. No further optimization possible here.
+
+**Why OTF twiddles are bundled with v1.5.0 (not standalone):**
+The retrospective notes: "Standalone: too small to measure above noise. Best deployed as
+part of a combined radix-8 + OTF outer-stage rewrite." OTF saves ~1 ms at n=2^22 — within
+measurement noise as a standalone change, but measurable when combined with radix-8.
+
+**Why Goldilocks/BabyBear is v1.6.0 (not earlier):**
+High impact/effort ratio but does not improve BLS12-381 performance. Placed after radix-8
+(the primary performance improvement) but before Plantard/Stockham (diminishing returns).
+Also provides a natural comparison point: "here's what our optimized BLS12-381 achieves
+vs a field that's inherently 10-50× faster."
+
+**Why Stockham is conditional:**
+Session 12's L2 diagnostic determines whether outer stages are latency-bound (Stockham
+helps) or bandwidth-bound (Stockham doesn't help). This is the most expensive optimization
+remaining (~2 weeks) and carries medium-high risk. The diagnostic costs 1 hour of profiling
+and saves potentially 2 weeks of wasted effort.
 
 ---
 
@@ -772,5 +1567,14 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 - **cuZK**: Lu et al., TCHES 2023 — async pipeline methodology
 - **Bailey**: D.H. Bailey (1990) — "FFTs in External or Hierarchical Memory" (4-step FFT)
 - **ICICLE**: Ingonyama, GPU acceleration library for ZKP — [github](https://github.com/ingonyama-zk/icicle)
+- **Özcan, Javeed, Savaş**: "High-Performance NTT on GPU Through radix2-CT and 4-Step
+  Algorithms", IEEE Access 2025. [doi:10.1109/ACCESS.2025.11003946](https://ieeexplore.ieee.org/document/11003946)
+- **Kim et al.**: "Accelerating NTT for Bootstrappable HE on GPUs", 2020.
+  [arXiv:2012.01968](https://arxiv.org/abs/2012.01968) — OTF twiddle factors
+- **NTTSuite (Ding et al.)**: "NTTSuite: Number Theoretic Transform Benchmarks for
+  Accelerating Encrypted Computation", 2024. [arXiv:2406.16972](https://arxiv.org/abs/2406.16972)
+  — Stockham GPU benchmarks
+- **Plantard**: "Efficient Word Size Modular Arithmetic", IEEE TETC 2021.
+  [PDF](https://thomas-plantard.github.io/pdf/Plantard21.pdf)
 - NVIDIA CUDA Programming Guide — §3.2.11 CUDA Graphs, §5.2 Memory Hierarchy
 - Nsight Compute Documentation — L2 cache metrics, roofline analysis
