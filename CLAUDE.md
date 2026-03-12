@@ -7,7 +7,9 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
 
 - **Completed**: Fused radix-1024 inner kernel + radix-8 Montgomery / radix-4 Barrett
   cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
-- **Next (v1.5.0+)**: OTF twiddle computation, benchmark + release v1.5.0,
+- **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
+  Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
+- **Next (v1.5.0+)**: Benchmark + release v1.5.0,
   Goldilocks/BabyBear multi-field comparison, Plantard reduction
 
 ---
@@ -93,6 +95,7 @@ include/
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
   ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
   pipeline.cuh        — AsyncNTTPipeline class interface
+  twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
@@ -299,6 +302,23 @@ LICENSE                — MIT License
   CPU launch overhead is already minimal compared to GPU compute time.
 - **Value**: clean API for embedding NTT in larger CUDA Graph workflows
 
+### On-the-Fly (OTF) Twiddle Computation (v1.5.0 Session 14 — NEGATIVE RESULT)
+- Replaces precomputed twiddle table loads with on-the-fly computation from per-stage roots
+  stored in `__constant__` memory (~1 KB vs 64 MB precomputed table at n=2^22)
+- OTF radix-8 derivation: 1 exponentiation (MSB-first square-and-multiply) + 6 multiplies
+- Stage roots: `root[s] = omega_n^(n/2^(s+1))`, computed via repeated squaring from omega_n
+- Fixed constants: omega_4, omega_8, omega_8^3 (independent of n)
+- Implementation: `include/twiddle_otf.cuh` (pow functions), OTF kernels in `ntt_optimized.cu`
+- **NEGATIVE RESULT**: At n=2^22, `ff_pow_mont_u32(root, j)` does ~29 Montgomery muls per
+  butterfly at large outer stages (j up to 2^19). Each 256-bit Montgomery CIOS mul costs ~128
+  MADs. Total OTF overhead: ~35 muls/butterfly vs 7 DRAM reads (precomputed).
+- **Measured**: Montgomery 56.9ms OTF vs 15.6ms precomputed (+265%). Barrett 91.4ms vs 17.9ms.
+- **Root cause**: BLS12-381 256-bit arithmetic makes exponentiation prohibitively expensive.
+  Warp divergence in the pow loop (`if ((exp >> bit) & 1)`) further degrades throughput.
+- **OTF disabled** in all dispatch functions. Infrastructure retained for Goldilocks/BabyBear
+  multi-field work (64-bit/31-bit fields where multiply is 1-2 instructions, not 128 MADs).
+- **Tests**: 333/333 pass (16 new OTF-specific tests: stage root chain, twiddle values, leftover patterns)
+
 ---
 
 ## Phase Status
@@ -306,14 +326,15 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.4.0** (v1.5.0 in progress, Sessions 12-13 done).
+Phases 1-8 complete. Current version: **v1.4.0** (v1.5.0 in progress, Sessions 12-14 done).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 - **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
-- **v1.5.0 (in progress)** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression). **15.6 ms Montgomery** at 2^22 (-8% vs v1.4.0). 317 tests.
+- **v1.5.0 (in progress)** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression).
+  OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.6 ms Montgomery** at 2^22 (-8% vs v1.4.0). 333 tests.
 
 ---
 

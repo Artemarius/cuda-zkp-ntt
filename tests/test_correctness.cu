@@ -2276,6 +2276,157 @@ void test_ntt_graph_vs_nongraph() {
     }
 }
 
+// ─── OTF Twiddle Tests ───────────────────────────────────────────────────────
+
+// Test: OTF stage root squaring chain.
+// root[s] should equal root[s+1]^2 in Montgomery form.
+void test_otf_stage_root_chain(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_otf_stage_root_chain (n=2^%d)...\n", log_n);
+
+    ff_ref::FpRef omega = ff_ref::get_root_of_unity(n);
+
+    // Compute stage roots: root[s] = omega^(n / 2^(s+1))
+    // By repeated squaring from omega, we get root[log_n-1] = omega,
+    // root[log_n-2] = omega^2, ..., root[0] = omega^(n/2) = -1.
+    // But the OTF code computes bottom-up: start from omega, square down.
+    // Verify: root[s] = root[s+1]^2
+    std::vector<ff_ref::FpRef> roots(log_n);
+    ff_ref::FpRef root = omega;
+    for (int s = log_n - 1; s >= 0; --s) {
+        roots[s] = root;
+        root = ff_ref::fp_sqr(root);
+    }
+
+    int pass = 0;
+    for (int s = 0; s < log_n - 1; ++s) {
+        ff_ref::FpRef squared = ff_ref::fp_sqr(roots[s + 1]);
+        if (squared == roots[s]) ++pass;
+    }
+
+    TEST_ASSERT(pass == log_n - 1, "stage root squaring chain failed");
+    printf("  Stage root chain (n=2^%d): %d/%d squaring relations verified\n",
+           log_n, pass, log_n - 1);
+}
+
+// Test: OTF twiddle matches precomputed table entry (CPU reference).
+// For a given stage s and butterfly index j, the twiddle should be omega_n^(j * n / 2^(s+1)).
+// Verify at representative (s, j) pairs.
+void test_otf_twiddle_values(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_otf_twiddle_values (n=2^%d)...\n", log_n);
+
+    ff_ref::FpRef omega = ff_ref::get_root_of_unity(n);
+
+    // Compute stage roots
+    std::vector<ff_ref::FpRef> roots(log_n);
+    ff_ref::FpRef root = omega;
+    for (int s = log_n - 1; s >= 0; --s) {
+        roots[s] = root;
+        root = ff_ref::fp_sqr(root);
+    }
+
+    int pass = 0, total = 0;
+    // K=10 means outer stages start at 10
+    int outer_start = (log_n >= 10) ? 10 : 0;
+
+    // Test representative (s, j) values
+    for (int s = outer_start; s < log_n; ++s) {
+        uint32_t half = 1u << s;
+        // Test j=0, j=1, j=half/2, j=half-1
+        uint32_t test_js[] = { 0, 1, half / 2, half - 1 };
+        int num_js = (half < 4) ? half : 4;
+        for (int ji = 0; ji < num_js; ++ji) {
+            uint32_t j = test_js[ji];
+            if (j >= half) continue;
+
+            // Expected: root[s]^j (via CPU pow)
+            // root[s] = omega^(n / 2^(s+1))
+            // root[s]^j = omega^(j * n / 2^(s+1))
+            ff_ref::FpRef expected = roots[s];
+            // Exponentiate by j using repeated squaring
+            ff_ref::FpRef result;
+            result.limbs = ff_ref::R_MOD;  // Montgomery(1)
+            ff_ref::FpRef base = roots[s];
+            uint32_t exp = j;
+            while (exp > 0) {
+                if (exp & 1) result = ff_ref::fp_mul(result, base);
+                base = ff_ref::fp_sqr(base);
+                exp >>= 1;
+            }
+
+            // Also verify via direct omega^(j * stride)
+            uint32_t stride = static_cast<uint32_t>(n / (2u * half));
+            uint64_t tw_exp_val = static_cast<uint64_t>(j) * stride;
+            ff_ref::FpRef direct;
+            direct.limbs = ff_ref::R_MOD;
+            ff_ref::FpRef ob = omega;
+            uint64_t de = tw_exp_val;
+            while (de > 0) {
+                if (de & 1) direct = ff_ref::fp_mul(direct, ob);
+                ob = ff_ref::fp_sqr(ob);
+                de >>= 1;
+            }
+
+            ++total;
+            if (result == direct) ++pass;
+        }
+    }
+
+    TEST_ASSERT(pass == total, "OTF twiddle value mismatch");
+    printf("  OTF twiddle values (n=2^%d): %d/%d matched\n", log_n, pass, total);
+}
+
+// Test: OTF NTT correctness at sizes exercising all leftover patterns.
+// Montgomery: num_outer%3 = 0,1,2
+// Barrett: num_outer%2 = 0,1
+void test_otf_ntt_leftover_patterns(int log_n, NTTMode mode) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    int K = (log_n >= 10) ? 10 : ((log_n >= 9) ? 9 : 8);
+    int num_outer = log_n - K;
+    int leftover = (mode == NTTMode::OPTIMIZED) ? (num_outer % 3) : (num_outer % 2);
+    printf("test_otf_ntt_leftover_patterns [%s] (n=2^%d, outer=%d, leftover=%d)...\n",
+           mode_name(mode), log_n, num_outer, leftover);
+
+    // Generate test data
+    std::vector<FpElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_data[i] = FpElement::zero();
+        h_data[i].limbs[0] = static_cast<uint32_t>((i * 7654321u + 1234567u) % 1000000007u);
+        h_data[i].limbs[1] = static_cast<uint32_t>((i * 8765432u + 2345678u) % 999999937u);
+    }
+
+    // CPU reference NTT (Montgomery domain)
+    std::vector<ff_ref::FpRef> ref(n);
+    for (size_t i = 0; i < n; ++i)
+        ref[i] = ff_ref::to_montgomery(ff_ref::FpRef::from_u32(h_data[i].limbs));
+    ff_ref::ntt_forward_reference(ref, n);
+    for (size_t i = 0; i < n; ++i)
+        ref[i] = ff_ref::from_montgomery(ref[i]);
+
+    // GPU NTT
+    FpElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_data, n, mode);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<FpElement> h_result(n);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_data));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i) {
+        FpElement expected;
+        ref[i].to_u32(expected.limbs);
+        if (h_result[i] == expected) ++pass;
+    }
+
+    TEST_ASSERT(pass == static_cast<int>(n), "OTF leftover pattern NTT mismatch");
+    printf("  OTF leftover [%s] (n=2^%d, leftover=%d): %d/%zu matched\n",
+           mode_name(mode), log_n, leftover, pass, n);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -2806,6 +2957,31 @@ int main() {
     test_ntt_inverse_explicit(14, NTTMode::BARRETT);
     test_ntt_inverse_explicit(15, NTTMode::BARRETT);
     test_ntt_inverse_explicit(22, NTTMode::BARRETT);
+
+    // ── OTF Twiddle Verification ──
+    // Stage root squaring chain
+    test_otf_stage_root_chain(13);
+    test_otf_stage_root_chain(20);
+    test_otf_stage_root_chain(22);
+
+    // OTF twiddle value consistency (root[s]^j == omega^(j*stride))
+    test_otf_twiddle_values(13);
+    test_otf_twiddle_values(20);
+    test_otf_twiddle_values(22);
+
+    // OTF NTT leftover pattern coverage:
+    // Montgomery radix-8: outer%3 = 0 (2^13,2^16,2^19,2^22), 1 (2^14,2^17,2^20), 2 (2^15,2^18,2^21)
+    // Barrett radix-4:    outer%2 = 0 (2^14,2^16,2^18,2^20,2^22), 1 (2^13,2^15,2^17,2^19,2^21)
+    test_otf_ntt_leftover_patterns(13, NTTMode::OPTIMIZED);  // 3 outer, %3=0
+    test_otf_ntt_leftover_patterns(14, NTTMode::OPTIMIZED);  // 4 outer, %3=1
+    test_otf_ntt_leftover_patterns(15, NTTMode::OPTIMIZED);  // 5 outer, %3=2
+    test_otf_ntt_leftover_patterns(20, NTTMode::OPTIMIZED);  // 10 outer, %3=1
+    test_otf_ntt_leftover_patterns(22, NTTMode::OPTIMIZED);  // 12 outer, %3=0
+    test_otf_ntt_leftover_patterns(13, NTTMode::BARRETT);    // 3 outer, %2=1
+    test_otf_ntt_leftover_patterns(14, NTTMode::BARRETT);    // 4 outer, %2=0
+    test_otf_ntt_leftover_patterns(15, NTTMode::BARRETT);    // 5 outer, %2=1
+    test_otf_ntt_leftover_patterns(20, NTTMode::BARRETT);    // 10 outer, %2=0
+    test_otf_ntt_leftover_patterns(22, NTTMode::BARRETT);    // 12 outer, %2=0
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

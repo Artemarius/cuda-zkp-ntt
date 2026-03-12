@@ -215,11 +215,161 @@ static void ensure_twiddles_4step(size_t n) {
     s_cached_n_4step = n;
 }
 
+// OTF stage root upload function (defined in ntt_optimized.cu)
+extern void otf_upload_roots(const FpElement* roots, int num_roots, const FpElement* consts);
+
 static int compute_log2(size_t n) {
     int log_n = 0;
     size_t tmp = n;
     while (tmp > 1) { tmp >>= 1; ++log_n; }
     return log_n;
+}
+
+// ─── OTF Stage Root Cache ────────────────────────────────────────────────────
+// Per-stage roots of unity for on-the-fly twiddle computation.
+// stage_roots[s] = omega_n^(n / 2^(s+1)) = primitive 2^(s+1)-th root of unity.
+// Computed via repeated squaring starting from omega_n.
+
+static FpElement s_otf_fwd_roots[32];           // forward Montgomery
+static FpElement s_otf_inv_roots[32];           // inverse Montgomery
+static FpElement s_otf_fwd_consts[3];           // omega_4, omega_8, omega_8^3 (Montgomery)
+static FpElement s_otf_inv_consts[3];           // their inverses (Montgomery)
+static size_t    s_otf_cached_n_mont = 0;
+
+static FpElement s_otf_fwd_roots_barrett[32];   // forward Barrett (standard form)
+static FpElement s_otf_inv_roots_barrett[32];   // inverse Barrett
+static FpElement s_otf_fwd_consts_barrett[3];   // omega_4, omega_8, omega_8^3 (standard)
+static FpElement s_otf_inv_consts_barrett[3];   // their inverses (standard)
+static size_t    s_otf_cached_n_barrett = 0;
+
+static void ensure_otf_roots_montgomery(size_t n) {
+    if (s_otf_cached_n_mont == n) return;
+
+    int log_n = compute_log2(n);
+
+    ff_ref::FpRef omega     = ff_ref::get_root_of_unity(n);   // Montgomery form
+    ff_ref::FpRef omega_inv = ff_ref::fp_inv(omega);
+
+    // Forward stage roots: stage_root[log_n-1] = omega_n, then square down
+    ff_ref::FpRef root = omega;
+    for (int s = log_n - 1; s >= 0; --s) {
+        root.to_u32(s_otf_fwd_roots[s].limbs);
+        root = ff_ref::fp_sqr(root);
+    }
+
+    // Inverse stage roots: same but starting from omega_n^{-1}
+    root = omega_inv;
+    for (int s = log_n - 1; s >= 0; --s) {
+        root.to_u32(s_otf_inv_roots[s].limbs);
+        root = ff_ref::fp_sqr(root);
+    }
+
+    // Fixed field constants (independent of n, but compute once)
+    ff_ref::FpRef omega_4   = ff_ref::get_root_of_unity(4);
+    ff_ref::FpRef omega_8   = ff_ref::get_root_of_unity(8);
+    ff_ref::FpRef omega_8_3 = ff_ref::fp_mul(omega_8, ff_ref::fp_sqr(omega_8));
+
+    omega_4.to_u32(s_otf_fwd_consts[0].limbs);
+    omega_8.to_u32(s_otf_fwd_consts[1].limbs);
+    omega_8_3.to_u32(s_otf_fwd_consts[2].limbs);
+
+    ff_ref::FpRef omega_4_inv   = ff_ref::fp_inv(omega_4);
+    ff_ref::FpRef omega_8_inv   = ff_ref::fp_inv(omega_8);
+    ff_ref::FpRef omega_8_3_inv = ff_ref::fp_inv(omega_8_3);
+
+    omega_4_inv.to_u32(s_otf_inv_consts[0].limbs);
+    omega_8_inv.to_u32(s_otf_inv_consts[1].limbs);
+    omega_8_3_inv.to_u32(s_otf_inv_consts[2].limbs);
+
+    s_otf_cached_n_mont = n;
+}
+
+static void ensure_otf_roots_barrett(size_t n) {
+    if (s_otf_cached_n_barrett == n) return;
+
+    int log_n = compute_log2(n);
+
+    ff_ref::FpRef omega     = ff_ref::get_root_of_unity(n);   // Montgomery form
+    ff_ref::FpRef omega_inv = ff_ref::fp_inv(omega);
+
+    // Forward: compute in Montgomery, convert each root to standard form
+    ff_ref::FpRef root = omega;
+    for (int s = log_n - 1; s >= 0; --s) {
+        ff_ref::FpRef root_std = ff_ref::from_montgomery(root);
+        root_std.to_u32(s_otf_fwd_roots_barrett[s].limbs);
+        root = ff_ref::fp_sqr(root);
+    }
+
+    // Inverse
+    root = omega_inv;
+    for (int s = log_n - 1; s >= 0; --s) {
+        ff_ref::FpRef root_std = ff_ref::from_montgomery(root);
+        root_std.to_u32(s_otf_inv_roots_barrett[s].limbs);
+        root = ff_ref::fp_sqr(root);
+    }
+
+    // Fixed constants in standard form
+    ff_ref::FpRef omega_4   = ff_ref::get_root_of_unity(4);
+    ff_ref::FpRef omega_8   = ff_ref::get_root_of_unity(8);
+    ff_ref::FpRef omega_8_3 = ff_ref::fp_mul(omega_8, ff_ref::fp_sqr(omega_8));
+
+    ff_ref::FpRef omega_4_std   = ff_ref::from_montgomery(omega_4);
+    ff_ref::FpRef omega_8_std   = ff_ref::from_montgomery(omega_8);
+    ff_ref::FpRef omega_8_3_std = ff_ref::from_montgomery(omega_8_3);
+
+    omega_4_std.to_u32(s_otf_fwd_consts_barrett[0].limbs);
+    omega_8_std.to_u32(s_otf_fwd_consts_barrett[1].limbs);
+    omega_8_3_std.to_u32(s_otf_fwd_consts_barrett[2].limbs);
+
+    ff_ref::FpRef omega_4_inv_std   = ff_ref::from_montgomery(ff_ref::fp_inv(omega_4));
+    ff_ref::FpRef omega_8_inv_std   = ff_ref::from_montgomery(ff_ref::fp_inv(omega_8));
+    ff_ref::FpRef omega_8_3_inv_std = ff_ref::from_montgomery(ff_ref::fp_inv(omega_8_3));
+
+    omega_4_inv_std.to_u32(s_otf_inv_consts_barrett[0].limbs);
+    omega_8_inv_std.to_u32(s_otf_inv_consts_barrett[1].limbs);
+    omega_8_3_inv_std.to_u32(s_otf_inv_consts_barrett[2].limbs);
+
+    s_otf_cached_n_barrett = n;
+}
+
+// Guard: skip OTF uploads during CUDA Graph capture
+// (cudaMemcpyToSymbol is not stream-ordered and cannot be captured)
+static bool s_in_graph_capture = false;
+
+// Upload OTF roots to constant memory before dispatch
+static void upload_otf_montgomery_fwd(size_t n) {
+    if (s_in_graph_capture) return;
+    ensure_otf_roots_montgomery(n);
+    otf_upload_roots(s_otf_fwd_roots, compute_log2(n), s_otf_fwd_consts);
+}
+
+static void upload_otf_montgomery_inv(size_t n) {
+    if (s_in_graph_capture) return;
+    ensure_otf_roots_montgomery(n);
+    otf_upload_roots(s_otf_inv_roots, compute_log2(n), s_otf_inv_consts);
+}
+
+static void upload_otf_barrett_fwd(size_t n) {
+    if (s_in_graph_capture) return;
+    ensure_otf_roots_barrett(n);
+    otf_upload_roots(s_otf_fwd_roots_barrett, compute_log2(n), s_otf_fwd_consts_barrett);
+}
+
+static void upload_otf_barrett_inv(size_t n) {
+    if (s_in_graph_capture) return;
+    ensure_otf_roots_barrett(n);
+    otf_upload_roots(s_otf_inv_roots_barrett, compute_log2(n), s_otf_inv_consts_barrett);
+}
+
+// Upload correct OTF roots for a given (mode, forward) configuration
+static void upload_otf_for_mode(size_t n, NTTMode mode, bool forward) {
+    if (mode == NTTMode::OPTIMIZED || mode == NTTMode::NAIVE) {
+        if (forward) upload_otf_montgomery_fwd(n);
+        else         upload_otf_montgomery_inv(n);
+    } else if (mode == NTTMode::BARRETT) {
+        if (forward) upload_otf_barrett_fwd(n);
+        else         upload_otf_barrett_inv(n);
+    }
 }
 
 static void ensure_twiddles(size_t n) {
@@ -467,6 +617,7 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         case NTTMode::OPTIMIZED: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles(n);
+            upload_otf_montgomery_fwd(n);
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
@@ -478,6 +629,7 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
+            upload_otf_barrett_fwd(n);
             // No Montgomery conversion — Barrett operates in standard form
             ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
             break;
@@ -489,6 +641,7 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             // For smaller sizes, fall back to Barrett (same arithmetic, no conversion overhead).
             if (n < (1u << 16)) {
                 ensure_twiddles_barrett(n);
+                upload_otf_barrett_fwd(n);
                 ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
             } else {
                 ensure_twiddles_4step(n);
@@ -525,6 +678,7 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         case NTTMode::OPTIMIZED: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles(n);
+            upload_otf_montgomery_inv(n);
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
@@ -536,6 +690,7 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
+            upload_otf_barrett_inv(n);
             // No Montgomery conversion — Barrett operates in standard form
             ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             break;
@@ -544,6 +699,7 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             assert(n >= 2 && (n & (n - 1)) == 0);
             if (n < (1u << 16)) {
                 ensure_twiddles_barrett(n);
+                upload_otf_barrett_inv(n);
                 ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             } else {
                 ensure_twiddles_4step(n);
@@ -570,6 +726,7 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         case NTTMode::OPTIMIZED: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles(n);
+            upload_otf_montgomery_fwd(n);
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t total = static_cast<uint32_t>(batch_size) * N;
             uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
@@ -587,6 +744,7 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
+            upload_otf_barrett_fwd(n);
             ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
             break;
         }
@@ -594,6 +752,7 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             assert(n >= 2 && (n & (n - 1)) == 0);
             if (n < (1u << 16)) {
                 ensure_twiddles_barrett(n);
+                upload_otf_barrett_fwd(n);
                 ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
             } else {
                 ensure_twiddles_4step(n);
@@ -618,6 +777,7 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         case NTTMode::OPTIMIZED: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles(n);
+            upload_otf_montgomery_inv(n);
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t total = static_cast<uint32_t>(batch_size) * N;
             uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
@@ -630,6 +790,7 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
+            upload_otf_barrett_inv(n);
             ntt_inverse_batch_barrett(d_data, batch_size, n,
                 s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             break;
@@ -638,6 +799,7 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             assert(n >= 2 && (n & (n - 1)) == 0);
             if (n < (1u << 16)) {
                 ensure_twiddles_barrett(n);
+                upload_otf_barrett_inv(n);
                 ntt_inverse_batch_barrett(d_data, batch_size, n,
                     s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
             } else {
@@ -717,6 +879,10 @@ static cudaGraphExec_t capture_ntt_graph(
         ensure_twiddles(n);
     }
 
+    // Upload OTF roots before capture (cudaMemcpyToSymbol is not capturable)
+    upload_otf_for_mode(n, mode, forward);
+
+    s_in_graph_capture = true;
     CUDA_CHECK(cudaStreamBeginCapture(s_capture_stream, cudaStreamCaptureModeRelaxed));
 
     if (batch_size <= 1) {
@@ -733,6 +899,7 @@ static cudaGraphExec_t capture_ntt_graph(
 
     cudaGraph_t graph;
     CUDA_CHECK(cudaStreamEndCapture(s_capture_stream, &graph));
+    s_in_graph_capture = false;
 
     cudaGraphExec_t graphExec;
     CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
@@ -752,6 +919,8 @@ void ntt_forward_graph(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t s
         s_graph_cache.push_back({d_data, N, 1, mode, true, ge});
         entry = &s_graph_cache.back();
     }
+    // OTF roots must be in constant memory before graph replay
+    upload_otf_for_mode(n, mode, true);
     CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
 }
 
@@ -766,6 +935,7 @@ void ntt_inverse_graph(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t s
         s_graph_cache.push_back({d_data, N, 1, mode, false, ge});
         entry = &s_graph_cache.back();
     }
+    upload_otf_for_mode(n, mode, false);
     CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
 }
 
@@ -781,6 +951,7 @@ void ntt_forward_batch_graph(FpElement* d_data, int batch_size, size_t n,
         s_graph_cache.push_back({d_data, N, batch_size, mode, true, ge});
         entry = &s_graph_cache.back();
     }
+    upload_otf_for_mode(n, mode, true);
     CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
 }
 
@@ -796,6 +967,7 @@ void ntt_inverse_batch_graph(FpElement* d_data, int batch_size, size_t n,
         s_graph_cache.push_back({d_data, N, batch_size, mode, false, ge});
         entry = &s_graph_cache.back();
     }
+    upload_otf_for_mode(n, mode, false);
     CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
 }
 

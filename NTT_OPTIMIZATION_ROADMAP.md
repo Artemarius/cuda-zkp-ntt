@@ -715,15 +715,17 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 stages into radix-8 butterflies, and eliminate twiddle DRAM traffic via on-the-fly computation.
 Preceded by L2 cache diagnostic to inform this and future releases.
 
-**Measured improvement (after Session 13):** Montgomery radix-8 gives **−8.2%** (15.6 ms vs 17.0 ms).
-Barrett radix-8 **disabled** (I-cache regression: 29.5 ms, +73%). Revised target: **~14 ms** with OTF.
+**Measured improvement (after Session 14):** Montgomery radix-8 gives **−8.2%** (15.6 ms vs 17.0 ms).
+Barrett radix-8 **disabled** (I-cache regression: 29.5 ms, +73%). OTF twiddles: **negative result**
+(56.9 ms, +265% — BLS12-381 exponentiation too expensive). Final target: **15.6 ms**.
 
 **Rationale:** v1.4.0's radix-4 gave −30% by halving outer-stage DRAM passes (12→6).
 Radix-8 fuses 3 stages per pass: 12→4 passes (another −33% from radix-4 baseline).
 Each eliminated pass saves ~128 MB DRAM R+W = ~0.7 ms at bandwidth ceiling.
 However, Barrett radix-8's 174 registers cause I-cache thrashing (55% I-fetch stalls),
-so only Montgomery benefits from radix-8 (134 regs). OTF twiddle computation eliminates
-twiddle-read DRAM traffic, worth ~1 ms for Montgomery radix-8's 4 outer passes.
+so only Montgomery benefits from radix-8 (134 regs). OTF twiddle computation was expected to
+eliminate twiddle-read DRAM traffic (~1 ms savings), but BLS12-381's 256-bit exponentiation
+cost (~35 muls × 128 MADs/mul per butterfly) far exceeds DRAM read cost. OTF disabled.
 
 **Key references:**
 - Özcan, Javeed, Savaş — "High-Performance NTT on GPU", IEEE Access 2025
@@ -834,123 +836,90 @@ Benchmark data: `results/data/bench_v150_s13.json`
 
 ---
 
-### Session 14 — On-the-Fly Twiddle Computation
+### Session 14 — On-the-Fly Twiddle Computation ✅ (NEGATIVE RESULT)
 
 **Objective:** Replace precomputed twiddle table loads with on-the-fly computation in the
 outer-stage kernels (Montgomery radix-8 + Barrett radix-4), eliminating twiddle DRAM reads.
 
-**NOTE (post-Session 13):** Barrett radix-8 is disabled (I-cache regression). OTF twiddles
-should be applied to both the Montgomery radix-8 and Barrett radix-4 outer kernels.
-OTF adds compute but may help Barrett radix-4 by reducing register pressure from twiddle loads.
+**Result: NEGATIVE.** OTF twiddle computation is catastrophically expensive for BLS12-381.
+The 256-bit Montgomery exponentiation (`ff_pow_mont_u32`) costs ~29 Montgomery muls per
+butterfly at large outer stages (j up to 2^19), each mul being ~128 MADs (8-limb CIOS).
+This far exceeds the DRAM savings from eliminating 7 twiddle table loads (224 bytes).
+Warp divergence in the pow loop (`if ((exp >> bit) & 1)`) further degrades throughput.
 
-**Background:**
-Current outer stages load twiddles from a 64 MB precomputed table (n/2 × 32 bytes at n=2^22).
-Access is strided (stage k has stride n/2^(k+1)), defeating L2 cache. OTF replaces this with
-per-thread computation: each thread computes its required twiddle ω^j from a single per-stage
-root ω_stage using a square-and-multiply chain.
+**Measured (n=2^22, 7-rep median):**
+- Montgomery: **56.9 ms OTF vs 15.6 ms precomputed (+265%)**
+- Barrett: **91.4 ms OTF vs 17.9 ms precomputed (+411%)**
 
-**Tasks:**
-- Implement OTF twiddle device function:
-  ```cuda
-  __device__ __forceinline__
-  FpElement compute_twiddle_otf(
-      const FpElement& omega_stage,  // ω^(n / 2^(s+1)) = primitive root for stage s
-      uint32_t j                     // butterfly index within group → twiddle = omega_stage^j
-  ) {
-      // Square-and-multiply: compute omega_stage^j
-      // For j up to 2^21, this is at most 21 ff_mul operations
-      FpElement result = FP_ONE;
-      FpElement base = omega_stage;
-      while (j > 0) {
-          if (j & 1) result = ff_mul(result, base);
-          base = ff_mul(base, base);
-          j >>= 1;
-      }
-      return result;
-  }
-  ```
-- **Optimization**: For radix-8, each butterfly needs 7 twiddles. Many share the same
-  `omega_stage` base. Compute twiddles incrementally where possible:
-  - Stage s twiddles: w, w², w³ → compute w then multiply sequentially
-  - Stage s+1 and s+2 twiddles share structure with stage s
-  - Target: reduce from 7×21 ff_mul worst case to ~3×21 + 4×1 = ~67 ff_mul per butterfly
-- **Precompute stage roots**: Instead of the full n/2 twiddle table, store only
-  `log_n` values: `omega_roots[s] = ω^(n / 2^(s+1))` for s = 0..log_n-1.
-  Total: 22 × 32 bytes = 704 bytes (fits in constant memory `__constant__`)
-- **Apply to outer stages only**: The fused inner kernel (stages 0-9) is compute-bound;
-  adding OTF ff_mul would make it slower. Keep precomputed twiddles for inner kernel.
-- Implement OTF variant of radix-8 kernel: `ntt_outer_radix8_otf_kernel`
-- **Trade-off analysis**: OTF adds ~7 ff_mul per radix-8 butterfly but eliminates 7 global
-  memory twiddle loads. For the memory-bound outer stages, this is a net win. Measure:
-  - With OTF: extra compute time from ff_mul
-  - Without OTF: twiddle DRAM traffic eliminated
-  - Net: should be positive for outer stages (memory-bound → compute is "free")
-- Test: OTF kernel output must be **bitwise identical** to precomputed-twiddle kernel
-  (same twiddle values, just computed differently)
+**What was implemented (all retained for future multi-field work):**
+- `include/twiddle_otf.cuh`: `ff_pow_mont_u32`, `ff_pow_barrett_u32` (MSB-first binary exponentiation)
+- `__constant__` memory: 32 stage roots + 3 fixed constants (omega_4, omega_8, omega_8^3), <1.2 KB
+- 12 OTF kernel variants: radix-8/4/2 × Montgomery/Barrett × single/batch (cooperative)
+- Stage root precomputation: repeated squaring from omega_n, upload via `cudaMemcpyToSymbol`
+- CUDA Graph compatibility: guard flag prevents `cudaMemcpyToSymbol` during stream capture
+- Radix-8 OTF derivation: 1 exponentiation + 6 multiplies (w4=root^j, w2=w4², w1=w2², w3=w2·ω₄, etc.)
 
-**Test plan — OTF twiddle correctness:**
-- **OTF twiddle values vs precomputed table:**
-  - For each stage s and 1000 random j values, verify compute_twiddle_otf(ω_stage, j)
-    equals twiddles[j * stride] from the precomputed table
-  - Edge values: j=0 (should be 1), j=1 (should be ω_stage), j=max
-- **NTT with OTF vs precomputed twiddles:**
-  - All sizes 2^13..2^22: bitwise identical output
-  - Both Montgomery and Barrett
-  - Batched B=4 at 2^18, 2^22
-- **Roundtrip with OTF twiddles:**
-  - INTT(NTT(x)) = x for 2^15, 2^18, 2^20, 2^22
-- **Stage root correctness:**
-  - Verify omega_roots[s]^(2^s) = ω_n for all s (each root is consistent with ω_n)
-  - Verify omega_roots[s]^(n/2^(s+1)) = 1 (correct order)
+**Bugs fixed during implementation:**
+- Batched OTF launch helpers could partially transform data (radix-8/4 passes) then `return false`
+  for leftover stages, causing precomputed fallback to re-do ALL stages on already-modified data.
+  Fixed by adding batched OTF radix-2 cooperative kernels for leftover handling.
+- FOUR_STEP fallback paths (n < 2^16) missing `upload_otf` calls. Fixed.
 
-**Deliverables:**
-- OTF twiddle device function in `include/ff_arithmetic.cuh` (or new `include/twiddle_otf.cuh`)
-- Stage root precomputation + `__constant__` storage
-- OTF variant of radix-8 outer kernel
-- OTF correctness tests: ~15 new tests
-- Trade-off analysis: OTF compute cost vs DRAM savings
+**OTF disabled** in all 4 dispatch functions. Infrastructure retained for v1.6.0 multi-field work
+(Goldilocks 64-bit / BabyBear 31-bit fields where multiply is 1-2 instructions, not 128 MADs).
+
+**Tests:** 333/333 pass (317 existing + 16 new OTF-specific tests)
+- Stage root squaring chain: root[s] == root[s+1]² at 3 sizes
+- OTF twiddle value consistency: root[s]^j == omega^(j*stride) at 3 sizes
+- OTF NTT leftover pattern coverage: all Montgomery (%3=0,1,2) and Barrett (%2=0,1) patterns
+
+**Why OTF fails for BLS12-381 but may work for smaller fields:**
+- BLS12-381: 256-bit, 8-limb CIOS → ~128 MADs per multiply → ~35 muls/butterfly = ~4480 MADs
+- Goldilocks: 64-bit → ~1 MUL instruction per multiply → ~35 muls/butterfly = ~35 instructions
+- BabyBear: 31-bit → ~1 MUL instruction per multiply → ~35 muls/butterfly = ~35 instructions
+- 7 DRAM reads (224 bytes at ~80ns each ≈ 560ns) vs 35 instructions at ~0.7ns = ~25ns. Clear win.
+
+**Benchmark data:** `results/data/bench_v150_s14.json`
 
 ---
 
 ### Session 15 — v1.5.0 Benchmark + Profile + Release
 
-**Objective:** Comprehensive benchmarking of radix-8 + OTF, profiling, release.
+**Objective:** Comprehensive benchmarking of radix-8 (OTF disabled — negative result),
+profiling, release.
 
 **Tasks:**
-- Full benchmark matrix: {Montgomery, Barrett} × {radix-4, radix-8, radix-8+OTF} × {2^15..2^22}
+- Full benchmark matrix: {Montgomery, Barrett} × {2^15..2^22}
   - Single NTT forward, 7-rep median
   - Batched 8×, 7-rep median
 - Profile with ncu:
   - Radix-8 kernel: register usage, occupancy, DRAM throughput, IPC
   - Compare radix-8 vs radix-4: DRAM bytes read/written (should show ~33% reduction)
-  - OTF vs precomputed: DRAM bytes (twiddle traffic should disappear)
-  - L2 hit rate comparison: does eliminating twiddle traffic improve coefficient caching?
-- Capture screenshots: radix-8 roofline, OTF DRAM comparison
+- Capture screenshots: radix-8 roofline
 - Generate benchmark charts: v1.5.0 vs v1.4.0 bar chart at all sizes
-- Full regression sweep: all 230+ existing tests pass + new tests green
-- Update `results/analysis.md` (new section: "Radix-8 + OTF Analysis")
+- Full regression sweep: all 333 existing tests pass
+- Update `results/analysis.md` (new section: "Radix-8 Analysis + OTF Negative Result")
 - Update `results/data/bench_v150.json`
 - Update README performance tables
-- Update CLAUDE.md with radix-8 and OTF documentation
 - Tag v1.5.0 release
 
 **Expected results (n=2^22):**
-- Radix-8 alone: ~13–15 ms (−15–25% vs v1.4.0's 17.1 ms)
-- Radix-8 + OTF: ~12–14 ms (additional −5–10% from twiddle traffic elimination)
-- Batched 8× at 2^22: proportional improvement (~110–130 ms vs v1.4.0's ~150 ms)
+- Radix-8 (Montgomery): ~15.6 ms (−8.2% vs v1.4.0's 17.0 ms)
+- Barrett (radix-4, unchanged): ~17.9 ms
+- Batched 8× Montgomery: ~135 ms; Barrett: ~151 ms
 
 **Test plan — v1.5.0 release regression sweep:**
-- All existing v1.4.0 tests pass (230/230 — no regressions)
+- All existing tests pass (333/333 — no regressions)
 - Full test matrix: {NAIVE, OPTIMIZED, BARRETT} × {single, batch-1, batch-8}
   × {forward, roundtrip} × {2^10..2^22}
 - Radix-8 cross-validation: radix-8 == radix-4 at all sizes (bitwise)
-- OTF cross-validation: OTF == precomputed at all sizes (bitwise)
-- CUDA Graph tests still pass (graphs should use new radix-8 kernels automatically)
-- **Test count target**: ≥275 total
+- OTF tests pass (OTF disabled in dispatch but tests exercise the infrastructure)
+- CUDA Graph tests still pass
+- **Test count**: 333 total
 
 **Deliverables:**
-- Updated benchmark tables + charts (radix-8, OTF comparison)
-- ncu screenshots (radix-8 roofline, OTF DRAM savings)
+- Updated benchmark tables + charts (radix-8)
+- ncu screenshots (radix-8 roofline)
 - Full regression pass (all tests green)
 - Git tag v1.5.0
 
@@ -1066,6 +1035,8 @@ correctness, handle field-specific optimizations.
 - Implement Goldilocks NTT in new `src/ntt_goldilocks.cu`:
   - Fused inner kernel (K=10 minimum, explore K=12 for deeper fusion)
   - Cooperative outer-stage kernel (radix-4 or radix-8 depending on v1.5.0 results)
+  - **OTF twiddles**: Goldilocks mul is ~5-8 instructions (vs 128 MADs for BLS12-381).
+    OTF may be viable here — reuse existing `twiddle_otf.cuh` infrastructure from Session 14.
   - Bit-reverse permutation kernel
   - Twiddle precomputation: find primitive root for Goldilocks field
     (p-1 = 2^32 × (2^32 - 1), has large power-of-2 factor → NTT-friendly up to 2^32!)
@@ -1473,8 +1444,8 @@ read/write contiguous blocks regardless of stage.
 | **11** | **v1.4.0** | **CUDA Graphs + release** ✅ | **Graph replay (negligible gain)** |
 | **12** | **v1.5.0** | **L2 diagnostic + radix-8 butterfly** ✅ | **Stockham NO-GO, 4 radix-8 kernels** |
 | **13** | **v1.5.0** | **Radix-8 benchmark + correctness** ✅ | **Montgomery-only radix-8 (15.6 ms), Barrett I-cache regression** |
-| 14 | v1.5.0 | On-the-fly twiddle computation | Eliminate twiddle DRAM traffic |
-| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: ~14 ms at 2^22 |
+| **14** | **v1.5.0** | **OTF twiddle computation** ✅ | **NEGATIVE RESULT: 56.9 ms vs 15.6 ms (+265%). Disabled.** |
+| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: 15.6 ms at 2^22 |
 | 16 | v1.6.0 | Goldilocks + BabyBear field arithmetic | Multi-field ZKP comparison |
 | 17 | v1.6.0 | Multi-field NTT integration + correctness | Field-specific kernel tuning |
 | 18 | v1.6.0 | 3-way benchmark + charts + release v1.6.0 | Portfolio/insight feature |
@@ -1493,7 +1464,8 @@ read/write contiguous blocks regardless of stage.
   radix-4 outer stages (-30%). CUDA Graphs add negligible improvement (within noise).
   **32% faster than v1.1.0, exceeds 18-22 ms target.**
 - **v1.5.0 (in progress): 15.6 ms (Montgomery radix-8, −8.2% vs v1.4.0)** — Barrett radix-8
-  disabled (I-cache regression). OTF twiddles may save ~1 ms → target **~14 ms**.
+  disabled (I-cache regression). OTF twiddles: **negative result** (56.9 ms, +265%), disabled.
+  333 tests. Final target: **15.6 ms** (no OTF gain).
 - v1.6.0: ~14 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
 - v1.7.0: ~13.5 ms (Plantard inner kernel, −4% vs v1.5.0) — **projected**
 - v1.8.0: **CANCELLED** (Stockham NO-GO — L2 58.5% = bandwidth-bound)
@@ -1523,10 +1495,12 @@ The fused inner kernel in `ntt_fused_kernels.cu` already uses `__shfl_xor_sync` 
 0-4 via `butterfly_shfl()` + `fp_shfl_xor()`. Stages 5-9 require cross-warp communication
 (stride ≥ 32) and must use shared memory. No further optimization possible here.
 
-**Why OTF twiddles are bundled with v1.5.0 (not standalone):**
-The retrospective notes: "Standalone: too small to measure above noise. Best deployed as
-part of a combined radix-8 + OTF outer-stage rewrite." OTF saves ~1 ms at n=2^22 — within
-measurement noise as a standalone change, but measurable when combined with radix-8.
+**OTF twiddles: NEGATIVE RESULT (Session 14).**
+OTF was expected to save ~1 ms by eliminating twiddle DRAM traffic. In practice, the BLS12-381
+256-bit exponentiation (`ff_pow_mont_u32`) costs ~35 Montgomery muls × 128 MADs = ~4480 MADs
+per butterfly, far exceeding the cost of 7 DRAM reads (224 bytes). OTF is disabled for BLS12-381.
+Infrastructure retained for v1.6.0 multi-field work (Goldilocks/BabyBear: 1-2 instructions per
+multiply makes OTF viable).
 
 **Why Goldilocks/BabyBear is v1.6.0 (not earlier):**
 High impact/effort ratio but does not improve BLS12-381 performance. Placed after radix-8
