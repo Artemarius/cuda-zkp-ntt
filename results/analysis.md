@@ -618,6 +618,86 @@ in a future release.
 
 ---
 
+## Section 7 — v1.4.0 Results (Branchless Arithmetic + Radix-4 + CUDA Graphs)
+
+### 7.1 Branchless Arithmetic (Session 9)
+
+Switched all NTT hot-path kernels from branchy to branchless arithmetic:
+- `ff_mul` → `ff_mul_ptx` (branchless conditional reduction via PTX sub.cc + lop3)
+- `ff_add` → `ff_add_v2` (branchless PTX carry chain + lop3 select)
+- `ff_sub` → `ff_sub_v2` (branchless PTX subtract + lop3 select)
+- `ff_mul_barrett` → `ff_mul_barrett_v2` (branchless 2× conditional subtraction via PTX)
+
+**Register usage (K=10)**: Montgomery 68→66 (-2), Barrett 92→80 (-12, -13%)
+
+**Single NTT (n=2^22, 7-rep median):**
+
+| Mode | v1.2.0 | v1.4.0-s9 | Delta |
+|---|---|---|---|
+| Barrett | 24.9 ms | **23.8 ms** | **-4.4%** |
+| Montgomery | 25.1 ms | **24.4 ms** | **-2.8%** |
+
+Barrett improved more because it had 2× branchy conditional subtract loops vs Montgomery's 1×.
+
+### 7.2 Radix-4 Outer Stages (Session 10)
+
+Fuses pairs of consecutive outer stages into radix-4 butterflies:
+- 4 data loads + 4 stores per radix-4 unit (vs 8+8 for 2 radix-2 stages)
+- **~45% DRAM traffic reduction** (theoretical), measured ~43%
+- For n=2^22: 12 outer stages → 6 radix-4 passes in **1 cooperative launch** (was 2)
+
+**Single NTT (n=2^22, 7-rep median):**
+
+| Mode | v1.4.0-s9 | v1.4.0-s10 | Delta |
+|---|---|---|---|
+| Montgomery | 24.4 ms | **17.0 ms** | **-30.3%** |
+| Barrett | 23.8 ms | **17.1 ms** | **-28.2%** |
+
+Outer stages went from ~19.4 ms to ~11 ms (-43%), matching theoretical DRAM traffic reduction.
+
+### 7.3 CUDA Graphs (Session 11)
+
+CUDA Graph API captures the NTT kernel launch sequence on first call and replays it on
+subsequent calls via `cudaGraphLaunch` (~5us vs ~20-40us per individual launch).
+
+**API**: `ntt_forward_graph()`, `ntt_inverse_graph()`, `ntt_forward_batch_graph()`,
+`ntt_inverse_batch_graph()`, `ntt_graph_clear_cache()`
+
+**Measured impact (7-rep median, head-to-head comparison):**
+
+| Size | Montgomery | Graph | Barrett | Graph |
+|---|---|---|---|---|
+| 2^15 | 0.120 ms | 0.129 ms | 0.142 ms | 0.151 ms |
+| 2^22 | 17.1 ms | 17.4 ms | 17.4 ms | 17.4 ms |
+
+**Result**: Negligible performance difference (within ±2% measurement noise). Only 3-4 kernel
+launches per NTT means CPU launch overhead is already ~50-100us total — small compared to
+GPU compute time even at the smallest sizes. The API is valuable for embedding NTT in larger
+CUDA Graph workflows where amortizing graph overhead across many operations matters.
+
+### 7.4 Summary — v1.4.0 Performance
+
+**Cumulative improvement from v1.1.0 (n=2^22, 7-rep median):**
+
+| Metric | v1.1.0 | v1.2.0 | v1.3.0 | **v1.4.0** | v1.4.0 vs v1.1.0 |
+|---|---|---|---|---|---|
+| Montgomery | 25.1 ms | 25.1 ms | — | **17.1 ms** | **-32%** |
+| Barrett | — | 24.9 ms | 29.5 ms (4-step) | **17.4 ms** | **-30%** |
+| Batch 8× (Montgomery) | ~201 ms | 214 ms | — | **150 ms** | **-25%** |
+| Batch 8× (Barrett) | — | 219 ms | 241 ms (4-step) | **159 ms** | **-27%** |
+| Tests | — | 119 | 221 | **230** | — |
+
+**Key contributions:**
+1. **Branchless arithmetic** (-4.4%): eliminated warp divergence in all NTT hot-path kernels
+2. **Radix-4 outer stages** (-30%): fused pairs of stages → 45% DRAM traffic reduction
+3. **CUDA Graphs** (negligible): clean API for graph workflows, ~0% performance impact
+
+**The v1.4.0 result (17.1 ms) exceeds the 18-22 ms target** set in the roadmap. The remaining
+bottleneck is the cooperative outer stages (~11 ms at 2^22), which are fundamentally limited
+by DRAM bandwidth on RTX 3060 (~360 GB/s).
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)

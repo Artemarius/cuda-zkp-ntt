@@ -27,6 +27,19 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n,
 void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n,
                        NTTMode mode = NTTMode::OPTIMIZED, cudaStream_t stream = 0);
 
+// Graph-accelerated NTT: captures kernel sequence as CUDA Graph on first call,
+// replays on subsequent calls with same (d_data, n, mode) configuration.
+// Supported modes: NAIVE, OPTIMIZED, BARRETT (not FOUR_STEP — internal cudaMalloc).
+void ntt_forward_graph(FpElement* d_data, size_t n,
+                       NTTMode mode = NTTMode::BARRETT, cudaStream_t stream = 0);
+void ntt_inverse_graph(FpElement* d_data, size_t n,
+                       NTTMode mode = NTTMode::BARRETT, cudaStream_t stream = 0);
+void ntt_forward_batch_graph(FpElement* d_data, int batch_size, size_t n,
+                             NTTMode mode = NTTMode::BARRETT, cudaStream_t stream = 0);
+void ntt_inverse_batch_graph(FpElement* d_data, int batch_size, size_t n,
+                             NTTMode mode = NTTMode::BARRETT, cudaStream_t stream = 0);
+void ntt_graph_clear_cache();  // free all cached graphs
+
 // Precompute twiddle factors on device (call once per NTT size)
 FpElement* ntt_precompute_twiddles(size_t n);
 void       ntt_free_twiddles(FpElement* d_twiddles);

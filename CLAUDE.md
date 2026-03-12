@@ -89,12 +89,12 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
-  ntt.cuh             — NTT public interface (single + batched, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
+  ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
   pipeline.cuh        — AsyncNTTPipeline class interface
 
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
-  ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches
+  ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches + CUDA Graph cache
   ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer (Montgomery + Barrett)
   ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
   ntt_4step.cu        — 4-step NTT: transpose kernel, twiddle multiply, forward/inverse (single + batched)
@@ -163,11 +163,11 @@ LICENSE                — MIT License
 - Twiddle factors: precomputed table in global memory, cached in L1
 - For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
-### NTT Time Breakdown (n=2^22, v1.1.0 → v1.4.0-s10)
+### NTT Time Breakdown (n=2^22, v1.1.0 → v1.4.0)
 - Bit-reverse: ~0.3 ms (1%), Montgomery conversions: ~3.0 ms (12%)
 - Fused K=10 (stages 0-9): ~2.5 ms (10%) — **compute-bound** (69%, IPC 2.41)
-- Cooperative outer (stages 10-21): ~19.4 ms (77%) → **~11 ms (radix-4, v1.4.0-s10)**
-- v1.4.0-s10 total: **17.0 ms Montgomery / 17.1 ms Barrett** (was 25.2 ms in v1.1.0)
+- Cooperative outer (stages 10-21): ~19.4 ms (77%) → **~11 ms (radix-4, v1.4.0)**
+- v1.4.0 total: **17.1 ms Montgomery / 17.4 ms Barrett** (was 25.2 ms in v1.1.0, -32%)
 
 ### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
@@ -272,6 +272,17 @@ LICENSE                — MIT License
 - **Measured (n=2^22, 7-rep median):** Montgomery 24.4→**17.0 ms** (**-30.3%**),
   Barrett 23.8→**17.1 ms** (**-28.2%**). Outer stages ~19.4→~11 ms (-43%).
 
+### CUDA Graphs (v1.4.0 Session 11)
+- Captures NTT kernel launch sequence as CUDA Graph on first call, replays on subsequent calls
+- API: `ntt_forward_graph()`, `ntt_inverse_graph()`, `ntt_forward_batch_graph()`,
+  `ntt_inverse_batch_graph()`, `ntt_graph_clear_cache()`
+- Graph cache keyed by `(d_data, n, batch_size, mode, forward)`
+- Capture: `cudaStreamCaptureModeRelaxed` (allows occupancy queries during capture)
+- Supported modes: NAIVE, OPTIMIZED, BARRETT (not FOUR_STEP — internal cudaMalloc)
+- **Measured impact**: negligible (within ±2% noise). Only 3-4 kernel launches per NTT →
+  CPU launch overhead is already minimal compared to GPU compute time.
+- **Value**: clean API for embedding NTT in larger CUDA Graph workflows
+
 ---
 
 ## Phase Status
@@ -279,18 +290,13 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-Phases 1-8 complete. Current version: **v1.3.0** (v1.4.0 Session 10 complete).
+Phases 1-8 complete. Current version: **v1.4.0**.
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
-
-### In Progress
-- **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs (target: ~18-22 ms)
-  - Session 9 (complete): Branchless arithmetic → Barrett 23.8 ms at 2^22 (-4.4%)
-  - Session 10 (complete): Radix-4 outer stages → **17.0 ms Montgomery, 17.1 ms Barrett (-30%)**
-  - Session 11 (next): CUDA Graphs + final polish + release
+- **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
 
 ---
 

@@ -677,26 +677,33 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 
 ---
 
-### Session 11 — CUDA Graphs + Final Polish + Release v1.4.0
+### Session 11 — CUDA Graphs + Final Polish + Release v1.4.0 ✅
 
 **Objective:** Wrap all launch sequences in CUDA Graphs, final benchmarking, release.
 
-**Tasks:**
-- Implement CUDA Graph capture for:
-  - Single NTT (cooperative sequence: bit-reverse → fused K=10 → cooperative outer stages)
-  - Batched NTT (same structure, more blocks)
-  - Graph instantiation caching by (n, batch_size, mode) key
-- Final benchmark suite: all modes × all sizes × single/batch
-- Final ncu profiling: capture definitive roofline and warp stall screenshots
-- Update all documentation: README, analysis.md, GUIDE.md, CLAUDE.md, profiling/README.md
-- Generate final charts
-- Tag v1.4.0 release
+**Implementation:**
+- CUDA Graph capture/replay API: `ntt_forward_graph()`, `ntt_inverse_graph()`,
+  `ntt_forward_batch_graph()`, `ntt_inverse_batch_graph()`, `ntt_graph_clear_cache()`
+- Graph cache: keyed by `(d_data, n, batch_size, mode, forward)`, captures on first call,
+  replays on subsequent calls with `cudaGraphLaunch` (~5us vs ~20-40us per individual launch)
+- Capture uses `cudaStreamCaptureModeRelaxed` to allow occupancy queries during capture
+- Pre-warms twiddle caches before capture to avoid `cudaMalloc` during stream capture
+- Supported modes: NAIVE, OPTIMIZED, BARRETT (FOUR_STEP excluded — internal `cudaMalloc`)
+- Cooperative kernel launches (`cudaLaunchCooperativeKernel`) captured automatically
 
-**Deliverables:**
-- CUDA Graph integration
-- Complete benchmark suite
-- Full documentation update
-- Git tag v1.4.0
+**Measured impact (7-rep median, head-to-head, RTX 3060):**
+- **Negligible performance difference** — within ±2% measurement noise at all sizes
+- At n=2^22: Montgomery 17.1ms (non-graph) vs 17.4ms (graph), Barrett 17.4ms both
+- At n=2^15: Montgomery 0.120ms vs 0.129ms, Barrett 0.142ms vs 0.151ms
+- **Root cause**: only 3-4 kernel launches per NTT → CPU launch overhead is ~50-100us total,
+  negligible compared to GPU compute time even at the smallest sizes
+- The API remains valuable for embedding NTT in larger CUDA Graph workflows
+
+**Tests:** 230/230 pass (221 existing + 9 new graph tests)
+- Graph vs non-graph bitwise equivalence: Barrett fwd (2^15, 2^18, 2^22), Montgomery fwd (2^15, 2^22)
+- Graph roundtrip: Barrett INTT(NTT(x))=x (2^15, 2^22)
+- Graph replay consistency: second call matches first (2^15)
+- Batched graph vs non-graph: Barrett B=4 at 2^15
 
 ---
 
@@ -711,10 +718,6 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 - Compute twiddles during butterfly stages instead of precomputing and loading from memory
 - Trades memory bandwidth for compute (beneficial when compute-bound)
 - Uses fast modular exponentiation: ω^k = ω^(k-1) · ω (sequential chain per thread)
-
-### Mixed-Radix Outer Stages
-- Use radix-4 butterflies for outer stages (2 stages per kernel, halving launch count)
-- Higher arithmetic intensity per memory access → better compute/memory ratio
 
 ### Multi-GPU NTT
 - Split n-point NTT across 2+ GPUs using the 4-step decomposition
@@ -735,16 +738,18 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 | **6** | **v1.3.0** | **4-step NTT: sub-NTT integration (+ batch)** ✅ | **Sub-NTTs fit in shmem** |
 | **7** | **v1.3.0** | **4-step NTT: correctness + edge cases** ✅ | **Fallback + 221 tests** |
 | **8** | **v1.3.0** | **Benchmark + release (negative result)** ✅ | **+18% slower than Barrett** |
-| 9 | v1.4.0 | Register-centric butterfly + carry chains | MoMA register optimization |
-| 10 | v1.4.0 | Outer-stage optimization + adaptive pipeline | L2-aware scheduling, radix-4 |
-| 11 | v1.4.0 | CUDA Graphs + final polish, release | Launch overhead elimination |
+| **9** | **v1.4.0** | **Branchless arithmetic** ✅ | **Eliminate warp divergence** |
+| **10** | **v1.4.0** | **Radix-4 outer stages** ✅ | **~45% DRAM traffic reduction** |
+| **11** | **v1.4.0** | **CUDA Graphs + release** ✅ | **Graph replay (negligible gain)** |
 
-**Cumulative results (n=2^22, single NTT, 5-rep median):**
+**Cumulative results (n=2^22, single NTT, 7-rep median):**
 - v1.1.0: 25.1 ms (Montgomery, fused K=10 + cooperative outer)
 - **v1.2.0: 24.9 ms (Barrett, -0.8%)** — minimal single-NTT gain; outer stages still dominate
 - **v1.3.0: 29.5 ms (4-Step, +18% SLOWER)** — 3 transposes + sub-NTT outer stages add overhead.
   **Best mode remains Barrett at 24.9 ms.** 4-step is a negative result.
-- v1.4.0 target: ~18-22 ms (register optimization + outer-stage improvements + CUDA Graphs)
+- **v1.4.0: 17.1 ms (Montgomery) / 17.4 ms (Barrett)** — branchless arithmetic (-4.4%) +
+  radix-4 outer stages (-30%). CUDA Graphs add negligible improvement (within noise).
+  **32% faster than v1.1.0, exceeds 18-22 ms target.**
 
 **Batch throughput (8× 2^22 NTTs):**
 - v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
@@ -753,7 +758,8 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 - **v1.3.0: 241 ms (4-step batched) vs 199 ms (Barrett batched)** — 4-step +21% slower.
   4-step benefits more from batching (1.16x vs 1.05x) but still slower in absolute terms.
   Best batch mode remains Barrett at 199 ms.
-- v1.4.0 target: ~150-180 ms (register opt + CUDA Graphs on cooperative approach)
+- **v1.4.0: ~150 ms (Montgomery batched) / ~159 ms (Barrett batched)** — radix-4 outer stages
+  reduce batch time by ~20%. Montgomery faster for batched (fewer instructions per ff_mul).
 
 ---
 

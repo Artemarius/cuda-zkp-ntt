@@ -656,6 +656,160 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
     }
 }
 
+// ─── CUDA Graph Cache ────────────────────────────────────────────────────────
+// Captures NTT kernel launch sequences as CUDA Graphs for replay with minimal
+// CPU overhead (~5us vs ~20-40us for individual launches).
+
+struct NTTGraphEntry {
+    FpElement*      d_data;
+    uint32_t        n;
+    int             batch_size;   // 1 for single NTT
+    NTTMode         mode;
+    bool            forward;
+    cudaGraphExec_t graphExec;
+};
+
+static std::vector<NTTGraphEntry> s_graph_cache;
+static cudaStream_t s_capture_stream = nullptr;
+
+static NTTGraphEntry* find_graph_entry(
+    FpElement* d_data, uint32_t n, int batch_size, NTTMode mode, bool forward
+) {
+    for (auto& e : s_graph_cache) {
+        if (e.d_data == d_data && e.n == n && e.batch_size == batch_size &&
+            e.mode == mode && e.forward == forward) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+static void ensure_capture_stream() {
+    if (!s_capture_stream) {
+        CUDA_CHECK(cudaStreamCreate(&s_capture_stream));
+    }
+}
+
+// Pre-warm twiddle caches so ensure_twiddles* inside ntt_forward/ntt_inverse
+// are no-ops during capture (no cudaMalloc/cudaMemcpy).
+static void prewarm_twiddles(size_t n, NTTMode mode) {
+    switch (mode) {
+        case NTTMode::NAIVE:
+        case NTTMode::OPTIMIZED:
+            ensure_twiddles(n);
+            break;
+        case NTTMode::BARRETT:
+            ensure_twiddles_barrett(n);
+            break;
+        default:
+            break;
+    }
+}
+
+static cudaGraphExec_t capture_ntt_graph(
+    FpElement* d_data, size_t n, int batch_size, NTTMode mode, bool forward
+) {
+    ensure_capture_stream();
+    prewarm_twiddles(n, mode);
+
+    // Also pre-warm Montgomery twiddles if mode needs them
+    if (mode == NTTMode::OPTIMIZED || mode == NTTMode::NAIVE) {
+        ensure_twiddles(n);
+    }
+
+    CUDA_CHECK(cudaStreamBeginCapture(s_capture_stream, cudaStreamCaptureModeRelaxed));
+
+    if (batch_size <= 1) {
+        if (forward)
+            ntt_forward(d_data, n, mode, s_capture_stream);
+        else
+            ntt_inverse(d_data, n, mode, s_capture_stream);
+    } else {
+        if (forward)
+            ntt_forward_batch(d_data, batch_size, n, mode, s_capture_stream);
+        else
+            ntt_inverse_batch(d_data, batch_size, n, mode, s_capture_stream);
+    }
+
+    cudaGraph_t graph;
+    CUDA_CHECK(cudaStreamEndCapture(s_capture_stream, &graph));
+
+    cudaGraphExec_t graphExec;
+    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+
+    return graphExec;
+}
+
+void ntt_forward_graph(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream) {
+    assert(mode != NTTMode::FOUR_STEP && "FOUR_STEP not supported with CUDA Graphs (internal cudaMalloc)");
+    assert(mode != NTTMode::ASYNC && "ASYNC not supported with CUDA Graphs");
+    uint32_t N = static_cast<uint32_t>(n);
+
+    NTTGraphEntry* entry = find_graph_entry(d_data, N, 1, mode, true);
+    if (!entry) {
+        cudaGraphExec_t ge = capture_ntt_graph(d_data, n, 1, mode, true);
+        s_graph_cache.push_back({d_data, N, 1, mode, true, ge});
+        entry = &s_graph_cache.back();
+    }
+    CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
+}
+
+void ntt_inverse_graph(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream) {
+    assert(mode != NTTMode::FOUR_STEP && "FOUR_STEP not supported with CUDA Graphs (internal cudaMalloc)");
+    assert(mode != NTTMode::ASYNC && "ASYNC not supported with CUDA Graphs");
+    uint32_t N = static_cast<uint32_t>(n);
+
+    NTTGraphEntry* entry = find_graph_entry(d_data, N, 1, mode, false);
+    if (!entry) {
+        cudaGraphExec_t ge = capture_ntt_graph(d_data, n, 1, mode, false);
+        s_graph_cache.push_back({d_data, N, 1, mode, false, ge});
+        entry = &s_graph_cache.back();
+    }
+    CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
+}
+
+void ntt_forward_batch_graph(FpElement* d_data, int batch_size, size_t n,
+                             NTTMode mode, cudaStream_t stream) {
+    assert(mode != NTTMode::FOUR_STEP && "FOUR_STEP not supported with CUDA Graphs (internal cudaMalloc)");
+    assert(mode != NTTMode::ASYNC && "ASYNC not supported with CUDA Graphs");
+    uint32_t N = static_cast<uint32_t>(n);
+
+    NTTGraphEntry* entry = find_graph_entry(d_data, N, batch_size, mode, true);
+    if (!entry) {
+        cudaGraphExec_t ge = capture_ntt_graph(d_data, n, batch_size, mode, true);
+        s_graph_cache.push_back({d_data, N, batch_size, mode, true, ge});
+        entry = &s_graph_cache.back();
+    }
+    CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
+}
+
+void ntt_inverse_batch_graph(FpElement* d_data, int batch_size, size_t n,
+                             NTTMode mode, cudaStream_t stream) {
+    assert(mode != NTTMode::FOUR_STEP && "FOUR_STEP not supported with CUDA Graphs (internal cudaMalloc)");
+    assert(mode != NTTMode::ASYNC && "ASYNC not supported with CUDA Graphs");
+    uint32_t N = static_cast<uint32_t>(n);
+
+    NTTGraphEntry* entry = find_graph_entry(d_data, N, batch_size, mode, false);
+    if (!entry) {
+        cudaGraphExec_t ge = capture_ntt_graph(d_data, n, batch_size, mode, false);
+        s_graph_cache.push_back({d_data, N, batch_size, mode, false, ge});
+        entry = &s_graph_cache.back();
+    }
+    CUDA_CHECK(cudaGraphLaunch(entry->graphExec, stream));
+}
+
+void ntt_graph_clear_cache() {
+    for (auto& e : s_graph_cache) {
+        cudaGraphExecDestroy(e.graphExec);
+    }
+    s_graph_cache.clear();
+    if (s_capture_stream) {
+        cudaStreamDestroy(s_capture_stream);
+        s_capture_stream = nullptr;
+    }
+}
+
 FpElement* ntt_precompute_twiddles(size_t n) {
     ensure_twiddles(n);
     return s_d_fwd_twiddles;

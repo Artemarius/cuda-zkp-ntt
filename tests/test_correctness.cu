@@ -2070,6 +2070,212 @@ void test_ntt_batch_vs_sequential_b8(int log_n, NTTMode mode) {
            mode_name(mode), log_n, pass, total);
 }
 
+// ─── CUDA Graph Tests ─────────────────────────────────────────────────────────
+// Validates that graph-accelerated NTT produces bitwise identical output to
+// non-graph NTT, and that graph replay is consistent.
+
+void test_ntt_graph_vs_nongraph() {
+    printf("\n--- CUDA Graph NTT Tests ---\n");
+
+    // Test 1: Barrett forward graph vs non-graph at multiple sizes
+    {
+        int sizes[] = {15, 18, 22};
+        for (int log_n : sizes) {
+            size_t n = static_cast<size_t>(1) << log_n;
+            printf("test_graph_barrett_forward (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 7919u + 12345u) % 1000000007u);
+            }
+
+            FpElement *d_graph, *d_plain;
+            CUDA_CHECK(cudaMalloc(&d_graph, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMalloc(&d_plain, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_graph, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_plain, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            ntt_forward_graph(d_graph, n, NTTMode::BARRETT);
+            ntt_forward(d_plain, n, NTTMode::BARRETT);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<FpElement> h_graph(n), h_plain(n);
+            CUDA_CHECK(cudaMemcpy(h_graph.data(), d_graph, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_plain.data(), d_plain, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_graph[i] == h_plain[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "Graph Barrett forward mismatch");
+            printf("  Graph vs plain Barrett fwd (2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            ntt_graph_clear_cache();
+            CUDA_CHECK(cudaFree(d_graph));
+            CUDA_CHECK(cudaFree(d_plain));
+        }
+    }
+
+    // Test 2: Montgomery forward graph vs non-graph
+    {
+        int sizes[] = {15, 22};
+        for (int log_n : sizes) {
+            size_t n = static_cast<size_t>(1) << log_n;
+            printf("test_graph_montgomery_forward (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 31337u + 42u) % 1000000007u);
+            }
+
+            FpElement *d_graph, *d_plain;
+            CUDA_CHECK(cudaMalloc(&d_graph, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMalloc(&d_plain, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_graph, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_plain, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            ntt_forward_graph(d_graph, n, NTTMode::OPTIMIZED);
+            ntt_forward(d_plain, n, NTTMode::OPTIMIZED);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<FpElement> h_graph(n), h_plain(n);
+            CUDA_CHECK(cudaMemcpy(h_graph.data(), d_graph, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_plain.data(), d_plain, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_graph[i] == h_plain[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "Graph Montgomery forward mismatch");
+            printf("  Graph vs plain Montgomery fwd (2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            ntt_graph_clear_cache();
+            CUDA_CHECK(cudaFree(d_graph));
+            CUDA_CHECK(cudaFree(d_plain));
+        }
+    }
+
+    // Test 3: Barrett roundtrip via graph (NTT then INTT)
+    {
+        int sizes[] = {15, 22};
+        for (int log_n : sizes) {
+            size_t n = static_cast<size_t>(1) << log_n;
+            printf("test_graph_barrett_roundtrip (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_orig(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_orig[i] = FpElement::zero();
+                h_orig[i].limbs[0] = static_cast<uint32_t>((i * 997u + 13u) % 1000000007u);
+            }
+
+            FpElement* d_data;
+            CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data, h_orig.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            ntt_forward_graph(d_data, n, NTTMode::BARRETT);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            ntt_graph_clear_cache();  // clear forward graph before inverse capture
+            ntt_inverse_graph(d_data, n, NTTMode::BARRETT);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<FpElement> h_result(n);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_result[i] == h_orig[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "Graph Barrett roundtrip mismatch");
+            printf("  Graph Barrett roundtrip (2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            ntt_graph_clear_cache();
+            CUDA_CHECK(cudaFree(d_data));
+        }
+    }
+
+    // Test 4: Graph replay consistency (second call same result as first)
+    {
+        size_t n = 1u << 15;
+        printf("test_graph_replay_consistency (n=2^15)...\n");
+
+        std::vector<FpElement> h_data(n);
+        for (size_t i = 0; i < n; ++i) {
+            h_data[i] = FpElement::zero();
+            h_data[i].limbs[0] = static_cast<uint32_t>((i * 4999u + 77u) % 1000000007u);
+        }
+
+        FpElement* d_data;
+        CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+
+        // First run (captures graph)
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+        ntt_forward_graph(d_data, n, NTTMode::BARRETT);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<FpElement> h_first(n);
+        CUDA_CHECK(cudaMemcpy(h_first.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        // Second run (replays cached graph)
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+        ntt_forward_graph(d_data, n, NTTMode::BARRETT);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<FpElement> h_second(n);
+        CUDA_CHECK(cudaMemcpy(h_second.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (h_first[i] == h_second[i]) ++pass;
+
+        TEST_ASSERT(pass == static_cast<int>(n), "Graph replay inconsistency");
+        printf("  Graph replay consistency (2^15): %d/%zu matched\n", pass, n);
+
+        ntt_graph_clear_cache();
+        CUDA_CHECK(cudaFree(d_data));
+    }
+
+    // Test 5: Batched graph vs non-graph (Barrett, B=4, n=2^15)
+    {
+        int log_n = 15;
+        int batch_size = 4;
+        size_t n = static_cast<size_t>(1) << log_n;
+        size_t total = static_cast<size_t>(batch_size) * n;
+        printf("test_graph_batch_barrett (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+        std::vector<FpElement> h_data(total);
+        for (size_t i = 0; i < total; ++i) {
+            h_data[i] = FpElement::zero();
+            h_data[i].limbs[0] = static_cast<uint32_t>((i * 2017u + 5u) % 1000000007u);
+        }
+
+        FpElement *d_graph, *d_plain;
+        CUDA_CHECK(cudaMalloc(&d_graph, total * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&d_plain, total * sizeof(FpElement)));
+        CUDA_CHECK(cudaMemcpy(d_graph, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_plain, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+        ntt_forward_batch_graph(d_graph, batch_size, n, NTTMode::BARRETT);
+        ntt_forward_batch(d_plain, batch_size, n, NTTMode::BARRETT);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<FpElement> h_graph(total), h_plain(total);
+        CUDA_CHECK(cudaMemcpy(h_graph.data(), d_graph, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_plain.data(), d_plain, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (size_t i = 0; i < total; ++i)
+            if (h_graph[i] == h_plain[i]) ++pass;
+
+        TEST_ASSERT(pass == static_cast<int>(total), "Batched graph vs plain mismatch");
+        printf("  Batch graph vs plain Barrett (2^%d, B=%d): %d/%zu matched\n",
+               log_n, batch_size, pass, total);
+
+        ntt_graph_clear_cache();
+        CUDA_CHECK(cudaFree(d_graph));
+        CUDA_CHECK(cudaFree(d_plain));
+    }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -2526,6 +2732,9 @@ int main() {
             CUDA_CHECK(cudaFree(d_barrett));
         }
     }
+
+    // ─── v1.4.0 Session 11: CUDA Graph NTT Tests ──────────────────────────
+    test_ntt_graph_vs_nongraph();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
