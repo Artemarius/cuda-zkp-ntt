@@ -5,10 +5,10 @@
 GPU-accelerated Number-Theoretic Transform for Zero-Knowledge Proofs.
 Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field comparison planned.
 
-- **Completed**: Fused radix-1024 inner kernel + radix-4 cooperative outer stages + branchless
+- **Completed**: Fused radix-1024 inner kernel + radix-4/8 cooperative outer stages + branchless
   arithmetic + Barrett/Montgomery dual paths + batched NTT + async pipeline + CUDA Graphs
-- **Next (v1.5.0+)**: Radix-8 outer stages, OTF twiddle computation, Goldilocks/BabyBear
-  multi-field comparison, Plantard reduction, Stockham NTT (conditional)
+- **Next (v1.5.0+)**: Radix-8 correctness tests + benchmark, OTF twiddle computation,
+  Goldilocks/BabyBear multi-field comparison, Plantard reduction
 
 ---
 
@@ -290,7 +290,7 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.8.0 planned).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
 Phases 1-8 complete. Current version: **v1.4.0**.
 

@@ -192,6 +192,10 @@ static constexpr int MAX_STAGES_PER_COOP_LAUNCH = 7;
 // 7 passes = 14 stages, sufficient for n up to 2^24.
 static constexpr int MAX_R4_PASSES_PER_COOP_LAUNCH = 7;
 
+// Max radix-8 passes per cooperative launch. Each pass fuses 3 stages.
+// 4 passes = 12 stages, sufficient for n up to 2^22.
+static constexpr int MAX_R8_PASSES_PER_COOP_LAUNCH = 4;
+
 static __host__ int log2_of(size_t n) {
     int r = 0;
     while (n > 1) { n >>= 1; ++r; }
@@ -355,6 +359,29 @@ static __host__ bool launch_outer_radix4(
     return true;
 }
 
+// ─── Forward Declarations: Radix-8 Launch Helpers ───────────────────────────
+// Defined later in the file (after radix-8 kernels and occupancy queries).
+
+static __host__ bool launch_outer_radix8(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream);
+
+static __host__ bool launch_outer_radix8_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream);
+
+static __host__ bool launch_outer_radix8_batch(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream);
+
+static __host__ bool launch_outer_radix8_batch_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream);
+
 // ─── Outer Stage Dispatch ───────────────────────────────────────────────────
 
 static __host__ void dispatch_outer_stages(
@@ -364,7 +391,15 @@ static __host__ void dispatch_outer_stages(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-4 first (halves DRAM passes for outer stages)
+    // Try radix-8 first (1/3 DRAM passes for outer stages)
+    if (num_outer >= 3 &&
+        launch_outer_radix8(d_data, d_twiddles, N, outer_start, num_outer,
+                            grid_half, stream))
+    {
+        return;
+    }
+
+    // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
         launch_outer_radix4(d_data, d_twiddles, N, outer_start, num_outer,
                             grid_half, stream))
@@ -764,7 +799,15 @@ static __host__ void dispatch_outer_stages_barrett(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-4 first (halves DRAM passes for outer stages)
+    // Try radix-8 first (1/3 DRAM passes for outer stages)
+    if (num_outer >= 3 &&
+        launch_outer_radix8_barrett(d_data, d_twiddles, N, outer_start, num_outer,
+                                    grid_half, stream))
+    {
+        return;
+    }
+
+    // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
         launch_outer_radix4_barrett(d_data, d_twiddles, N, outer_start, num_outer,
                                     grid_half, stream))
@@ -1049,6 +1092,324 @@ __global__ void ntt_outer_radix4_batch_barrett_kernel(
     }
 }
 
+// ─── Radix-8 Outer Kernel (Montgomery, Cooperative) ──────────────────────────
+// Fuses triples of consecutive outer stages into radix-8 butterflies.
+// Each radix-8 unit processes 8 elements and 3 stages with 8 loads + 8 stores,
+// reducing DRAM passes to 1/3 compared to radix-2 (which needs 3× (4 loads + 4 stores)).
+//
+// Radix-8 butterfly for stages (s, s+1, s+2):
+//   8 data elements at indices base+{0, h, 2h, 3h, 4h, 5h, 6h, 7h}, h = 2^s
+//   Stage s:   4 radix-2 butterflies on (a0,a4),(a1,a5),(a2,a6),(a3,a7) with w_s(j)
+//   Stage s+1: 4 radix-2 butterflies on (a0,a2),(a1,a3),(a4,a6),(a5,a7)
+//   Stage s+2: 4 radix-2 butterflies on (a0,a4),(a1,a5),(a2,a6),(a3,a7) [re-paired]
+
+__global__ void ntt_outer_radix8_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    int start_stage,
+    int num_r8_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+    const uint32_t num_r8_butterflies = n >> 3;  // n/8
+
+    for (int pass = 0; pass < num_r8_passes; ++pass) {
+        const int s = start_stage + 3 * pass;
+        const uint32_t h = 1u << s;
+        const uint32_t stride_s  = n >> (s + 1);
+        const uint32_t stride_s1 = stride_s >> 1;
+        const uint32_t stride_s2 = stride_s >> 2;
+
+        for (uint32_t tid = global_tid; tid < num_r8_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (h - 1);
+            const uint32_t base  = (group << (s + 3)) + j;
+
+            // Load 8 elements
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + h];
+            FpElement a2 = data[base + (h << 1)];
+            FpElement a3 = data[base + (h << 1) + h];
+            FpElement a4 = data[base + (h << 2)];
+            FpElement a5 = data[base + (h << 2) + h];
+            FpElement a6 = data[base + (h << 2) + (h << 1)];
+            FpElement a7 = data[base + (h << 2) + (h << 1) + h];
+
+            // Stage s: 4 radix-2 butterflies with w1 — pairs h apart
+            FpElement w1 = twiddles[j * stride_s];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_ptx(a3, w1); { FpElement tmp = ff_add_v2(a2, t); a3 = ff_sub_v2(a2, t); a2 = tmp; }
+                t = ff_mul_ptx(a5, w1); { FpElement tmp = ff_add_v2(a4, t); a5 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_ptx(a7, w1); { FpElement tmp = ff_add_v2(a6, t); a7 = ff_sub_v2(a6, t); a6 = tmp; }
+            }
+
+            // Stage s+1: 4 radix-2 butterflies — pairs 2h apart
+            FpElement w2 = twiddles[j * stride_s1];
+            FpElement w3 = twiddles[(j + h) * stride_s1];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_ptx(a3, w3); { FpElement tmp = ff_add_v2(a1, t); a3 = ff_sub_v2(a1, t); a1 = tmp; }
+                t = ff_mul_ptx(a6, w2); { FpElement tmp = ff_add_v2(a4, t); a6 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_ptx(a7, w3); { FpElement tmp = ff_add_v2(a5, t); a7 = ff_sub_v2(a5, t); a5 = tmp; }
+            }
+
+            // Stage s+2: 4 radix-2 butterflies — pairs 4h apart
+            FpElement w4 = twiddles[j * stride_s2];
+            FpElement w5 = twiddles[(j + h) * stride_s2];
+            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
+            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
+                t = ff_mul_ptx(a5, w5); data[base + h]                               = ff_add_v2(a1, t); data[base + (h << 2) + h]                = ff_sub_v2(a1, t);
+                t = ff_mul_ptx(a6, w6); data[base + (h << 1)]                        = ff_add_v2(a2, t); data[base + (h << 2) + (h << 1)]         = ff_sub_v2(a2, t);
+                t = ff_mul_ptx(a7, w7); data[base + (h << 1) + h]                    = ff_add_v2(a3, t); data[base + (h << 2) + (h << 1) + h]     = ff_sub_v2(a3, t);
+            }
+        }
+
+        if (pass + 1 < num_r8_passes) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Radix-8 Outer Kernel (Barrett, Cooperative) ─────────────────────────────
+
+__global__ void ntt_outer_radix8_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    int start_stage,
+    int num_r8_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+    const uint32_t num_r8_butterflies = n >> 3;
+
+    for (int pass = 0; pass < num_r8_passes; ++pass) {
+        const int s = start_stage + 3 * pass;
+        const uint32_t h = 1u << s;
+        const uint32_t stride_s  = n >> (s + 1);
+        const uint32_t stride_s1 = stride_s >> 1;
+        const uint32_t stride_s2 = stride_s >> 2;
+
+        for (uint32_t tid = global_tid; tid < num_r8_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (h - 1);
+            const uint32_t base  = (group << (s + 3)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + h];
+            FpElement a2 = data[base + (h << 1)];
+            FpElement a3 = data[base + (h << 1) + h];
+            FpElement a4 = data[base + (h << 2)];
+            FpElement a5 = data[base + (h << 2) + h];
+            FpElement a6 = data[base + (h << 2) + (h << 1)];
+            FpElement a7 = data[base + (h << 2) + (h << 1) + h];
+
+            // Stage s
+            FpElement w1 = twiddles[j * stride_s];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_barrett_v2(a3, w1); { FpElement tmp = ff_add_v2(a2, t); a3 = ff_sub_v2(a2, t); a2 = tmp; }
+                t = ff_mul_barrett_v2(a5, w1); { FpElement tmp = ff_add_v2(a4, t); a5 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_barrett_v2(a7, w1); { FpElement tmp = ff_add_v2(a6, t); a7 = ff_sub_v2(a6, t); a6 = tmp; }
+            }
+
+            // Stage s+1
+            FpElement w2 = twiddles[j * stride_s1];
+            FpElement w3 = twiddles[(j + h) * stride_s1];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_barrett_v2(a3, w3); { FpElement tmp = ff_add_v2(a1, t); a3 = ff_sub_v2(a1, t); a1 = tmp; }
+                t = ff_mul_barrett_v2(a6, w2); { FpElement tmp = ff_add_v2(a4, t); a6 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_barrett_v2(a7, w3); { FpElement tmp = ff_add_v2(a5, t); a7 = ff_sub_v2(a5, t); a5 = tmp; }
+            }
+
+            // Stage s+2
+            FpElement w4 = twiddles[j * stride_s2];
+            FpElement w5 = twiddles[(j + h) * stride_s2];
+            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
+            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
+                t = ff_mul_barrett_v2(a5, w5); data[base + h]                               = ff_add_v2(a1, t); data[base + (h << 2) + h]                = ff_sub_v2(a1, t);
+                t = ff_mul_barrett_v2(a6, w6); data[base + (h << 1)]                        = ff_add_v2(a2, t); data[base + (h << 2) + (h << 1)]         = ff_sub_v2(a2, t);
+                t = ff_mul_barrett_v2(a7, w7); data[base + (h << 1) + h]                    = ff_add_v2(a3, t); data[base + (h << 2) + (h << 1) + h]     = ff_sub_v2(a3, t);
+            }
+        }
+
+        if (pass + 1 < num_r8_passes) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Batched Radix-8 Outer Kernel (Montgomery, Cooperative) ──────────────────
+
+__global__ void ntt_outer_radix8_batch_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_r8_butterflies,
+    int start_stage,
+    int num_r8_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int pass = 0; pass < num_r8_passes; ++pass) {
+        const int s = start_stage + 3 * pass;
+        const uint32_t h = 1u << s;
+        const uint32_t stride_s  = n >> (s + 1);
+        const uint32_t stride_s1 = stride_s >> 1;
+        const uint32_t stride_s2 = stride_s >> 2;
+
+        for (uint32_t tid = global_tid; tid < total_r8_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (h - 1);
+            const uint32_t base  = (group << (s + 3)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + h];
+            FpElement a2 = data[base + (h << 1)];
+            FpElement a3 = data[base + (h << 1) + h];
+            FpElement a4 = data[base + (h << 2)];
+            FpElement a5 = data[base + (h << 2) + h];
+            FpElement a6 = data[base + (h << 2) + (h << 1)];
+            FpElement a7 = data[base + (h << 2) + (h << 1) + h];
+
+            // Stage s
+            FpElement w1 = twiddles[j * stride_s];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_ptx(a3, w1); { FpElement tmp = ff_add_v2(a2, t); a3 = ff_sub_v2(a2, t); a2 = tmp; }
+                t = ff_mul_ptx(a5, w1); { FpElement tmp = ff_add_v2(a4, t); a5 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_ptx(a7, w1); { FpElement tmp = ff_add_v2(a6, t); a7 = ff_sub_v2(a6, t); a6 = tmp; }
+            }
+
+            // Stage s+1
+            FpElement w2 = twiddles[j * stride_s1];
+            FpElement w3 = twiddles[(j + h) * stride_s1];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_ptx(a3, w3); { FpElement tmp = ff_add_v2(a1, t); a3 = ff_sub_v2(a1, t); a1 = tmp; }
+                t = ff_mul_ptx(a6, w2); { FpElement tmp = ff_add_v2(a4, t); a6 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_ptx(a7, w3); { FpElement tmp = ff_add_v2(a5, t); a7 = ff_sub_v2(a5, t); a5 = tmp; }
+            }
+
+            // Stage s+2
+            FpElement w4 = twiddles[j * stride_s2];
+            FpElement w5 = twiddles[(j + h) * stride_s2];
+            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
+            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            {
+                FpElement t;
+                t = ff_mul_ptx(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
+                t = ff_mul_ptx(a5, w5); data[base + h]                               = ff_add_v2(a1, t); data[base + (h << 2) + h]                = ff_sub_v2(a1, t);
+                t = ff_mul_ptx(a6, w6); data[base + (h << 1)]                        = ff_add_v2(a2, t); data[base + (h << 2) + (h << 1)]         = ff_sub_v2(a2, t);
+                t = ff_mul_ptx(a7, w7); data[base + (h << 1) + h]                    = ff_add_v2(a3, t); data[base + (h << 2) + (h << 1) + h]     = ff_sub_v2(a3, t);
+            }
+        }
+
+        if (pass + 1 < num_r8_passes) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Batched Radix-8 Outer Kernel (Barrett, Cooperative) ─────────────────────
+
+__global__ void ntt_outer_radix8_batch_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_r8_butterflies,
+    int start_stage,
+    int num_r8_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int pass = 0; pass < num_r8_passes; ++pass) {
+        const int s = start_stage + 3 * pass;
+        const uint32_t h = 1u << s;
+        const uint32_t stride_s  = n >> (s + 1);
+        const uint32_t stride_s1 = stride_s >> 1;
+        const uint32_t stride_s2 = stride_s >> 2;
+
+        for (uint32_t tid = global_tid; tid < total_r8_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (h - 1);
+            const uint32_t base  = (group << (s + 3)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + h];
+            FpElement a2 = data[base + (h << 1)];
+            FpElement a3 = data[base + (h << 1) + h];
+            FpElement a4 = data[base + (h << 2)];
+            FpElement a5 = data[base + (h << 2) + h];
+            FpElement a6 = data[base + (h << 2) + (h << 1)];
+            FpElement a7 = data[base + (h << 2) + (h << 1) + h];
+
+            // Stage s
+            FpElement w1 = twiddles[j * stride_s];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_barrett_v2(a3, w1); { FpElement tmp = ff_add_v2(a2, t); a3 = ff_sub_v2(a2, t); a2 = tmp; }
+                t = ff_mul_barrett_v2(a5, w1); { FpElement tmp = ff_add_v2(a4, t); a5 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_barrett_v2(a7, w1); { FpElement tmp = ff_add_v2(a6, t); a7 = ff_sub_v2(a6, t); a6 = tmp; }
+            }
+
+            // Stage s+1
+            FpElement w2 = twiddles[j * stride_s1];
+            FpElement w3 = twiddles[(j + h) * stride_s1];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
+                t = ff_mul_barrett_v2(a3, w3); { FpElement tmp = ff_add_v2(a1, t); a3 = ff_sub_v2(a1, t); a1 = tmp; }
+                t = ff_mul_barrett_v2(a6, w2); { FpElement tmp = ff_add_v2(a4, t); a6 = ff_sub_v2(a4, t); a4 = tmp; }
+                t = ff_mul_barrett_v2(a7, w3); { FpElement tmp = ff_add_v2(a5, t); a7 = ff_sub_v2(a5, t); a5 = tmp; }
+            }
+
+            // Stage s+2
+            FpElement w4 = twiddles[j * stride_s2];
+            FpElement w5 = twiddles[(j + h) * stride_s2];
+            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
+            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            {
+                FpElement t;
+                t = ff_mul_barrett_v2(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
+                t = ff_mul_barrett_v2(a5, w5); data[base + h]                               = ff_add_v2(a1, t); data[base + (h << 2) + h]                = ff_sub_v2(a1, t);
+                t = ff_mul_barrett_v2(a6, w6); data[base + (h << 1)]                        = ff_add_v2(a2, t); data[base + (h << 2) + (h << 1)]         = ff_sub_v2(a2, t);
+                t = ff_mul_barrett_v2(a7, w7); data[base + (h << 1) + h]                    = ff_add_v2(a3, t); data[base + (h << 2) + (h << 1) + h]     = ff_sub_v2(a3, t);
+            }
+        }
+
+        if (pass + 1 < num_r8_passes) {
+            grid.sync();
+        }
+    }
+}
+
 // ─── Batched Cooperative Launch Helpers ───────────────────────────────────────
 
 static int s_coop_max_blocks_batch = 0;
@@ -1266,6 +1627,485 @@ static __host__ bool launch_outer_radix4_batch_barrett(
     return true;
 }
 
+// ─── Radix-8 Cooperative Launch Helpers (Montgomery, single) ─────────────────
+
+static int s_coop_max_blocks_r8 = 0;
+
+static __host__ int get_coop_max_blocks_r8() {
+    if (s_coop_max_blocks_r8 != 0) return s_coop_max_blocks_r8;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix8_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r8 = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r8 = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r8 == 0) {
+        s_coop_max_blocks_r8 = -1;
+    }
+    return s_coop_max_blocks_r8;
+}
+
+// Try radix-8 dispatch (Montgomery, single). Returns true on success.
+static __host__ bool launch_outer_radix8(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream
+) {
+    int num_r8 = num_outer / 3;
+    if (num_r8 == 0) return false;
+
+    int r8_max = get_coop_max_blocks_r8();
+    if (r8_max <= 0) return false;
+
+    uint32_t needed = (n / 8 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r8_max) < needed)
+                         ? static_cast<uint32_t>(r8_max) : needed;
+
+    int r8_stage = outer_start;
+    for (int done = 0; done < num_r8; ) {
+        int passes = num_r8 - done;
+        if (passes > MAX_R8_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R8_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r8_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix8_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r8_stage += 3 * passes;
+    }
+
+    // Handle leftover stages after radix-8 passes
+    int leftover = num_outer % 3;
+    if (leftover == 2) {
+        // Leftover pair: use radix-4 cooperative kernel
+        int r4_max = get_coop_max_blocks_r4();
+        if (r4_max > 0) {
+            uint32_t r4_needed = (n / 4 + OPT_BLOCK - 1) / OPT_BLOCK;
+            uint32_t r4_grid = (static_cast<uint32_t>(r4_max) < r4_needed)
+                               ? static_cast<uint32_t>(r4_max) : r4_needed;
+            int ss = r8_stage;
+            int np = 1;
+            void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_radix4_kernel,
+                dim3(r4_grid), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+            if (err != cudaSuccess) {
+                // Fall back to 2 radix-2 stages
+                for (int i = 0; i < 2; ++i) {
+                    int s = r8_stage + i;
+                    uint32_t half   = 1u << s;
+                    uint32_t stride = n / (2u * half);
+                    ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                        d_data, d_twiddles, n, half, stride);
+                }
+            }
+        } else {
+            for (int i = 0; i < 2; ++i) {
+                int s = r8_stage + i;
+                uint32_t half   = 1u << s;
+                uint32_t stride = n / (2u * half);
+                ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_data, d_twiddles, n, half, stride);
+            }
+        }
+    } else if (leftover == 1) {
+        int s = r8_stage;
+        uint32_t half   = 1u << s;
+        uint32_t stride = n / (2u * half);
+        ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+            d_data, d_twiddles, n, half, stride);
+    }
+    return true;
+}
+
+// ─── Radix-8 Cooperative Launch Helpers (Barrett, single) ────────────────────
+
+static int s_coop_max_blocks_r8_barrett = 0;
+
+static __host__ int get_coop_max_blocks_r8_barrett() {
+    if (s_coop_max_blocks_r8_barrett != 0) return s_coop_max_blocks_r8_barrett;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix8_barrett_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r8_barrett = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r8_barrett = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r8_barrett == 0) {
+        s_coop_max_blocks_r8_barrett = -1;
+    }
+    return s_coop_max_blocks_r8_barrett;
+}
+
+// Try radix-8 dispatch (Barrett, single). Returns true on success.
+static __host__ bool launch_outer_radix8_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream
+) {
+    int num_r8 = num_outer / 3;
+    if (num_r8 == 0) return false;
+
+    int r8_max = get_coop_max_blocks_r8_barrett();
+    if (r8_max <= 0) return false;
+
+    uint32_t needed = (n / 8 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r8_max) < needed)
+                         ? static_cast<uint32_t>(r8_max) : needed;
+
+    int r8_stage = outer_start;
+    for (int done = 0; done < num_r8; ) {
+        int passes = num_r8 - done;
+        if (passes > MAX_R8_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R8_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r8_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix8_barrett_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r8_stage += 3 * passes;
+    }
+
+    // Handle leftover stages after radix-8 passes
+    int leftover = num_outer % 3;
+    if (leftover == 2) {
+        int r4_max = get_coop_max_blocks_r4_barrett();
+        if (r4_max > 0) {
+            uint32_t r4_needed = (n / 4 + OPT_BLOCK - 1) / OPT_BLOCK;
+            uint32_t r4_grid = (static_cast<uint32_t>(r4_max) < r4_needed)
+                               ? static_cast<uint32_t>(r4_max) : r4_needed;
+            int ss = r8_stage;
+            int np = 1;
+            void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_radix4_barrett_kernel,
+                dim3(r4_grid), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+            if (err != cudaSuccess) {
+                for (int i = 0; i < 2; ++i) {
+                    int s = r8_stage + i;
+                    uint32_t half   = 1u << s;
+                    uint32_t stride = n / (2u * half);
+                    ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                        d_data, d_twiddles, n, half, stride);
+                }
+            }
+        } else {
+            for (int i = 0; i < 2; ++i) {
+                int s = r8_stage + i;
+                uint32_t half   = 1u << s;
+                uint32_t stride = n / (2u * half);
+                ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                    d_data, d_twiddles, n, half, stride);
+            }
+        }
+    } else if (leftover == 1) {
+        int s = r8_stage;
+        uint32_t half   = 1u << s;
+        uint32_t stride = n / (2u * half);
+        ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+            d_data, d_twiddles, n, half, stride);
+    }
+    return true;
+}
+
+// ─── Radix-8 Cooperative Launch Helpers (Montgomery, batch) ──────────────────
+
+static int s_coop_max_blocks_r8_batch = 0;
+
+static __host__ int get_coop_max_blocks_r8_batch() {
+    if (s_coop_max_blocks_r8_batch != 0) return s_coop_max_blocks_r8_batch;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix8_batch_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r8_batch = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r8_batch = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r8_batch == 0) {
+        s_coop_max_blocks_r8_batch = -1;
+    }
+    return s_coop_max_blocks_r8_batch;
+}
+
+static __host__ bool launch_outer_radix8_batch(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream
+) {
+    int num_r8 = num_outer / 3;
+    if (num_r8 == 0) return false;
+
+    int r8_max = get_coop_max_blocks_r8_batch();
+    if (r8_max <= 0) return false;
+
+    uint32_t total_r8 = static_cast<uint32_t>(batch_size) * (n >> 3);
+    uint32_t needed = (total_r8 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r8_max) < needed)
+                         ? static_cast<uint32_t>(r8_max) : needed;
+
+    int r8_stage = outer_start;
+    for (int done = 0; done < num_r8; ) {
+        int passes = num_r8 - done;
+        if (passes > MAX_R8_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R8_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r8_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &total_r8, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix8_batch_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r8_stage += 3 * passes;
+    }
+
+    // Handle leftover stages after radix-8 passes
+    int leftover = num_outer % 3;
+    if (leftover == 2) {
+        // Use batched radix-4 cooperative kernel for leftover pair
+        int r4_max = get_coop_max_blocks_r4_batch();
+        if (r4_max > 0) {
+            uint32_t total_r4 = static_cast<uint32_t>(batch_size) * (n >> 2);
+            uint32_t r4_needed = (total_r4 + OPT_BLOCK - 1) / OPT_BLOCK;
+            uint32_t r4_grid = (static_cast<uint32_t>(r4_max) < r4_needed)
+                               ? static_cast<uint32_t>(r4_max) : r4_needed;
+            int ss = r8_stage;
+            int np = 1;
+            void* args[] = { &d_data, &d_twiddles, &n, &total_r4, &ss, &np };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_radix4_batch_kernel,
+                dim3(r4_grid), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+            if (err != cudaSuccess) {
+                uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+                for (int b = 0; b < batch_size; ++b) {
+                    for (int i = 0; i < 2; ++i) {
+                        int s = r8_stage + i;
+                        uint32_t half   = 1u << s;
+                        uint32_t stride = n / (2u * half);
+                        ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                            d_data + b * n, d_twiddles, n, half, stride);
+                    }
+                }
+            }
+        } else {
+            uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+            for (int b = 0; b < batch_size; ++b) {
+                for (int i = 0; i < 2; ++i) {
+                    int s = r8_stage + i;
+                    uint32_t half   = 1u << s;
+                    uint32_t stride = n / (2u * half);
+                    ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                        d_data + b * n, d_twiddles, n, half, stride);
+                }
+            }
+        }
+    } else if (leftover == 1) {
+        uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        int s = r8_stage;
+        uint32_t half   = 1u << s;
+        uint32_t stride = n / (2u * half);
+        for (int b = 0; b < batch_size; ++b) {
+            ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                d_data + b * n, d_twiddles, n, half, stride);
+        }
+    }
+    return true;
+}
+
+// ─── Radix-8 Cooperative Launch Helpers (Barrett, batch) ─────────────────────
+
+static int s_coop_max_blocks_r8_batch_barrett = 0;
+
+static __host__ int get_coop_max_blocks_r8_batch_barrett() {
+    if (s_coop_max_blocks_r8_batch_barrett != 0) return s_coop_max_blocks_r8_batch_barrett;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix8_batch_barrett_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r8_batch_barrett = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r8_batch_barrett = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r8_batch_barrett == 0) {
+        s_coop_max_blocks_r8_batch_barrett = -1;
+    }
+    return s_coop_max_blocks_r8_batch_barrett;
+}
+
+static __host__ bool launch_outer_radix8_batch_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream
+) {
+    int num_r8 = num_outer / 3;
+    if (num_r8 == 0) return false;
+
+    int r8_max = get_coop_max_blocks_r8_batch_barrett();
+    if (r8_max <= 0) return false;
+
+    uint32_t total_r8 = static_cast<uint32_t>(batch_size) * (n >> 3);
+    uint32_t needed = (total_r8 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r8_max) < needed)
+                         ? static_cast<uint32_t>(r8_max) : needed;
+
+    int r8_stage = outer_start;
+    for (int done = 0; done < num_r8; ) {
+        int passes = num_r8 - done;
+        if (passes > MAX_R8_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R8_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r8_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &total_r8, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix8_batch_barrett_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r8_stage += 3 * passes;
+    }
+
+    // Handle leftover stages after radix-8 passes
+    int leftover = num_outer % 3;
+    if (leftover == 2) {
+        int r4_max = get_coop_max_blocks_r4_batch_barrett();
+        if (r4_max > 0) {
+            uint32_t total_r4 = static_cast<uint32_t>(batch_size) * (n >> 2);
+            uint32_t r4_needed = (total_r4 + OPT_BLOCK - 1) / OPT_BLOCK;
+            uint32_t r4_grid = (static_cast<uint32_t>(r4_max) < r4_needed)
+                               ? static_cast<uint32_t>(r4_max) : r4_needed;
+            int ss = r8_stage;
+            int np = 1;
+            void* args[] = { &d_data, &d_twiddles, &n, &total_r4, &ss, &np };
+
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)ntt_outer_radix4_batch_barrett_kernel,
+                dim3(r4_grid), dim3(OPT_BLOCK),
+                args, 0, stream
+            );
+            if (err != cudaSuccess) {
+                uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+                for (int b = 0; b < batch_size; ++b) {
+                    for (int i = 0; i < 2; ++i) {
+                        int s = r8_stage + i;
+                        uint32_t half   = 1u << s;
+                        uint32_t stride = n / (2u * half);
+                        ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                            d_data + b * n, d_twiddles, n, half, stride);
+                    }
+                }
+            }
+        } else {
+            uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+            for (int b = 0; b < batch_size; ++b) {
+                for (int i = 0; i < 2; ++i) {
+                    int s = r8_stage + i;
+                    uint32_t half   = 1u << s;
+                    uint32_t stride = n / (2u * half);
+                    ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                        d_data + b * n, d_twiddles, n, half, stride);
+                }
+            }
+        }
+    } else if (leftover == 1) {
+        uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        int s = r8_stage;
+        uint32_t half   = 1u << s;
+        uint32_t stride = n / (2u * half);
+        for (int b = 0; b < batch_size; ++b) {
+            ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                d_data + b * n, d_twiddles, n, half, stride);
+        }
+    }
+    return true;
+}
+
 // ─── Batched Outer Stage Dispatch (Montgomery) ──────────────────────────────
 
 static __host__ void dispatch_outer_stages_batch(
@@ -1275,7 +2115,15 @@ static __host__ void dispatch_outer_stages_batch(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-4 first
+    // Try radix-8 first (1/3 DRAM passes for outer stages)
+    if (num_outer >= 3 &&
+        launch_outer_radix8_batch(d_data, d_twiddles, N, batch_size,
+                                  outer_start, num_outer, stream))
+    {
+        return;
+    }
+
+    // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
         launch_outer_radix4_batch(d_data, d_twiddles, N, batch_size,
                                   outer_start, num_outer, stream))
@@ -1347,7 +2195,15 @@ static __host__ void dispatch_outer_stages_batch_barrett(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-4 first
+    // Try radix-8 first (1/3 DRAM passes for outer stages)
+    if (num_outer >= 3 &&
+        launch_outer_radix8_batch_barrett(d_data, d_twiddles, N, batch_size,
+                                          outer_start, num_outer, stream))
+    {
+        return;
+    }
+
+    // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
         launch_outer_radix4_batch_barrett(d_data, d_twiddles, N, batch_size,
                                           outer_start, num_outer, stream))

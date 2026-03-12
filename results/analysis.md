@@ -698,6 +698,65 @@ by DRAM bandwidth on RTX 3060 (~360 GB/s).
 
 ---
 
+## Section 8 — L2 Cache Behavior at v1.5.0 (Session 12)
+
+### 8.1 L2 Cache Diagnostic — Stockham v1.8.0 Go/No-Go
+
+**Method**: Nsight Compute 2025.1.1 `--set full`, radix-8 Barrett outer kernel profiled at 2^18, 2^20, 2^22. RTX 3060 Laptop GPU (SM 8.6, 30 SMs, 3 MB L2).
+
+**L2 Hit Rate vs NTT Size:**
+
+| Size | Working Set | L2 Hit Rate (radix-8 outer) | L2 Hit Rate (radix-4 leftover) |
+|---|---|---|---|
+| 2^18 | 8 MB | 64.8% | 47.9% |
+| 2^20 | 32 MB | 60.6% | — |
+| 2^22 | 128 MB | **58.5%** | — |
+
+### 8.2 All Kernels at 2^22
+
+| Kernel | L2 Hit Rate | Grid Config |
+|---|---|---|
+| `ntt_bit_reverse_kernel` | 65.5% | (16384, 1, 1) x (256, 1, 1) |
+| `ntt_fused_stages_barrett_kernel<10>` | 78.1% | (4096, 1, 1) x (512, 1, 1) |
+| `ntt_outer_radix8_barrett_kernel` | **58.5%** | (30, 1, 1) x (256, 1, 1) |
+
+### 8.3 Radix-8 Outer Kernel Detailed Profile (2^22)
+
+| Metric | Value |
+|---|---|
+| Occupancy (theoretical) | 16.7% (register-limited, 174 regs) |
+| ALU utilization | 20.7% |
+| Uncoalesced global accesses | 50% excessive sectors (16/32 bytes utilized) |
+| Top stall | Instruction fetch/select: 55.3% of stall cycles |
+| Issue rate | 1 instruction per 5.0 cycles |
+| Eligible warps per cycle | 0.27 (of 2.0 active) |
+| Blocks per SM | 1 (vs 2 for radix-4 at 98 regs) |
+
+### 8.4 Radix-8 Register Pressure
+
+| Kernel | Registers | Blocks/SM | Total Blocks |
+|---|---|---|---|
+| Radix-4 Montgomery | 86 | 2 | 60 |
+| Radix-4 Barrett | 98 | 2 | 60 |
+| **Radix-8 Montgomery** | **134** | **1** | **30** |
+| **Radix-8 Barrett** | **174** | **1** | **30** |
+
+No register spills (STACK:0, LOCAL:0) on any kernel.
+
+### 8.5 Stockham v1.8.0 Decision: NO-GO
+
+L2 hit rate at 2^22 is 58.5%, well above the 50% threshold. The outer stages are **bandwidth-bound**, not latency-bound. Stockham's sequential access pattern would not improve L2 reuse since it is already effective. The hit rate barely degrades from 2^18 (65%) to 2^22 (58.5%) despite a 16x increase in working set.
+
+### 8.6 Primary Optimization Targets Identified
+
+1. **50% uncoalesced access** — the stride-h butterfly pattern wastes half the sector bandwidth. This is the dominant inefficiency.
+2. **16.7% occupancy** — 174 registers for Barrett radix-8 limits to 1 block/SM. The Montgomery variant (134 regs) is similarly limited.
+3. **Instruction cache thrashing** — 55% of stall cycles are instruction fetch/select, likely due to the large kernel body (Barrett radix-8: ~174 regs of live state cycling through the 3-stage butterfly).
+
+**ncu-rep files**: `results/data/l2_diag_outer_2e{18,20,22}.ncu-rep`, `results/data/l2_diag_all_2e22.ncu-rep`
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)

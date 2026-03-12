@@ -730,128 +730,95 @@ radix-8 + OTF outer-stage rewrite (standalone OTF is too small to measure above 
 
 ---
 
-### Session 12 — L2 Diagnostic + Radix-8 Butterfly Design
+### Session 12 — L2 Diagnostic + Radix-8 Butterfly Design ✅ COMPLETE
 
 **Objective:** Profile the outer stages to determine whether they are latency-bound or
 bandwidth-bound (informing Stockham feasibility in v1.8.0), and design + implement the
 radix-8 butterfly device function with register pressure analysis.
 
-**Part A — L2 Hit-Rate Diagnostic:**
+**Part A — L2 Hit-Rate Diagnostic: COMPLETE**
 
-This is the 2-line ncu diagnostic from the retrospective doc. Results inform:
-- Whether Stockham (v1.8.0) is worth implementing
-- Optimal register vs. memory tradeoffs for radix-8
-- Whether twiddle traffic is a significant fraction of total DRAM
+Profiled with ncu 2025.1.1 `--set full` at 2^18, 2^20, 2^22. Results:
 
-**Tasks:**
-- Profile radix-4 outer kernel with ncu L1/L2 metrics:
-  ```bash
-  ncu --metrics l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,\
-  dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sectors_srcunit_tex_op_read.sum,\
-  lts__t_sector_op_read_hit_rate.pct \
-      --kernel-name-base function --kernel-id ::ntt_outer_radix4: \
-      ./build/Release/ntt_profile.exe
-  ```
-- Profile at n=2^18, 2^20, 2^22 to see how hit rate changes with array size vs L2 capacity
-- Profile twiddle-specific traffic: is twiddle load a measurable fraction of total DRAM?
-- Document results in `results/analysis.md` (new section: "L2 Cache Behavior at v1.4.0")
-- **Decision point**: If L2 hit rate < 20% at 2^22 → latency-bound (Stockham likely helps).
-  If > 50% → bandwidth-bound (Stockham won't help much). Record for v1.8.0 go/no-go.
+| Size | Working Set | L2 Hit Rate (radix-8 outer) |
+|------|------------|---------------------------|
+| 2^18 | 8 MB | 64.8% |
+| 2^20 | 32 MB | 60.6% |
+| 2^22 | 128 MB | **58.5%** |
 
-**Part B — Radix-8 Butterfly Design:**
+**Decision: Stockham v1.8.0 → NO-GO.** L2 hit rate 58.5% at 2^22 is well above the 50%
+threshold — outer stages are bandwidth-bound, not latency-bound. Stockham's sequential
+access pattern would not improve L2 reuse.
 
-**Tasks:**
-- Design `radix8_butterfly_outer()` device function:
-  - Process 8 data elements at indices base+{0, h, 2h, 3h, 4h, 5h, 6h, 7h} where h=2^s
-  - Fuse 3 consecutive outer stages (s, s+1, s+2) into 1 memory pass
-  - 8 loads + 8 stores (vs 24+24 for three radix-2 passes) = **67% DRAM reduction per triple**
-  - Arithmetic: 7 twiddle multiplies + 8 ff_add/ff_sub per radix-8 unit
-  - Twiddle indexing: 7 distinct twiddle values per butterfly:
-    - Stage s: w_s(j) — 4 butterflies of (a0,a4), (a1,a5), (a2,a6), (a3,a7)
-    - Stage s+1: w_{s+1}(j), w_{s+1}(j+h) — 4 butterflies of (a0',a2'), etc.
-    - Stage s+2: w_{s+2}(j), w_{s+2}(j+h), w_{s+2}(j+2h), w_{s+2}(j+3h) — 4 butterflies
-  - Implement for both Montgomery (ff_mul_ptx) and Barrett (ff_mul_barrett_v2)
-- Analyze register pressure with `--ptxas-options=-v`:
-  - Radix-8 needs 8 FpElements in registers = 64 registers for data alone
-  - Plus 7 twiddle values (reusable, not all live simultaneously) + temps
-  - Estimate: 80–100 registers per thread → occupancy ≈ 1 block/SM for K=10
-  - RTX 3060: 65,536 registers per SM ÷ 100 regs/thread = 655 threads max
-  - With OPT_BLOCK=256: 2 blocks/SM (if 100 regs) or 1 block/SM (if >128 regs)
-  - **Fallback plan**: if register pressure kills occupancy, use radix-8 only when
-    num_outer_stages % 3 == 0, and radix-4 for remainder (hybrid approach)
-- Compile test: build a standalone device function, check register count, verify
-  it doesn't spill to local memory
+Additional findings from full profile (radix-8 Barrett outer at 2^22):
+- Occupancy: 16.7% (174 regs, register-limited, 1 block/SM)
+- 50% uncoalesced global accesses (stride-h pattern, 16/32 bytes per sector)
+- Top stall: instruction fetch/select (55.3% of stall cycles)
+- ALU utilization: 20.7%
+- ncu-rep files: `results/data/l2_diag_*.ncu-rep`
 
-**Deliverables:**
-- L2 diagnostic results + analysis (go/no-go for Stockham)
-- `radix8_butterfly_outer()` device function (Montgomery + Barrett)
-- Register pressure report: actual vs theoretical occupancy
-- Updated `results/analysis.md` with L2 and register sections
+**Part B — Radix-8 Butterfly: COMPLETE**
+
+Implemented 4 cooperative kernels + 8 occupancy helpers + 4 launch helpers:
+- `ntt_outer_radix8_kernel` / `_barrett_kernel` / `_batch_kernel` / `_batch_barrett_kernel`
+- Dispatch updated: radix-8 → radix-4 → radix-2 fallback in all 4 dispatch functions
+- Leftover handling: 0→done, 1→radix-2 launch, 2→radix-4 cooperative launch
+
+Register pressure (actual, no spills):
+
+| Kernel | Registers | Blocks/SM | vs Radix-4 |
+|--------|-----------|-----------|-----------|
+| Radix-8 Montgomery (single) | 134 | 1 | +48 (vs 86) |
+| Radix-8 Montgomery (batch) | 128 | 1 | +42 (vs 86) |
+| Radix-8 Barrett (single) | 174 | 1 | +76 (vs 98) |
+| Radix-8 Barrett (batch) | 174 | 1 | +76 (vs 98) |
+
+All 230 existing tests pass. Profiling confirms radix-8 path is active at all sizes ≥ 2^13.
 
 ---
 
-### Session 13 — Radix-8 Cooperative Kernels + Correctness
+### Session 13 — Radix-8 Correctness Tests + Benchmark
 
-**Objective:** Implement the full radix-8 cooperative outer-stage kernels and validate
-correctness at all sizes.
+**Objective:** Validate radix-8 correctness at all sizes with dedicated tests, and benchmark
+radix-8 vs radix-4 to measure actual performance impact. Kernels and dispatch logic are
+already implemented (completed in Session 12 ahead of schedule).
+
+**NOTE:** Session 12 ncu profiling revealed 50% uncoalesced access and 16.7% occupancy for
+the Barrett radix-8 kernel. If benchmark shows radix-8 is slower than radix-4 due to
+register pressure (174 regs Barrett → 1 block/SM vs 2 for radix-4), consider:
+- `--maxrregcount=128` to force register spilling and recover 2 blocks/SM occupancy
+- Montgomery-only radix-8 (134 regs) with Barrett falling back to radix-4
+- Re-profiling with ncu after any changes to verify impact
 
 **Tasks:**
-- Implement 4 new cooperative kernels in `src/ntt_optimized.cu`:
-  - `ntt_outer_radix8_kernel` (Montgomery, single)
-  - `ntt_outer_radix8_barrett_kernel` (Barrett, single)
-  - `ntt_outer_radix8_batch_kernel` (Montgomery, batched)
-  - `ntt_outer_radix8_batch_barrett_kernel` (Barrett, batched)
-- Kernel structure (extending the radix-4 pattern):
-  ```cuda
-  for (int pass = 0; pass < num_r8_passes; ++pass) {
-      const int s = start_stage + 3 * pass;  // triple of stages
-      // ... radix-8 butterfly over 8 elements ...
-      if (pass + 1 < num_r8_passes) grid.sync();
-  }
-  ```
-- Stage allocation logic for n=2^22 (12 outer stages, K=10):
-  - Radix-8: 12 / 3 = 4 passes (no remainder) → single cooperative launch
-  - General: `num_r8_passes = num_outer / 3`, leftover = num_outer % 3
-  - Leftover handling:
-    - 0 leftover: all radix-8 (ideal)
-    - 1 leftover: num_r8_passes radix-8 + 1 radix-2 (append to same coop launch)
-    - 2 leftover: num_r8_passes radix-8 + 1 radix-4 (append to same coop launch)
-  - **Hybrid kernel**: single cooperative kernel that does radix-8 passes, then optionally
-    a radix-4 pass, then optionally a radix-2 pass. Avoids extra kernel launches.
-- Modify dispatch logic in all 4 host functions:
-  `ntt_forward`, `ntt_inverse`, `ntt_forward_batch`, `ntt_inverse_batch`
-  - Try radix-8 first; fall back to radix-4 if occupancy insufficient
-  - Occupancy query: `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for radix-8 kernel
-- Handle edge case: n=2^11 has only 1 outer stage (K=10 fuses 10, only stage 10 left)
-  → radix-2 only, no radix-8 possible. Threshold: need ≥3 outer stages for radix-8.
 
-**Test plan — Radix-8 correctness:**
-- **Forward NTT vs CPU reference (radix-8 path exercised):**
-  - All sizes 2^10..2^22 (radix-8 active for sizes where ≥3 outer stages exist)
-  - Radix-8 vs existing radix-4 output: **bitwise identical** at all sizes
-- **Roundtrip INTT(NTT(x)) = x:**
-  - All sizes 2^10..2^22, both Montgomery and Barrett
-- **Cross-validation (radix-8 vs radix-4):**
-  - Force radix-4 path and radix-8 path separately, compare outputs
-  - Sizes 2^13..2^22 (sizes where both paths are meaningful)
-  - Both Montgomery and Barrett
-- **Batched radix-8:**
-  - Batch B=8 vs sequential: 2^15, 2^18, 2^20, 2^22
-  - Batched radix-8 vs batched radix-4: bitwise identical
-- **Leftover handling:**
-  - n where outer stages % 3 == 0 (e.g., 2^22: 12 outer = 4×3, clean)
-  - n where outer stages % 3 == 1 (e.g., 2^14: 4 outer = 1×3 + 1)
-  - n where outer stages % 3 == 2 (e.g., 2^15: 5 outer = 1×3 + 2)
-  - Verify correct fallback to radix-4/radix-2 for leftover stages
-- **Occupancy fallback:**
-  - If radix-8 has insufficient occupancy at some block count, verify graceful
-    fallback to radix-4 path (same output, no crash)
+**Part A — Correctness Tests (add to `tests/test_correctness.cu`):**
+- Forward NTT vs CPU reference at all sizes 2^10..2^22 (radix-8 active where ≥3 outer)
+- Roundtrip INTT(NTT(x)) = x at all sizes, both Montgomery and Barrett
+- Batched radix-8: B=8 vs sequential at 2^15, 2^18, 2^20, 2^22
+- Leftover handling:
+  - num_outer % 3 == 0 (e.g., 2^22: 12 outer = 4×3)
+  - num_outer % 3 == 1 (e.g., 2^14: 4 outer = 1×3 + 1)
+  - num_outer % 3 == 2 (e.g., 2^15: 5 outer = 1×3 + 2)
+- Target: ≥30 new tests (total ~260)
+
+**Part B — Benchmark:**
+- Measure radix-8 vs radix-4 at 2^15, 2^18, 2^20, 2^22 (single + batched)
+- Both Montgomery and Barrett paths
+- Key question: does radix-8's 1 block/SM (vs radix-4's 2 blocks/SM) hurt or help?
+  - If net slower: try `--maxrregcount=128` or Montgomery-only radix-8
+- Update benchmark data files in `results/data/`
+
+**Part C — Re-profiling (if needed):**
+- If `--maxrregcount` or other register pressure mitigations are applied, re-profile
+  with ncu to verify occupancy improvement and measure coalescing impact
+- Use existing `profiling/scripts/l2_diagnostic.ps1` to compare before/after
 
 **Deliverables:**
-- 4 new cooperative radix-8 kernels in `ntt_optimized.cu`
-- Updated dispatch logic with radix-8 → radix-4 → radix-2 fallback chain
-- Hybrid kernel handling leftover stages (radix-8 + radix-4/radix-2 tail)
-- Correctness tests: ≥30 new tests (target ~260 total)
+- ≥30 new correctness tests for radix-8 paths
+- Benchmark comparison: radix-8 vs radix-4 at key sizes
+- Decision: keep radix-8 for Barrett, Montgomery, or both
+- Updated `results/analysis.md` with benchmark results
 
 ---
 
