@@ -1009,64 +1009,54 @@ validate with exhaustive tests.
 
 ---
 
-### Session 17 — Multi-Field NTT Integration + Correctness
+### Session 17 — Multi-Field NTT Integration + Correctness ✅
 
 **Objective:** Implement NTT kernels for Goldilocks and BabyBear fields, validate
 correctness, handle field-specific optimizations.
 
-**Design decision — Separate kernels vs templates:**
-- **Separate kernels** (recommended): Each field has fundamentally different element size
-  (32B vs 8B vs 4B), different shared memory per element, different register pressure.
-  Template instantiation would work but shared memory sizing, thread counts, and K values
-  all differ. Separate implementation is cleaner and allows per-field tuning.
-- Goldilocks: 8 bytes/element → K=10 fuses 1024 elements × 8B = 8 KB shmem (vs 32 KB for BLS)
-  → could potentially go to K=12 (4096 elements × 8B = 32 KB) for deeper fusion
-- BabyBear: 4 bytes/element → K=10 fuses 1024 × 4B = 4 KB → could go to K=13 (8192 × 4B = 32 KB)
+**Result:** Both fields' NTT kernels implemented and validated. 458/458 tests pass (374 existing + 84 new).
+- Goldilocks NTT: `src/ntt_goldilocks.cu` (~700 lines) + `include/ntt_goldilocks.cuh`
+- BabyBear NTT: `src/ntt_babybear.cu` (~700 lines) + `include/ntt_babybear.cuh`
+- Architecture (both fields): fused inner K=8/9/10/11 + cooperative radix-8 → radix-4 → radix-2 outer
+- K=11 max: 2048 elements, 1024 threads (limited by threads/block, not shmem)
+  - GL shmem: 2048 × 8B = 16 KB; BB shmem: 2048 × 4B = 8 KB
+- Standard form throughout (no Montgomery conversion overhead)
+- Register pressure trivial: GL ~40-50 regs, BB ~20-30 regs (vs 134 BLS12-381 Montgomery)
+- Twiddle precomputation via CPU reference (GlRef/BbRef), uploaded once to device
+- Radix-8 default for outer stages (no register pressure concerns)
+- No separate fused kernel TU needed (no RDC template issues with simple scalar arithmetic)
 
-**Tasks:**
-- Implement Goldilocks NTT in new `src/ntt_goldilocks.cu`:
-  - Fused inner kernel (K=10 minimum, explore K=12 for deeper fusion)
-  - Cooperative outer-stage kernel (radix-4 or radix-8 depending on v1.5.0 results)
-  - **OTF twiddles**: Goldilocks mul is ~5-8 instructions (vs 128 MADs for BLS12-381).
-    OTF may be viable here — reuse existing `twiddle_otf.cuh` infrastructure from Session 14.
-  - Bit-reverse permutation kernel
-  - Twiddle precomputation: find primitive root for Goldilocks field
-    (p-1 = 2^32 × (2^32 - 1), has large power-of-2 factor → NTT-friendly up to 2^32!)
-  - Forward + inverse, single + batched
-- Implement BabyBear NTT in new `src/ntt_babybear.cu`:
-  - Same structure as Goldilocks
-  - BabyBear p-1 = 2^27 × (2^4 - 1) → NTT-friendly up to 2^27
-  - Explore deeper fusion: K=12 or K=13 (entire NTT may fit in shmem for small sizes)
-- Public API additions to `include/ntt.cuh` (or new headers):
-  ```cpp
-  void ntt_forward_goldilocks(GoldilocksElement* d_data, size_t n, cudaStream_t stream = 0);
-  void ntt_inverse_goldilocks(GoldilocksElement* d_data, size_t n, cudaStream_t stream = 0);
-  void ntt_forward_babybear(BabyBearElement* d_data, size_t n, cudaStream_t stream = 0);
-  void ntt_inverse_babybear(BabyBearElement* d_data, size_t n, cudaStream_t stream = 0);
-  ```
-- CPU reference NTT for both fields in `tests/ff_reference.h`
-  (extend existing CPU NTT with field-generic template or separate functions)
+**Design decision — Separate kernels (chosen):** Each field has fundamentally different
+element size (32B vs 8B vs 4B), shared memory per element, and register pressure.
+Separate implementation is cleaner and allows per-field tuning.
 
-**Test plan — Multi-field NTT correctness:**
-- **Forward NTT vs CPU reference:**
-  - Goldilocks: sizes 2^10..2^22 (13 sizes)
-  - BabyBear: sizes 2^10..2^22 (13 sizes)
-- **Roundtrip INTT(NTT(x)) = x:**
-  - Both fields, sizes 2^10..2^22
-- **Known-vector patterns:**
-  - All-zeros, all-ones, single-nonzero, ascending for both fields (3 sizes each)
-- **Batched:**
-  - B=8 vs sequential at 2^15, 2^18, 2^22 for both fields
-- **Cross-field sanity**: at 2^10 where computation is trivially verifiable by hand,
-  verify all 3 fields produce correct DFT coefficients for a known input vector
+**K selection logic (both fields):**
+- K=11 for log_n >= 11 (2048 elements, 1024 threads)
+- K=10 for log_n >= 10
+- K=9 for log_n == 9
+- K=8 default (log_n == 8)
 
-**Deliverables:**
-- `src/ntt_goldilocks.cu` — Goldilocks NTT implementation
-- `src/ntt_babybear.cu` — BabyBear NTT implementation
-- Updated `include/ntt.cuh` (or `include/ntt_goldilocks.cuh`, `include/ntt_babybear.cuh`)
-- CPU reference NTT for both fields
-- NTT correctness tests: ~30 new tests per field (~60 total)
-- Target: ~340 total tests
+**Note on deeper fusion (K=12/K=13):** Not implemented. While shmem would allow it
+(GL: 32 KB for K=12, BB: 32 KB for K=13), the 1024 threads/block hardware limit means
+K=11 is the practical maximum (2^K / 2 = 1024 threads for K=11). Going beyond K=11
+would require fundamentally different thread-to-element mapping.
+
+**Warp shuffle details:**
+- Goldilocks: `gl_shfl_xor` splits uint64_t into 2×uint32_t for `__shfl_xor_sync`
+- BabyBear: `bb_shfl_xor` uses direct uint32_t `__shfl_xor_sync` (single instruction)
+
+**Tests (84 new, 42 per field):**
+- Forward NTT vs CPU reference: 11 sizes (2^8..2^22, all K paths + leftover patterns)
+- Roundtrip INTT(NTT(x)) = x: 8 sizes (2^8..2^22 step 2)
+- Known vectors: 3 sizes × 4 patterns (zeros, ones, single-nonzero, ascending) = 12
+- Forward zeros NTT(0) = 0: 2 sizes
+- Inverse explicit fwd(inv(x)) = x: 2 sizes
+- Batch vs sequential: 4 configs (B=4, B=8)
+- Batch roundtrip: 3 configs
+
+**Bug fixed:** Radix-8 single kernel in ntt_goldilocks.cu initially had a double-load
+bug (botched first butterfly attempt + redundant global memory reload). Fixed by removing
+the redundant first attempt, keeping only the clean radix-8 butterfly matching the batch kernel.
 
 ---
 
@@ -1107,7 +1097,7 @@ correctness, handle field-specific optimizations.
 - 3-field benchmark data: `results/data/bench_v160.json`
 - Comparison charts in `results/charts/`
 - Updated README with multi-field performance table
-- All tests green (target: ~340 total)
+- All tests green (458 after Session 17)
 - Git tag v1.6.0
 
 ---
@@ -1439,7 +1429,7 @@ read/write contiguous blocks regardless of stage.
 | **14** | **v1.5.0** | **OTF twiddle computation** ✅ | **NEGATIVE RESULT: 56.9 ms vs 15.6 ms (+265%). Disabled.** |
 | **15** | **v1.5.0** | **Benchmark + profile + release v1.5.0** ✅ | **15.5 ms at 2^22. 333 tests.** |
 | **16** | **v1.6.0** | **Goldilocks + BabyBear field arithmetic** ✅ | **GPU+CPU ref, 374 tests. GL 3.6x, BB 6.8x faster mul.** |
-| 17 | v1.6.0 | Multi-field NTT integration + correctness | Field-specific kernel tuning |
+| **17** | **v1.6.0** | **Multi-field NTT integration + correctness** ✅ | **Fused K=8-11 + radix-8/4/2 outer, batched. 458 tests.** |
 | 18 | v1.6.0 | 3-way benchmark + charts + release v1.6.0 | Portfolio/insight feature |
 | 19 | v1.7.0 | Plantard arithmetic + twiddle precompute | Eliminate 1 big-int mul/butterfly |
 | 20 | v1.7.0 | Plantard NTT integration + benchmark + release v1.7.0 | ~2–5% total improvement |

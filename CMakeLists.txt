@@ -66,6 +66,8 @@ add_library(zkp_ntt_core STATIC
     src/ntt_optimized.cu
     src/ntt_async.cu
     src/ntt_4step.cu
+    src/ntt_goldilocks.cu
+    src/ntt_babybear.cu
 )
 set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON

@@ -9,9 +9,10 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
   cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
 - **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
   Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
-- **v1.6.0 in progress**: Goldilocks (64-bit) + BabyBear (31-bit) field arithmetic complete.
-  NTT kernels for both fields next (Session 17).
-- **Next**: Multi-field NTT integration, Plantard reduction
+- **v1.6.0 in progress**: Goldilocks (64-bit) + BabyBear (31-bit) field arithmetic + NTT kernels complete.
+  Session 17 done: full NTT for both fields (fused K=8-11 + cooperative radix-8/4/2 outer + batched). 458 tests.
+  Session 18 remains (benchmark + charts + release).
+- **Next**: Multi-field NTT benchmark, Plantard reduction
 
 ---
 
@@ -84,9 +85,11 @@ CMake targets:
   - BabyBear: `BbRef` (uint32_t), NTT reference
 
 ### NTT
-- All NTT operate on BLS12-381 scalar field elements
-- Input/output in standard (non-Montgomery) form
-- Three arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead),
+- BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
+- Goldilocks NTT: `ntt_goldilocks.cuh` (standard-form, fused K=8-11 + cooperative radix-8/4/2 outer)
+- BabyBear NTT: `ntt_babybear.cuh` (standard-form, fused K=8-11 + cooperative radix-8/4/2 outer)
+- Input/output in standard (non-Montgomery) form for all fields
+- BLS12-381 three arithmetic paths: `NTTMode::OPTIMIZED` (Montgomery internal, conversion overhead),
   `NTTMode::BARRETT` (standard-form throughout, no conversion),
   and `NTTMode::FOUR_STEP` (4-step Bailey's algorithm, Barrett arithmetic)
 - Batched NTT: `ntt_forward_batch()` / `ntt_inverse_batch()` process B independent NTTs
@@ -95,6 +98,8 @@ CMake targets:
   Shared across all NTTs in a batch (single precomputation, B× reuse)
 - NTT size must be power of 2, range [2^8 .. 2^26]
 - Butterfly operation: `A[i] += w * A[j]; A[j] = A[i] - 2*w*A[j]` (in-place Cooley-Tukey)
+- Goldilocks/BabyBear NTT: K=11 max (2048 elements, 1024 threads), radix-8 outer default
+  (register pressure trivial: ~40-50 regs GL, ~20-30 BB vs 134 BLS12-381 Montgomery)
 
 ---
 
@@ -108,6 +113,8 @@ include/
   ff_goldilocks.cuh   — Goldilocks field (p=2^64-2^32+1, uint64_t): add, sub, mul, pow, inv
   ff_babybear.cuh     — BabyBear field (p=2^31-2^27+1, uint32_t): add, sub, mul, pow, inv
   ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
+  ntt_goldilocks.cuh  — Goldilocks NTT public interface (forward/inverse, single/batched)
+  ntt_babybear.cuh    — BabyBear NTT public interface (forward/inverse, single/batched)
   pipeline.cuh        — AsyncNTTPipeline class interface
   twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
@@ -119,6 +126,8 @@ src/
   ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
   ntt_4step.cu        — 4-step NTT: transpose kernel, twiddle multiply, forward/inverse (single + batched)
   ntt_async.cu        — Double-buffered async pipeline NTT
+  ntt_goldilocks.cu   — Goldilocks NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
+  ntt_babybear.cu     — BabyBear NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
   benchmark.cu        — Main benchmark entry point
 
 tests/
@@ -341,7 +350,7 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.5.0 complete, v1.6.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progress (Session 16 done).
+Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progress (Session 17 done).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
@@ -352,9 +361,9 @@ Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progres
   OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.5 ms Montgomery** at 2^22 (-9% vs v1.4.0). 333 tests.
 
 ### In Progress
-- **v1.6.0** — Multi-field NTT (Goldilocks + BabyBear). Session 16 complete: field arithmetic
-  for both fields (GPU + CPU reference). 374 tests. Mul throughput: Goldilocks 3.6x, BabyBear
-  6.8x faster than BLS12-381 (all DRAM-bound at 2^22). Sessions 17-18 remain (NTT kernels + benchmark).
+- **v1.6.0** — Multi-field NTT (Goldilocks + BabyBear). Session 17 complete: full NTT kernels
+  for both fields (fused K=8-11, cooperative radix-8/4/2 outer, single + batched, forward + inverse).
+  458 tests. Session 18 remains (benchmark + charts + release).
 
 ---
 

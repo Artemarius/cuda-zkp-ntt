@@ -6,6 +6,8 @@
 #include "ff_goldilocks.cuh"
 #include "ff_babybear.cuh"
 #include "ntt.cuh"
+#include "ntt_goldilocks.cuh"
+#include "ntt_babybear.cuh"
 #include "pipeline.cuh"
 #include "cuda_utils.cuh"
 #include "ff_reference.h"
@@ -2919,6 +2921,452 @@ void test_babybear_algebraic() {
     TEST_ASSERT(a_to_pm1 == BbRef::one(), "BB: a^(p-1) = 1");
 }
 
+// ─── v1.6.0 Session 17: Goldilocks NTT Tests ────────────────────────────────
+
+void test_gl_ntt_forward(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_gl_ntt_forward (n=2^%d)...\n", log_n);
+
+    // Generate test data
+    std::vector<GlRef> h_ref(n);
+    std::vector<GoldilocksElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t v = (i * 12345678901ull + 6789ull) % GL_P;
+        h_ref[i] = GlRef::from_u64(v);
+        h_data[i].val = v;
+    }
+
+    // CPU reference NTT
+    gl_ntt_forward_reference(h_ref, n);
+
+    // GPU NTT
+    GoldilocksElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_forward_goldilocks(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_ref[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "GL NTT forward vs CPU reference mismatch");
+    printf("  GL forward (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    if (pass != static_cast<int>(n)) {
+        int printed = 0;
+        for (size_t i = 0; i < n && printed < 5; ++i) {
+            if (h_data[i].val != h_ref[i].val) {
+                printf("    [%zu] gpu=%016llx cpu=%016llx\n", i,
+                    (unsigned long long)h_data[i].val, (unsigned long long)h_ref[i].val);
+                ++printed;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_gl_ntt_roundtrip(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_gl_ntt_roundtrip (n=2^%d)...\n", log_n);
+
+    std::vector<GoldilocksElement> h_orig(n), h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_orig[i].val = (i * 12345678901ull + 6789ull) % GL_P;
+        h_data[i] = h_orig[i];
+    }
+
+    GoldilocksElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_forward_goldilocks(d_data, n);
+    ntt_inverse_goldilocks(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "GL NTT roundtrip mismatch");
+    printf("  GL roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_gl_ntt_known_vectors(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_gl_ntt_known_vectors (n=2^%d)...\n", log_n);
+
+    auto run_roundtrip = [&](const char* name, std::vector<GoldilocksElement>& h_data) {
+        std::vector<GoldilocksElement> h_orig = h_data;
+        GoldilocksElement* d_data;
+        CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(GoldilocksElement)));
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+        ntt_forward_goldilocks(d_data, n);
+        ntt_inverse_goldilocks(d_data, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (h_data[i].val == h_orig[i].val) ++pass;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "GL known-vector %s (n=2^%d)", name, log_n);
+        TEST_ASSERT(pass == static_cast<int>(n), msg);
+        CUDA_CHECK(cudaFree(d_data));
+    };
+
+    // All zeros
+    { std::vector<GoldilocksElement> v(n); for (auto& e : v) e.val = 0; run_roundtrip("zeros", v); }
+    // All ones
+    { std::vector<GoldilocksElement> v(n); for (auto& e : v) e.val = 1; run_roundtrip("ones", v); }
+    // Single nonzero
+    { std::vector<GoldilocksElement> v(n); for (auto& e : v) e.val = 0; v[0].val = 42; run_roundtrip("single", v); }
+    // Ascending
+    { std::vector<GoldilocksElement> v(n); for (size_t i = 0; i < n; ++i) v[i].val = i % GL_P; run_roundtrip("ascending", v); }
+}
+
+void test_gl_ntt_batch_vs_sequential(int log_n, int batch_size) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_gl_ntt_batch_vs_sequential (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+    std::vector<GoldilocksElement> h_data(total);
+    for (size_t i = 0; i < total; ++i)
+        h_data[i].val = (i * 12345678901ull + 42ull) % GL_P;
+
+    // Sequential: run B individual NTTs
+    GoldilocksElement* d_seq;
+    CUDA_CHECK(cudaMalloc(&d_seq, total * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_seq, h_data.data(), total * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    for (int b = 0; b < batch_size; ++b)
+        ntt_forward_goldilocks(d_seq + b * n, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Batched
+    GoldilocksElement* d_batch;
+    CUDA_CHECK(cudaMalloc(&d_batch, total * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_batch, h_data.data(), total * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch_goldilocks(d_batch, batch_size, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<GoldilocksElement> h_seq(total), h_batch(total);
+    CUDA_CHECK(cudaMemcpy(h_seq.data(), d_seq, total * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_batch.data(), d_batch, total * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < total; ++i)
+        if (h_seq[i].val == h_batch[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(total), "GL batch vs sequential mismatch");
+    printf("  GL batch vs seq (n=2^%d, B=%d): %d/%zu matched\n", log_n, batch_size, pass, total);
+
+    CUDA_CHECK(cudaFree(d_seq));
+    CUDA_CHECK(cudaFree(d_batch));
+}
+
+void test_gl_ntt_batch_roundtrip(int log_n, int batch_size) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_gl_ntt_batch_roundtrip (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+    std::vector<GoldilocksElement> h_orig(total), h_data(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_orig[i].val = (i * 12345678901ull + 42ull) % GL_P;
+        h_data[i] = h_orig[i];
+    }
+
+    GoldilocksElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), total * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch_goldilocks(d_data, batch_size, n);
+    ntt_inverse_batch_goldilocks(d_data, batch_size, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, total * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < total; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(total), "GL batch roundtrip mismatch");
+    printf("  GL batch roundtrip (n=2^%d, B=%d): %d/%zu matched\n", log_n, batch_size, pass, total);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_gl_ntt_forward_zeros(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_gl_ntt_forward_zeros (n=2^%d)...\n", log_n);
+
+    std::vector<GoldilocksElement> h_data(n);
+    for (auto& e : h_data) e.val = 0;
+
+    GoldilocksElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_forward_goldilocks(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == 0) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "GL NTT(0) should be 0");
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_gl_ntt_inverse_explicit(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_gl_ntt_inverse_explicit (n=2^%d)...\n", log_n);
+
+    std::vector<GoldilocksElement> h_data(n);
+    for (size_t i = 0; i < n; ++i)
+        h_data[i].val = (i * 12345678901ull + 6789ull) % GL_P;
+    std::vector<GoldilocksElement> h_orig = h_data;
+
+    GoldilocksElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(GoldilocksElement)));
+
+    // Test fwd(inv(x)) = x
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    ntt_inverse_goldilocks(d_data, n);
+    ntt_forward_goldilocks(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "GL fwd(inv(x)) = x");
+    printf("  GL fwd(inv(x))=x (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+// ─── v1.6.0 Session 17: BabyBear NTT Tests ─────────────────────────────────
+
+void test_bb_ntt_forward(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_bb_ntt_forward (n=2^%d)...\n", log_n);
+
+    std::vector<BbRef> h_ref(n);
+    std::vector<BabyBearElement> h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t v = static_cast<uint32_t>((i * 12345u + 6789u) % BB_P);
+        h_ref[i] = BbRef::from_u32(v);
+        h_data[i].val = v;
+    }
+
+    bb_ntt_forward_reference(h_ref, n);
+
+    BabyBearElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_forward_babybear(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_ref[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "BB NTT forward vs CPU reference mismatch");
+    printf("  BB forward (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    if (pass != static_cast<int>(n)) {
+        int printed = 0;
+        for (size_t i = 0; i < n && printed < 5; ++i) {
+            if (h_data[i].val != h_ref[i].val) {
+                printf("    [%zu] gpu=%08x cpu=%08x\n", i, h_data[i].val, h_ref[i].val);
+                ++printed;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_bb_ntt_roundtrip(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_bb_ntt_roundtrip (n=2^%d)...\n", log_n);
+
+    std::vector<BabyBearElement> h_orig(n), h_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        h_orig[i].val = static_cast<uint32_t>((i * 12345u + 6789u) % BB_P);
+        h_data[i] = h_orig[i];
+    }
+
+    BabyBearElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_forward_babybear(d_data, n);
+    ntt_inverse_babybear(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "BB NTT roundtrip mismatch");
+    printf("  BB roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_bb_ntt_known_vectors(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_bb_ntt_known_vectors (n=2^%d)...\n", log_n);
+
+    auto run_roundtrip = [&](const char* name, std::vector<BabyBearElement>& h_data) {
+        std::vector<BabyBearElement> h_orig = h_data;
+        BabyBearElement* d_data;
+        CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+        ntt_forward_babybear(d_data, n);
+        ntt_inverse_babybear(d_data, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+        int pass = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (h_data[i].val == h_orig[i].val) ++pass;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "BB known-vector %s (n=2^%d)", name, log_n);
+        TEST_ASSERT(pass == static_cast<int>(n), msg);
+        CUDA_CHECK(cudaFree(d_data));
+    };
+
+    { std::vector<BabyBearElement> v(n); for (auto& e : v) e.val = 0; run_roundtrip("zeros", v); }
+    { std::vector<BabyBearElement> v(n); for (auto& e : v) e.val = 1; run_roundtrip("ones", v); }
+    { std::vector<BabyBearElement> v(n); for (auto& e : v) e.val = 0; v[0].val = 42; run_roundtrip("single", v); }
+    { std::vector<BabyBearElement> v(n); for (size_t i = 0; i < n; ++i) v[i].val = static_cast<uint32_t>(i % BB_P); run_roundtrip("ascending", v); }
+}
+
+void test_bb_ntt_batch_vs_sequential(int log_n, int batch_size) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_bb_ntt_batch_vs_sequential (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+    std::vector<BabyBearElement> h_data(total);
+    for (size_t i = 0; i < total; ++i)
+        h_data[i].val = static_cast<uint32_t>((i * 12345u + 42u) % BB_P);
+
+    BabyBearElement* d_seq;
+    CUDA_CHECK(cudaMalloc(&d_seq, total * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_seq, h_data.data(), total * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    for (int b = 0; b < batch_size; ++b)
+        ntt_forward_babybear(d_seq + b * n, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    BabyBearElement* d_batch;
+    CUDA_CHECK(cudaMalloc(&d_batch, total * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_batch, h_data.data(), total * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch_babybear(d_batch, batch_size, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<BabyBearElement> h_seq(total), h_batch(total);
+    CUDA_CHECK(cudaMemcpy(h_seq.data(), d_seq, total * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_batch.data(), d_batch, total * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < total; ++i)
+        if (h_seq[i].val == h_batch[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(total), "BB batch vs sequential mismatch");
+    printf("  BB batch vs seq (n=2^%d, B=%d): %d/%zu matched\n", log_n, batch_size, pass, total);
+
+    CUDA_CHECK(cudaFree(d_seq));
+    CUDA_CHECK(cudaFree(d_batch));
+}
+
+void test_bb_ntt_batch_roundtrip(int log_n, int batch_size) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    size_t total = static_cast<size_t>(batch_size) * n;
+    printf("test_bb_ntt_batch_roundtrip (n=2^%d, B=%d)...\n", log_n, batch_size);
+
+    std::vector<BabyBearElement> h_orig(total), h_data(total);
+    for (size_t i = 0; i < total; ++i) {
+        h_orig[i].val = static_cast<uint32_t>((i * 12345u + 42u) % BB_P);
+        h_data[i] = h_orig[i];
+    }
+
+    BabyBearElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), total * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_forward_batch_babybear(d_data, batch_size, n);
+    ntt_inverse_batch_babybear(d_data, batch_size, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, total * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < total; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(total), "BB batch roundtrip mismatch");
+    printf("  BB batch roundtrip (n=2^%d, B=%d): %d/%zu matched\n", log_n, batch_size, pass, total);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_bb_ntt_forward_zeros(int log_n) {
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_bb_ntt_forward_zeros (n=2^%d)...\n", log_n);
+
+    std::vector<BabyBearElement> h_data(n);
+    for (auto& e : h_data) e.val = 0;
+
+    BabyBearElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_forward_babybear(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == 0) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "BB NTT(0) should be 0");
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_bb_ntt_inverse_explicit(int log_n) {
+    using namespace ff_ref;
+    size_t n = static_cast<size_t>(1) << log_n;
+    printf("test_bb_ntt_inverse_explicit (n=2^%d)...\n", log_n);
+
+    std::vector<BabyBearElement> h_data(n);
+    for (size_t i = 0; i < n; ++i)
+        h_data[i].val = static_cast<uint32_t>((i * 12345u + 6789u) % BB_P);
+    std::vector<BabyBearElement> h_orig = h_data;
+
+    BabyBearElement* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+
+    // Test fwd(inv(x)) = x
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    ntt_inverse_babybear(d_data, n);
+    ntt_forward_babybear(d_data, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (h_data[i].val == h_orig[i].val) ++pass;
+    TEST_ASSERT(pass == static_cast<int>(n), "BB fwd(inv(x)) = x");
+    printf("  BB fwd(inv(x))=x (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -3491,6 +3939,94 @@ int main() {
     test_babybear_gpu_mul();
     test_babybear_gpu_sqr();
     test_babybear_algebraic();
+
+    // ─── v1.6.0 Session 17: Goldilocks NTT Tests ────────────────────────────
+    printf("\n--- v1.6.0 Session 17: Goldilocks NTT ---\n");
+
+    // Forward vs CPU reference: all K paths + outer stage leftover patterns
+    test_gl_ntt_forward(8);    // K=8 only
+    test_gl_ntt_forward(9);    // K=9 only
+    test_gl_ntt_forward(10);   // K=10 only
+    test_gl_ntt_forward(11);   // K=11 only (no outer stages)
+    test_gl_ntt_forward(12);   // K=11 + 1 outer stage
+    test_gl_ntt_forward(14);   // K=11 + 3 outer (%3=0)
+    test_gl_ntt_forward(15);   // K=11 + 4 outer (%3=1)
+    test_gl_ntt_forward(16);   // K=11 + 5 outer (%3=2)
+    test_gl_ntt_forward(18);   // K=11 + 7 outer
+    test_gl_ntt_forward(20);   // K=11 + 9 outer (%3=0)
+    test_gl_ntt_forward(22);   // K=11 + 11 outer
+
+    // Roundtrip INTT(NTT(x)) = x
+    for (int log_n = 8; log_n <= 22; log_n += 2)
+        test_gl_ntt_roundtrip(log_n);
+
+    // Known vectors at representative sizes
+    test_gl_ntt_known_vectors(10);
+    test_gl_ntt_known_vectors(15);
+    test_gl_ntt_known_vectors(20);
+
+    // Forward zeros: NTT(0) = 0
+    test_gl_ntt_forward_zeros(12);
+    test_gl_ntt_forward_zeros(20);
+
+    // Inverse explicit: fwd(inv(x)) = x
+    test_gl_ntt_inverse_explicit(15);
+    test_gl_ntt_inverse_explicit(20);
+
+    // Batched: batch vs sequential
+    test_gl_ntt_batch_vs_sequential(10, 4);
+    test_gl_ntt_batch_vs_sequential(15, 4);
+    test_gl_ntt_batch_vs_sequential(15, 8);
+    test_gl_ntt_batch_vs_sequential(18, 2);
+
+    // Batched roundtrip
+    test_gl_ntt_batch_roundtrip(10, 4);
+    test_gl_ntt_batch_roundtrip(15, 8);
+    test_gl_ntt_batch_roundtrip(18, 2);
+
+    // ─── v1.6.0 Session 17: BabyBear NTT Tests ─────────────────────────────
+    printf("\n--- v1.6.0 Session 17: BabyBear NTT ---\n");
+
+    // Forward vs CPU reference
+    test_bb_ntt_forward(8);
+    test_bb_ntt_forward(9);
+    test_bb_ntt_forward(10);
+    test_bb_ntt_forward(11);
+    test_bb_ntt_forward(12);
+    test_bb_ntt_forward(14);
+    test_bb_ntt_forward(15);
+    test_bb_ntt_forward(16);
+    test_bb_ntt_forward(18);
+    test_bb_ntt_forward(20);
+    test_bb_ntt_forward(22);
+
+    // Roundtrip
+    for (int log_n = 8; log_n <= 22; log_n += 2)
+        test_bb_ntt_roundtrip(log_n);
+
+    // Known vectors
+    test_bb_ntt_known_vectors(10);
+    test_bb_ntt_known_vectors(15);
+    test_bb_ntt_known_vectors(20);
+
+    // Forward zeros
+    test_bb_ntt_forward_zeros(12);
+    test_bb_ntt_forward_zeros(20);
+
+    // Inverse explicit
+    test_bb_ntt_inverse_explicit(15);
+    test_bb_ntt_inverse_explicit(20);
+
+    // Batched: batch vs sequential
+    test_bb_ntt_batch_vs_sequential(10, 4);
+    test_bb_ntt_batch_vs_sequential(15, 4);
+    test_bb_ntt_batch_vs_sequential(15, 8);
+    test_bb_ntt_batch_vs_sequential(18, 2);
+
+    // Batched roundtrip
+    test_bb_ntt_batch_roundtrip(10, 4);
+    test_bb_ntt_batch_roundtrip(15, 8);
+    test_bb_ntt_batch_roundtrip(18, 2);
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
