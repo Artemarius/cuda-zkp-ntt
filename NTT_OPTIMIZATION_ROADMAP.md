@@ -715,14 +715,15 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 stages into radix-8 butterflies, and eliminate twiddle DRAM traffic via on-the-fly computation.
 Preceded by L2 cache diagnostic to inform this and future releases.
 
-**Expected improvement:** 15–25% additional over v1.4.0. Target: ~13 ms at n=2²².
+**Measured improvement (after Session 13):** Montgomery radix-8 gives **−8.2%** (15.6 ms vs 17.0 ms).
+Barrett radix-8 **disabled** (I-cache regression: 29.5 ms, +73%). Revised target: **~14 ms** with OTF.
 
 **Rationale:** v1.4.0's radix-4 gave −30% by halving outer-stage DRAM passes (12→6).
 Radix-8 fuses 3 stages per pass: 12→4 passes (another −33% from radix-4 baseline).
 Each eliminated pass saves ~128 MB DRAM R+W = ~0.7 ms at bandwidth ceiling.
-OTF twiddle computation eliminates an additional 384 MB twiddle-read traffic across
-6 outer passes, worth ~1 ms. The doc recommends deploying OTF as part of a combined
-radix-8 + OTF outer-stage rewrite (standalone OTF is too small to measure above noise).
+However, Barrett radix-8's 174 registers cause I-cache thrashing (55% I-fetch stalls),
+so only Montgomery benefits from radix-8 (134 regs). OTF twiddle computation eliminates
+twiddle-read DRAM traffic, worth ~1 ms for Montgomery radix-8's 4 outer passes.
 
 **Key references:**
 - Özcan, Javeed, Savaş — "High-Performance NTT on GPU", IEEE Access 2025
@@ -777,55 +778,70 @@ All 230 existing tests pass. Profiling confirms radix-8 path is active at all si
 
 ---
 
-### Session 13 — Radix-8 Correctness Tests + Benchmark
+### Session 13 — Radix-8 Correctness Tests + Benchmark ✅ COMPLETE
 
 **Objective:** Validate radix-8 correctness at all sizes with dedicated tests, and benchmark
-radix-8 vs radix-4 to measure actual performance impact. Kernels and dispatch logic are
-already implemented (completed in Session 12 ahead of schedule).
+radix-8 vs radix-4 to measure actual performance impact.
 
-**NOTE:** Session 12 ncu profiling revealed 50% uncoalesced access and 16.7% occupancy for
-the Barrett radix-8 kernel. If benchmark shows radix-8 is slower than radix-4 due to
-register pressure (174 regs Barrett → 1 block/SM vs 2 for radix-4), consider:
-- `--maxrregcount=128` to force register spilling and recover 2 blocks/SM occupancy
-- Montgomery-only radix-8 (134 regs) with Barrett falling back to radix-4
-- Re-profiling with ncu after any changes to verify impact
+**Part A — Correctness Tests: COMPLETE (87 new tests, 317 total)**
 
-**Tasks:**
+Added comprehensive radix-8 tests covering all leftover patterns:
+- Forward NTT vs CPU reference at 2^13..2^22 (both OPTIMIZED and BARRETT) — 20 tests
+- Roundtrip INTT(NTT(x)) = x at 2^13..2^22 (both modes) — 20 tests
+- Cross-validation Barrett == Montgomery at 2^13..2^22 — 10 tests
+- Batched B=8 vs sequential at 2^15, 2^18, 2^20, 2^22 (both modes) — 7 tests
+- Batched roundtrip B=8 at 2^15, 2^18, 2^20 (both modes) — 6 tests
+- Known vectors at %3=0,1,2 leftover sizes (both modes) — 6 tests
+- Forward zeros at 2^13, 2^16, 2^22 (both modes) — 6 tests
+- Inverse explicit at 2^14, 2^15, 2^22 (both modes) — 6 tests + 6 sub-tests
 
-**Part A — Correctness Tests (add to `tests/test_correctness.cu`):**
-- Forward NTT vs CPU reference at all sizes 2^10..2^22 (radix-8 active where ≥3 outer)
-- Roundtrip INTT(NTT(x)) = x at all sizes, both Montgomery and Barrett
-- Batched radix-8: B=8 vs sequential at 2^15, 2^18, 2^20, 2^22
-- Leftover handling:
-  - num_outer % 3 == 0 (e.g., 2^22: 12 outer = 4×3)
-  - num_outer % 3 == 1 (e.g., 2^14: 4 outer = 1×3 + 1)
-  - num_outer % 3 == 2 (e.g., 2^15: 5 outer = 1×3 + 2)
-- Target: ≥30 new tests (total ~260)
+**Part B — Benchmark: COMPLETE**
 
-**Part B — Benchmark:**
-- Measure radix-8 vs radix-4 at 2^15, 2^18, 2^20, 2^22 (single + batched)
-- Both Montgomery and Barrett paths
-- Key question: does radix-8's 1 block/SM (vs radix-4's 2 blocks/SM) hurt or help?
-  - If net slower: try `--maxrregcount=128` or Montgomery-only radix-8
-- Update benchmark data files in `results/data/`
+**Key finding: Barrett radix-8 is catastrophically slow due to I-cache thrashing.**
 
-**Part C — Re-profiling (if needed):**
-- If `--maxrregcount` or other register pressure mitigations are applied, re-profile
-  with ncu to verify occupancy improvement and measure coalescing impact
-- Use existing `profiling/scripts/l2_diagnostic.ps1` to compare before/after
+Barrett radix-8 (174 regs) at 2^22: **29.5 ms** vs radix-4 baseline **17.1 ms** = +73% regression.
+Montgomery radix-8 (134 regs) at 2^22: **15.4 ms** vs radix-4 baseline **17.0 ms** = −8.2% improvement.
 
-**Deliverables:**
-- ≥30 new correctness tests for radix-8 paths
-- Benchmark comparison: radix-8 vs radix-4 at key sizes
-- Decision: keep radix-8 for Barrett, Montgomery, or both
-- Updated `results/analysis.md` with benchmark results
+Root cause: Barrett radix-8's 174 registers + bloated instruction footprint causes 55.3%
+instruction fetch stalls (profiled in Session 12). Montgomery radix-8 (134 regs) has a
+smaller instruction footprint and benefits from the DRAM traffic reduction.
+
+**Decision: Montgomery-only radix-8.** Barrett falls back to radix-4 (−73% regression eliminated).
+
+Single NTT forward (7-rep median, RTX 3060):
+
+| Size | Montgomery (radix-8) | Barrett (radix-4) | v1.4.0 Montgomery | v1.4.0 Barrett |
+|------|---|---|---|---|
+| 2^15 | 0.121 ms | 0.141 ms | 0.132 ms | 0.159 ms |
+| 2^16 | 0.225 ms | 0.255 ms | 0.244 ms | 0.308 ms |
+| 2^18 | 0.900 ms | 0.972 ms | 1.21 ms | 1.27 ms |
+| 2^20 | 3.84 ms | 4.15 ms | 5.51 ms | 5.61 ms |
+| **2^22** | **15.6 ms** | 18.0 ms | 17.0 ms | 17.1 ms |
+
+Batched 8× NTT forward (7-rep median):
+
+| Size | Montgomery (radix-8) | Barrett (radix-4) |
+|------|---|---|
+| 2^15 | 0.788 ms | 0.957 ms |
+| 2^18 | 7.08 ms | 8.12 ms |
+| 2^20 | 32.3 ms | 36.2 ms |
+| 2^22 | 139 ms | 167 ms |
+
+Montgomery radix-8 is now the fastest path at all sizes. Barrett with radix-4 is competitive
+at small sizes but Montgomery wins decisively at 2^20+ due to radix-8 outer stages.
+
+Benchmark data: `results/data/bench_v150_s13.json`
 
 ---
 
 ### Session 14 — On-the-Fly Twiddle Computation
 
 **Objective:** Replace precomputed twiddle table loads with on-the-fly computation in the
-outer-stage radix-8 kernel, eliminating ~384 MB of twiddle DRAM reads.
+outer-stage kernels (Montgomery radix-8 + Barrett radix-4), eliminating twiddle DRAM reads.
+
+**NOTE (post-Session 13):** Barrett radix-8 is disabled (I-cache regression). OTF twiddles
+should be applied to both the Montgomery radix-8 and Barrett radix-4 outer kernels.
+OTF adds compute but may help Barrett radix-4 by reducing register pressure from twiddle loads.
 
 **Background:**
 Current outer stages load twiddles from a 64 MB precomputed table (n/2 × 32 bytes at n=2^22).
@@ -1455,10 +1471,10 @@ read/write contiguous blocks regardless of stage.
 | **9** | **v1.4.0** | **Branchless arithmetic** ✅ | **Eliminate warp divergence** |
 | **10** | **v1.4.0** | **Radix-4 outer stages** ✅ | **~45% DRAM traffic reduction** |
 | **11** | **v1.4.0** | **CUDA Graphs + release** ✅ | **Graph replay (negligible gain)** |
-| 12 | v1.5.0 | L2 diagnostic + radix-8 butterfly design | Profile-guided + higher radix |
-| 13 | v1.5.0 | Radix-8 cooperative kernels + correctness | ~67% DRAM traffic reduction/triple |
+| **12** | **v1.5.0** | **L2 diagnostic + radix-8 butterfly** ✅ | **Stockham NO-GO, 4 radix-8 kernels** |
+| **13** | **v1.5.0** | **Radix-8 benchmark + correctness** ✅ | **Montgomery-only radix-8 (15.6 ms), Barrett I-cache regression** |
 | 14 | v1.5.0 | On-the-fly twiddle computation | Eliminate twiddle DRAM traffic |
-| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: ~13 ms at 2^22 |
+| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: ~14 ms at 2^22 |
 | 16 | v1.6.0 | Goldilocks + BabyBear field arithmetic | Multi-field ZKP comparison |
 | 17 | v1.6.0 | Multi-field NTT integration + correctness | Field-specific kernel tuning |
 | 18 | v1.6.0 | 3-way benchmark + charts + release v1.6.0 | Portfolio/insight feature |
@@ -1476,10 +1492,11 @@ read/write contiguous blocks regardless of stage.
 - **v1.4.0: 17.1 ms (Montgomery) / 17.4 ms (Barrett)** — branchless arithmetic (-4.4%) +
   radix-4 outer stages (-30%). CUDA Graphs add negligible improvement (within noise).
   **32% faster than v1.1.0, exceeds 18-22 ms target.**
-- v1.5.0: ~13 ms (radix-8 + OTF twiddles, −24% vs v1.4.0) — **projected**
-- v1.6.0: ~13 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
-- v1.7.0: ~12.5 ms (Plantard inner kernel, −4% vs v1.5.0) — **projected**
-- v1.8.0: ~10 ms (Stockham coalesced outer, −20% vs v1.5.0, conditional) — **projected**
+- **v1.5.0 (in progress): 15.6 ms (Montgomery radix-8, −8.2% vs v1.4.0)** — Barrett radix-8
+  disabled (I-cache regression). OTF twiddles may save ~1 ms → target **~14 ms**.
+- v1.6.0: ~14 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
+- v1.7.0: ~13.5 ms (Plantard inner kernel, −4% vs v1.5.0) — **projected**
+- v1.8.0: **CANCELLED** (Stockham NO-GO — L2 58.5% = bandwidth-bound)
 
 **Batch throughput (8× 2^22 NTTs):**
 - v1.1.0: 8 × 25.1 ms = ~201 ms (sequential)
@@ -1490,7 +1507,7 @@ read/write contiguous blocks regardless of stage.
   Best batch mode remains Barrett at 199 ms.
 - **v1.4.0: ~150 ms (Montgomery batched) / ~159 ms (Barrett batched)** — radix-4 outer stages
   reduce batch time by ~20%. Montgomery faster for batched (fewer instructions per ff_mul).
-- v1.5.0: ~100–110 ms (radix-8 batched, projected)
+- **v1.5.0 (in progress): 139 ms (Montgomery radix-8 batched)** — Barrett batched: 167 ms (radix-4)
 
 **Honest ceiling for BLS12-381 on RTX 3060 Laptop:**
 ~8–9 ms at n=2^22. The 4 MB L2 vs 128 MB array means outer stages can never achieve

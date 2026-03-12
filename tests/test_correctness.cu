@@ -2736,6 +2736,77 @@ int main() {
     // ─── v1.4.0 Session 11: CUDA Graph NTT Tests ──────────────────────────
     test_ntt_graph_vs_nongraph();
 
+    // ─── v1.5.0 Session 13: Radix-8 Outer Stage Correctness Tests ──────────
+    // Radix-8 activates at n >= 2^13 (K=10, num_outer >= 3).
+    // Leftover handling coverage:
+    //   num_outer % 3 == 0: 2^13 (3), 2^16 (6), 2^19 (9), 2^22 (12)
+    //   num_outer % 3 == 1: 2^14 (4), 2^17 (7), 2^20 (10)
+    //   num_outer % 3 == 2: 2^15 (5), 2^18 (8), 2^21 (11)
+    printf("\n--- v1.5.0 Session 13: Radix-8 outer stage tests ---\n");
+
+    // Forward NTT vs CPU reference: all sizes where radix-8 is active
+    for (int log_n = 13; log_n <= 22; ++log_n) {
+        test_ntt_forward_gpu(log_n, NTTMode::OPTIMIZED);
+    }
+    for (int log_n = 13; log_n <= 22; ++log_n) {
+        test_ntt_forward_gpu(log_n, NTTMode::BARRETT);
+    }
+
+    // Roundtrip: INTT(NTT(x)) = x for all radix-8 sizes
+    for (int log_n = 13; log_n <= 22; ++log_n) {
+        test_ntt_roundtrip_gpu(log_n, NTTMode::OPTIMIZED);
+    }
+    for (int log_n = 13; log_n <= 22; ++log_n) {
+        test_ntt_roundtrip_gpu(log_n, NTTMode::BARRETT);
+    }
+
+    // Cross-validation: Barrett == Montgomery at all radix-8 sizes
+    for (int log_n = 13; log_n <= 22; ++log_n) {
+        test_ntt_barrett_vs_montgomery(log_n);
+    }
+
+    // Batched B=8 vs sequential: both modes at key radix-8 sizes
+    // Covers leftover %3=2 (2^15), %3=2 (2^18), %3=1 (2^20), %3=0 (2^22)
+    test_ntt_batch_vs_sequential_b8(15, NTTMode::OPTIMIZED);
+    test_ntt_batch_vs_sequential_b8(18, NTTMode::OPTIMIZED);
+    test_ntt_batch_vs_sequential_b8(20, NTTMode::OPTIMIZED);
+    test_ntt_batch_vs_sequential_b8(15, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential_b8(18, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential_b8(20, NTTMode::BARRETT);
+    test_ntt_batch_vs_sequential_b8(22, NTTMode::BARRETT);
+
+    // Batched roundtrip B=8 at representative sizes
+    test_ntt_batch_roundtrip(15, 8, NTTMode::OPTIMIZED);
+    test_ntt_batch_roundtrip(18, 8, NTTMode::OPTIMIZED);
+    test_ntt_batch_roundtrip(20, 8, NTTMode::OPTIMIZED);
+    test_ntt_batch_roundtrip(15, 8, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(18, 8, NTTMode::BARRETT);
+    test_ntt_batch_roundtrip(20, 8, NTTMode::BARRETT);
+
+    // Known vectors: leftover-representative sizes, both modes
+    test_ntt_known_vectors(13, NTTMode::OPTIMIZED);  // %3=0 (3 outer = 1x3)
+    test_ntt_known_vectors(14, NTTMode::OPTIMIZED);  // %3=1 (4 outer = 1x3+1)
+    test_ntt_known_vectors(15, NTTMode::OPTIMIZED);  // %3=2 (5 outer = 1x3+2)
+    test_ntt_known_vectors(13, NTTMode::BARRETT);
+    test_ntt_known_vectors(14, NTTMode::BARRETT);
+    test_ntt_known_vectors(15, NTTMode::BARRETT);
+
+    // Forward zeros: NTT(0) = 0
+    test_ntt_forward_zeros(13, NTTMode::OPTIMIZED);
+    test_ntt_forward_zeros(16, NTTMode::OPTIMIZED);
+    test_ntt_forward_zeros(22, NTTMode::OPTIMIZED);
+    test_ntt_forward_zeros(13, NTTMode::BARRETT);
+    test_ntt_forward_zeros(16, NTTMode::BARRETT);
+    test_ntt_forward_zeros(22, NTTMode::BARRETT);
+
+    // Inverse explicit: verify both inv(fwd(x))=x AND fwd(inv(x))=x
+    test_ntt_inverse_explicit(14, NTTMode::OPTIMIZED);  // %3=1 leftover
+    test_ntt_inverse_explicit(15, NTTMode::OPTIMIZED);  // %3=2 leftover
+    test_ntt_inverse_explicit(22, NTTMode::OPTIMIZED);  // %3=0 (full radix-8)
+    test_ntt_inverse_explicit(14, NTTMode::BARRETT);
+    test_ntt_inverse_explicit(15, NTTMode::BARRETT);
+    test_ntt_inverse_explicit(22, NTTMode::BARRETT);
+
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }

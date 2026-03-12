@@ -5,9 +5,9 @@
 GPU-accelerated Number-Theoretic Transform for Zero-Knowledge Proofs.
 Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field comparison planned.
 
-- **Completed**: Fused radix-1024 inner kernel + radix-4/8 cooperative outer stages + branchless
-  arithmetic + Barrett/Montgomery dual paths + batched NTT + async pipeline + CUDA Graphs
-- **Next (v1.5.0+)**: Radix-8 correctness tests + benchmark, OTF twiddle computation,
+- **Completed**: Fused radix-1024 inner kernel + radix-8 Montgomery / radix-4 Barrett
+  cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
+- **Next (v1.5.0+)**: OTF twiddle computation, benchmark + release v1.5.0,
   Goldilocks/BabyBear multi-field comparison, Plantard reduction
 
 ---
@@ -165,11 +165,13 @@ LICENSE                — MIT License
 - Twiddle factors: precomputed table in global memory, cached in L1
 - For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
-### NTT Time Breakdown (n=2^22, v1.1.0 → v1.4.0)
+### NTT Time Breakdown (n=2^22, v1.1.0 → v1.5.0-s13)
 - Bit-reverse: ~0.3 ms (1%), Montgomery conversions: ~3.0 ms (12%)
 - Fused K=10 (stages 0-9): ~2.5 ms (10%) — **compute-bound** (69%, IPC 2.41)
-- Cooperative outer (stages 10-21): ~19.4 ms (77%) → **~11 ms (radix-4, v1.4.0)**
-- v1.4.0 total: **17.1 ms Montgomery / 17.4 ms Barrett** (was 25.2 ms in v1.1.0, -32%)
+- Cooperative outer (stages 10-21): ~19.4 ms (77%) → ~11 ms (radix-4) → **~9 ms (radix-8 Montgomery)**
+- v1.4.0: 17.1 ms Montgomery / 17.4 ms Barrett (radix-4 outer)
+- v1.5.0-s13: **15.6 ms Montgomery** (radix-8 outer) / 18.0 ms Barrett (radix-4, unchanged)
+- Barrett radix-8 disabled: 174 regs → I-cache thrashing → +73% regression
 
 ### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
@@ -274,6 +276,18 @@ LICENSE                — MIT License
 - **Measured (n=2^22, 7-rep median):** Montgomery 24.4→**17.0 ms** (**-30.3%**),
   Barrett 23.8→**17.1 ms** (**-28.2%**). Outer stages ~19.4→~11 ms (-43%).
 
+### Radix-8 Outer Stages (v1.5.0 Sessions 12-13)
+- Fuses triples of consecutive outer stages into radix-8 butterflies
+- Each radix-8 unit: 8 data loads + 8 stores (vs 6×(4+4) for 3 radix-4 stages)
+- **Montgomery only**: radix-8 (134 regs) gives −8.2% at 2^22 (15.6 ms vs 17.0 ms)
+- **Barrett disabled**: radix-8 (174 regs) causes I-cache thrashing → +73% regression.
+  Barrett stays on radix-4 (~98 regs, 2 blocks/SM).
+- Dispatch priority: radix-8 → radix-4 → radix-2 (Montgomery), radix-4 → radix-2 (Barrett)
+- Leftover handling: num_outer%3==1 → 1 radix-2, num_outer%3==2 → 1 radix-4
+- For n=2^22 Montgomery: 12 outer stages → 4 radix-8 passes in 1 cooperative launch
+- **Measured (n=2^22, 7-rep median):** Montgomery **15.6 ms** (−8.2% vs v1.4.0)
+- **Tests**: 317/317 pass (87 new radix-8 tests)
+
 ### CUDA Graphs (v1.4.0 Session 11)
 - Captures NTT kernel launch sequence as CUDA Graph on first call, replays on subsequent calls
 - API: `ntt_forward_graph()`, `ntt_inverse_graph()`, `ntt_forward_batch_graph()`,
@@ -292,13 +306,14 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.4.0**.
+Phases 1-8 complete. Current version: **v1.4.0** (v1.5.0 in progress, Sessions 12-13 done).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 - **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
+- **v1.5.0 (in progress)** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression). **15.6 ms Montgomery** at 2^22 (-8% vs v1.4.0). 317 tests.
 
 ---
 

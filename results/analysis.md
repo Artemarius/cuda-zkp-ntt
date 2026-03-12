@@ -757,6 +757,77 @@ L2 hit rate at 2^22 is 58.5%, well above the 50% threshold. The outer stages are
 
 ---
 
+## Section 9 — Radix-8 Benchmark Results (Session 13)
+
+### 9.1 Barrett Radix-8: Catastrophic Regression
+
+Initial benchmark with radix-8 active for both Montgomery and Barrett revealed a severe
+regression in the Barrett path:
+
+| Size | Barrett radix-8 | Barrett radix-4 (v1.4.0) | Change |
+|------|---|---|---|
+| 2^15 | 0.146 ms | 0.159 ms | −8% |
+| 2^18 | 1.33 ms | 1.27 ms | +5% |
+| 2^20 | 6.44 ms | 5.61 ms | +15% |
+| 2^22 | **29.5 ms** | **17.1 ms** | **+73%** |
+
+Root cause: Barrett radix-8 kernel uses 174 registers with an enormous instruction footprint.
+Session 12 profiling showed 55.3% of stall cycles in instruction fetch/select, confirming
+instruction cache thrashing as the bottleneck. The radix-4 Barrett kernel uses ~98 regs
+(2 blocks/SM) and is small enough to stay I-cache resident.
+
+### 9.2 Montgomery Radix-8: Clear Win
+
+Montgomery radix-8 (134 regs) has a smaller instruction footprint and benefits from the
+DRAM traffic reduction (4 passes vs 6 for radix-4):
+
+| Size | Montgomery radix-8 | Montgomery radix-4 (v1.4.0) | Change |
+|------|---|---|---|
+| 2^15 | 0.121 ms | 0.132 ms | −8% |
+| 2^18 | 0.900 ms | 1.21 ms | −26% |
+| 2^20 | 3.84 ms | 5.51 ms | −31% |
+| 2^22 | **15.6 ms** | **17.0 ms** | **−8.2%** |
+
+### 9.3 Decision: Montgomery-Only Radix-8
+
+Barrett dispatch changed to skip radix-8 and use radix-4 directly. After fix:
+
+| Size | Montgomery (radix-8) | Barrett (radix-4) |
+|------|---|---|
+| 2^15 | 0.121 ms | 0.141 ms |
+| 2^16 | 0.225 ms | 0.255 ms |
+| 2^18 | 0.900 ms | 0.972 ms |
+| 2^20 | 3.84 ms | 4.15 ms |
+| **2^22** | **15.6 ms** | **18.0 ms** |
+
+Montgomery radix-8 is now the fastest path at all sizes. The 15.6 ms at 2^22 is the new
+best result (was 17.0 ms in v1.4.0, −8.2%).
+
+### 9.4 Batched Performance (8× NTT)
+
+| Size | Montgomery (radix-8) | Barrett (radix-4) |
+|------|---|---|
+| 2^15 | 0.788 ms | 0.957 ms |
+| 2^18 | 7.08 ms | 8.12 ms |
+| 2^20 | 32.3 ms | 36.2 ms |
+| 2^22 | 139 ms | 167 ms |
+
+Montgomery radix-8 batched at 2^22: 139 ms / 8 = **17.4 ms per NTT** (near-linear scaling).
+
+### 9.5 Lessons Learned
+
+1. **Instruction cache is a real constraint for large kernels.** Barrett radix-8's 174 regs
+   + huge instruction body exceeded the I-cache capacity, causing 55% I-fetch stalls.
+   Montgomery at 134 regs is at the edge but still benefits.
+2. **Register count alone doesn't predict performance.** Both Montgomery and Barrett radix-8
+   have 1 block/SM (16.7% occupancy), but Montgomery is 2× faster due to instruction count.
+3. **Mixed radix strategies are viable.** Using different radix for different arithmetic paths
+   (radix-8 for Montgomery, radix-4 for Barrett) extracts the best from each.
+
+Benchmark data: `results/data/bench_v150_s13.json`
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)

@@ -799,13 +799,9 @@ static __host__ void dispatch_outer_stages_barrett(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-8 first (1/3 DRAM passes for outer stages)
-    if (num_outer >= 3 &&
-        launch_outer_radix8_barrett(d_data, d_twiddles, N, outer_start, num_outer,
-                                    grid_half, stream))
-    {
-        return;
-    }
+    // NOTE: Barrett radix-8 disabled — 174 registers causes I-cache thrashing
+    // at large sizes (29.5ms vs 17.1ms at 2^22). Montgomery radix-8 (134 regs)
+    // is fine. Barrett stays on radix-4 which uses ~98 regs (2 blocks/SM).
 
     // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
@@ -2195,13 +2191,8 @@ static __host__ void dispatch_outer_stages_batch_barrett(
 ) {
     int num_outer = outer_end - outer_start;
 
-    // Try radix-8 first (1/3 DRAM passes for outer stages)
-    if (num_outer >= 3 &&
-        launch_outer_radix8_batch_barrett(d_data, d_twiddles, N, batch_size,
-                                          outer_start, num_outer, stream))
-    {
-        return;
-    }
+    // NOTE: Barrett radix-8 disabled — 174 registers causes I-cache thrashing.
+    // Barrett stays on radix-4 (~98 regs, 2 blocks/SM).
 
     // Try radix-4 (halves DRAM passes for outer stages)
     if (num_outer >= 2 &&
