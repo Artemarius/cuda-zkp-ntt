@@ -1,0 +1,70 @@
+{
+  "version": "v1.4.0-s10",
+  "description": "Radix-4 outer-stage optimization (halves DRAM passes for stages 10-21)",
+  "gpu": "RTX 3060 Laptop GPU (Ampere, 30 SMs, sm_86)",
+  "cuda": "12.8",
+  "measurement": "7-rep median, device-to-device compute only",
+
+  "single_ntt_forward_ms": {
+    "note": "Isolated 2^22 run (Naive=26.2 matches v1.2.0 baseline exactly)",
+    "naive": {
+      "32768": 0.123,
+      "65536": 0.235,
+      "262144": 1.35,
+      "1048576": 5.92,
+      "4194304": 26.2
+    },
+    "montgomery": {
+      "32768": 0.122,
+      "65536": 0.215,
+      "262144": 0.940,
+      "1048576": 4.05,
+      "4194304": 17.0
+    },
+    "barrett": {
+      "32768": 0.151,
+      "65536": 0.269,
+      "262144": 1.00,
+      "1048576": 4.32,
+      "4194304": 17.1
+    }
+  },
+
+  "vs_v140_s9_at_2_22": {
+    "note": "Isolated run, Naive 26.2ms in both (consistent thermal state)",
+    "montgomery": {"s9": 24.4, "s10": 17.0, "delta_pct": -30.3},
+    "barrett": {"s9": 23.8, "s10": 17.1, "delta_pct": -28.2}
+  },
+
+  "vs_v120_at_2_22": {
+    "note": "Isolated run vs original v1.2.0 baseline",
+    "montgomery": {"v120": 25.1, "s10": 17.0, "delta_pct": -32.3},
+    "barrett": {"v120": 24.9, "s10": 17.1, "delta_pct": -31.3}
+  },
+
+  "batch_ntt_2_22_ms": {
+    "note": "Batched at n=2^22, GPU warmed from prior runs",
+    "montgomery": {
+      "B1": 17.2,
+      "B2": 34.4,
+      "B4": 69.7,
+      "B8": 139
+    },
+    "barrett": {
+      "B1": 18.3,
+      "B2": 36.8,
+      "B4": 77.2,
+      "B8": 164
+    }
+  },
+
+  "radix4_details": {
+    "description": "Radix-4 fuses pairs of outer stages: 4 data loads + 4 stores per unit (vs 8+8 for 2 radix-2 stages)",
+    "stages_per_pass": 2,
+    "outer_stages_n22": 12,
+    "radix4_passes_n22": 6,
+    "cooperative_launches_n22": 1,
+    "dram_traffic_reduction": "~45% theoretical (4+4 vs 8+8 per 2 stages)",
+    "measured_outer_improvement": "~43% (estimated 19.4ms -> ~11ms)"
+  }
+}

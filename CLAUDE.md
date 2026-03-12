@@ -163,11 +163,11 @@ LICENSE                — MIT License
 - Twiddle factors: precomputed table in global memory, cached in L1
 - For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
-### NTT Time Breakdown (n=2^22, v1.1.0)
+### NTT Time Breakdown (n=2^22, v1.1.0 → v1.4.0-s10)
 - Bit-reverse: ~0.3 ms (1%), Montgomery conversions: ~3.0 ms (12%)
 - Fused K=10 (stages 0-9): ~2.5 ms (10%) — **compute-bound** (69%, IPC 2.41)
-- Cooperative outer (stages 10-21): ~19.4 ms (77%) — **memory-bound** (DRAM R-M-W)
-- Outer stages are the dominant bottleneck; see NTT_OPTIMIZATION_ROADMAP.md
+- Cooperative outer (stages 10-21): ~19.4 ms (77%) → **~11 ms (radix-4, v1.4.0-s10)**
+- v1.4.0-s10 total: **17.0 ms Montgomery / 17.1 ms Barrett** (was 25.2 ms in v1.1.0)
 
 ### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
@@ -260,6 +260,18 @@ LICENSE                — MIT License
 - **Measured (n=2^22, 7-rep median):** Barrett 24.9→23.8 ms (**-4.4%**),
   Montgomery 25.1→24.4 ms (**-2.8%**). Outer stages unchanged (memory-bound).
 
+### Radix-4 Outer Stages (v1.4.0 Session 10)
+- Fuses pairs of consecutive outer stages into radix-4 butterflies
+- Each radix-4 unit: 4 data loads + 4 stores (vs 8+8 for 2 radix-2 stages) = **~45% DRAM traffic reduction**
+- Radix-4 butterfly for stages (s, s+1): 4 elements at base+{0, half, 2·half, 3·half}
+  - Stage s: 2 radix-2 butterflies on (a0,a1) and (a2,a3) with w_s(j)
+  - Stage s+1: 2 radix-2 butterflies on (a0',a2') and (a1',a3') with w_{s+1}(j) and w_{s+1}(j+half)
+- 6 new cooperative kernels: Barrett/Montgomery × single/batch × radix-4
+- For n=2^22: 12 outer stages → 6 radix-4 passes in **1 cooperative launch** (was 2 launches)
+- Odd outer stage count: radix-4 for pairs + 1 radix-2 leftover
+- **Measured (n=2^22, 7-rep median):** Montgomery 24.4→**17.0 ms** (**-30.3%**),
+  Barrett 23.8→**17.1 ms** (**-28.2%**). Outer stages ~19.4→~11 ms (-43%).
+
 ---
 
 ## Phase Status
@@ -267,7 +279,7 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-Phases 1-8 complete. Current version: **v1.3.0** (v1.4.0 Session 9 in progress).
+Phases 1-8 complete. Current version: **v1.3.0** (v1.4.0 Session 10 complete).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
@@ -275,10 +287,10 @@ Phases 1-8 complete. Current version: **v1.3.0** (v1.4.0 Session 9 in progress).
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 
 ### In Progress
-- **v1.4.0** — Register optimization + outer-stage improvements + CUDA Graphs (target: ~18-22 ms)
+- **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs (target: ~18-22 ms)
   - Session 9 (complete): Branchless arithmetic → Barrett 23.8 ms at 2^22 (-4.4%)
-  - Session 10 (next): L2-aware outer-stage scheduling + radix-4 outer stages
-  - Session 11: CUDA Graphs + final polish + release
+  - Session 10 (complete): Radix-4 outer stages → **17.0 ms Montgomery, 17.1 ms Barrett (-30%)**
+  - Session 11 (next): CUDA Graphs + final polish + release
 
 ---
 

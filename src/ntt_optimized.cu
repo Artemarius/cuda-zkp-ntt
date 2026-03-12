@@ -111,6 +111,75 @@ __global__ void ntt_outer_fused_kernel(
     }
 }
 
+// ─── Radix-4 Outer Kernel (Montgomery, Cooperative) ──────────────────────────
+// Fuses pairs of consecutive outer stages into radix-4 butterflies.
+// Each radix-4 unit processes 4 elements and 2 stages with 4 loads + 4 stores,
+// halving DRAM passes compared to radix-2 (which needs 2× (4 loads + 4 stores)).
+//
+// Radix-4 butterfly for stages (s, s+1):
+//   4 data elements at indices base+{0, half, 2*half, 3*half}
+//   3 twiddle factors: w_s(j), w_{s+1}(j), w_{s+1}(j+half)
+//   Stage s:   2 radix-2 butterflies on (a0,a1) and (a2,a3) with w_s(j)
+//   Stage s+1: 2 radix-2 butterflies on (a0',a2') and (a1',a3')
+
+__global__ void ntt_outer_radix4_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    int start_stage,
+    int num_r4_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+    const uint32_t num_r4_butterflies = n >> 2;
+
+    for (int pass = 0; pass < num_r4_passes; ++pass) {
+        const int s = start_stage + 2 * pass;
+        const uint32_t half    = 1u << s;
+        const uint32_t stride  = n >> (s + 1);
+        const uint32_t stride2 = stride >> 1;
+
+        for (uint32_t tid = global_tid; tid < num_r4_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (half - 1);
+            const uint32_t base  = (group << (s + 2)) + j;
+
+            // Load + stage s: two radix-2 butterflies with same twiddle
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + half];
+            FpElement w1 = twiddles[j * stride];
+
+            FpElement t1 = ff_mul_ptx(a1, w1);
+            FpElement a0p = ff_add_v2(a0, t1);
+            FpElement a1p = ff_sub_v2(a0, t1);
+
+            FpElement a2 = data[base + (half << 1)];
+            FpElement a3 = data[base + (half << 1) + half];
+
+            FpElement t2 = ff_mul_ptx(a3, w1);
+            FpElement a2p = ff_add_v2(a2, t2);
+            FpElement a3p = ff_sub_v2(a2, t2);
+
+            // Stage s+1: two radix-2 butterflies with different twiddles
+            FpElement w2 = twiddles[j * stride2];
+            FpElement t3 = ff_mul_ptx(a2p, w2);
+            data[base]              = ff_add_v2(a0p, t3);
+            data[base + (half << 1)] = ff_sub_v2(a0p, t3);
+
+            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement t4 = ff_mul_ptx(a3p, w3);
+            data[base + half]              = ff_add_v2(a1p, t4);
+            data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
+        }
+
+        if (pass + 1 < num_r4_passes) {
+            grid.sync();
+        }
+    }
+}
+
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 static constexpr uint32_t OPT_BLOCK = 256;
@@ -118,6 +187,10 @@ static constexpr uint32_t OPT_BLOCK = 256;
 // Max outer stages per cooperative launch. 7 stages per launch means
 // 14 outer stages (K=8) -> 2 launches, 12 outer stages (K=10) -> 2 launches.
 static constexpr int MAX_STAGES_PER_COOP_LAUNCH = 7;
+
+// Max radix-4 passes per cooperative launch. Each pass fuses 2 stages.
+// 7 passes = 14 stages, sufficient for n up to 2^24.
+static constexpr int MAX_R4_PASSES_PER_COOP_LAUNCH = 7;
 
 static __host__ int log2_of(size_t n) {
     int r = 0;
@@ -202,6 +275,86 @@ static __host__ bool launch_outer_fused(
     return (err == cudaSuccess);
 }
 
+// ─── Radix-4 Cooperative Launch Helpers (Montgomery) ─────────────────────────
+
+static int s_coop_max_blocks_r4 = 0;
+
+static __host__ int get_coop_max_blocks_r4() {
+    if (s_coop_max_blocks_r4 != 0) return s_coop_max_blocks_r4;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix4_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // Clear error state
+        s_coop_max_blocks_r4 = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r4 = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r4 == 0) {
+        s_coop_max_blocks_r4 = -1;
+    }
+    return s_coop_max_blocks_r4;
+}
+
+// Try radix-4 dispatch. Returns true on success, false to fall back to radix-2.
+static __host__ bool launch_outer_radix4(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream
+) {
+    int num_r4 = num_outer / 2;
+    if (num_r4 == 0) return false;
+
+    int r4_max = get_coop_max_blocks_r4();
+    if (r4_max <= 0) return false;
+
+    uint32_t needed = (n / 4 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r4_max) < needed)
+                         ? static_cast<uint32_t>(r4_max) : needed;
+
+    int r4_stage = outer_start;
+    for (int done = 0; done < num_r4; ) {
+        int passes = num_r4 - done;
+        if (passes > MAX_R4_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R4_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r4_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix4_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r4_stage += 2 * passes;
+    }
+
+    // Leftover radix-2 stage (if odd number of outer stages)
+    if (num_outer % 2 == 1) {
+        int last = outer_start + num_outer - 1;
+        uint32_t half   = 1u << last;
+        uint32_t stride = n / (2u * half);
+        ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+            d_data, d_twiddles, n, half, stride);
+    }
+    return true;
+}
+
 // ─── Outer Stage Dispatch ───────────────────────────────────────────────────
 
 static __host__ void dispatch_outer_stages(
@@ -209,6 +362,17 @@ static __host__ void dispatch_outer_stages(
     uint32_t N, int outer_start, int outer_end,
     uint32_t grid_half, cudaStream_t stream
 ) {
+    int num_outer = outer_end - outer_start;
+
+    // Try radix-4 first (halves DRAM passes for outer stages)
+    if (num_outer >= 2 &&
+        launch_outer_radix4(d_data, d_twiddles, N, outer_start, num_outer,
+                            grid_half, stream))
+    {
+        return;
+    }
+
+    // Radix-2 cooperative fallback
     bool coop_ok = (get_coop_max_blocks() > 0);
 
     if (coop_ok) {
@@ -387,6 +551,65 @@ __global__ void ntt_scale_barrett_kernel(
     data[i] = ff_mul_barrett_v2(data[i], scalar);
 }
 
+// ─── Radix-4 Outer Kernel (Barrett, Cooperative) ─────────────────────────────
+// Same radix-4 structure as Montgomery variant, using ff_mul_barrett_v2.
+
+__global__ void ntt_outer_radix4_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    int start_stage,
+    int num_r4_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+    const uint32_t num_r4_butterflies = n >> 2;
+
+    for (int pass = 0; pass < num_r4_passes; ++pass) {
+        const int s = start_stage + 2 * pass;
+        const uint32_t half    = 1u << s;
+        const uint32_t stride  = n >> (s + 1);
+        const uint32_t stride2 = stride >> 1;
+
+        for (uint32_t tid = global_tid; tid < num_r4_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (half - 1);
+            const uint32_t base  = (group << (s + 2)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + half];
+            FpElement w1 = twiddles[j * stride];
+
+            FpElement t1 = ff_mul_barrett_v2(a1, w1);
+            FpElement a0p = ff_add_v2(a0, t1);
+            FpElement a1p = ff_sub_v2(a0, t1);
+
+            FpElement a2 = data[base + (half << 1)];
+            FpElement a3 = data[base + (half << 1) + half];
+
+            FpElement t2 = ff_mul_barrett_v2(a3, w1);
+            FpElement a2p = ff_add_v2(a2, t2);
+            FpElement a3p = ff_sub_v2(a2, t2);
+
+            FpElement w2 = twiddles[j * stride2];
+            FpElement t3 = ff_mul_barrett_v2(a2p, w2);
+            data[base]              = ff_add_v2(a0p, t3);
+            data[base + (half << 1)] = ff_sub_v2(a0p, t3);
+
+            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement t4 = ff_mul_barrett_v2(a3p, w3);
+            data[base + half]              = ff_add_v2(a1p, t4);
+            data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
+        }
+
+        if (pass + 1 < num_r4_passes) {
+            grid.sync();
+        }
+    }
+}
+
 // ─── Barrett Cooperative Launch Helpers ──────────────────────────────────────
 
 static int s_coop_max_blocks_barrett = 0;
@@ -455,12 +678,101 @@ static __host__ void launch_fused_barrett(
     }
 }
 
+// ─── Radix-4 Cooperative Launch Helpers (Barrett) ────────────────────────────
+
+static int s_coop_max_blocks_r4_barrett = 0;
+
+static __host__ int get_coop_max_blocks_r4_barrett() {
+    if (s_coop_max_blocks_r4_barrett != 0) return s_coop_max_blocks_r4_barrett;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix4_barrett_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r4_barrett = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r4_barrett = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r4_barrett == 0) {
+        s_coop_max_blocks_r4_barrett = -1;
+    }
+    return s_coop_max_blocks_r4_barrett;
+}
+
+static __host__ bool launch_outer_radix4_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int outer_start, int num_outer,
+    uint32_t grid_half, cudaStream_t stream
+) {
+    int num_r4 = num_outer / 2;
+    if (num_r4 == 0) return false;
+
+    int r4_max = get_coop_max_blocks_r4_barrett();
+    if (r4_max <= 0) return false;
+
+    uint32_t needed = (n / 4 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r4_max) < needed)
+                         ? static_cast<uint32_t>(r4_max) : needed;
+
+    int r4_stage = outer_start;
+    for (int done = 0; done < num_r4; ) {
+        int passes = num_r4 - done;
+        if (passes > MAX_R4_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R4_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r4_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix4_barrett_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r4_stage += 2 * passes;
+    }
+
+    if (num_outer % 2 == 1) {
+        int last = outer_start + num_outer - 1;
+        uint32_t half   = 1u << last;
+        uint32_t stride = n / (2u * half);
+        ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+            d_data, d_twiddles, n, half, stride);
+    }
+    return true;
+}
+
 // Barrett outer stage dispatch
 static __host__ void dispatch_outer_stages_barrett(
     FpElement* d_data, const FpElement* d_twiddles,
     uint32_t N, int outer_start, int outer_end,
     uint32_t grid_half, cudaStream_t stream
 ) {
+    int num_outer = outer_end - outer_start;
+
+    // Try radix-4 first (halves DRAM passes for outer stages)
+    if (num_outer >= 2 &&
+        launch_outer_radix4_barrett(d_data, d_twiddles, N, outer_start, num_outer,
+                                    grid_half, stream))
+    {
+        return;
+    }
+
+    // Radix-2 cooperative fallback
     bool coop_ok = (get_coop_max_blocks_barrett() > 0);
 
     if (coop_ok) {
@@ -621,6 +933,122 @@ __global__ void ntt_outer_fused_batch_barrett_kernel(
     }
 }
 
+// ─── Batched Radix-4 Outer Kernel (Montgomery, Cooperative) ──────────────────
+
+__global__ void ntt_outer_radix4_batch_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_r4_butterflies,
+    int start_stage,
+    int num_r4_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int pass = 0; pass < num_r4_passes; ++pass) {
+        const int s = start_stage + 2 * pass;
+        const uint32_t half    = 1u << s;
+        const uint32_t stride  = n >> (s + 1);
+        const uint32_t stride2 = stride >> 1;
+
+        for (uint32_t tid = global_tid; tid < total_r4_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (half - 1);
+            const uint32_t base  = (group << (s + 2)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + half];
+            FpElement w1 = twiddles[j * stride];
+
+            FpElement t1 = ff_mul_ptx(a1, w1);
+            FpElement a0p = ff_add_v2(a0, t1);
+            FpElement a1p = ff_sub_v2(a0, t1);
+
+            FpElement a2 = data[base + (half << 1)];
+            FpElement a3 = data[base + (half << 1) + half];
+
+            FpElement t2 = ff_mul_ptx(a3, w1);
+            FpElement a2p = ff_add_v2(a2, t2);
+            FpElement a3p = ff_sub_v2(a2, t2);
+
+            FpElement w2 = twiddles[j * stride2];
+            FpElement t3 = ff_mul_ptx(a2p, w2);
+            data[base]              = ff_add_v2(a0p, t3);
+            data[base + (half << 1)] = ff_sub_v2(a0p, t3);
+
+            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement t4 = ff_mul_ptx(a3p, w3);
+            data[base + half]              = ff_add_v2(a1p, t4);
+            data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
+        }
+
+        if (pass + 1 < num_r4_passes) {
+            grid.sync();
+        }
+    }
+}
+
+// ─── Batched Radix-4 Outer Kernel (Barrett, Cooperative) ─────────────────────
+
+__global__ void ntt_outer_radix4_batch_barrett_kernel(
+    FpElement* __restrict__ data,
+    const FpElement* __restrict__ twiddles,
+    uint32_t n,
+    uint32_t total_r4_butterflies,
+    int start_stage,
+    int num_r4_passes
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_threads = gridDim.x * blockDim.x;
+
+    for (int pass = 0; pass < num_r4_passes; ++pass) {
+        const int s = start_stage + 2 * pass;
+        const uint32_t half    = 1u << s;
+        const uint32_t stride  = n >> (s + 1);
+        const uint32_t stride2 = stride >> 1;
+
+        for (uint32_t tid = global_tid; tid < total_r4_butterflies; tid += total_threads) {
+            const uint32_t group = tid >> s;
+            const uint32_t j     = tid & (half - 1);
+            const uint32_t base  = (group << (s + 2)) + j;
+
+            FpElement a0 = data[base];
+            FpElement a1 = data[base + half];
+            FpElement w1 = twiddles[j * stride];
+
+            FpElement t1 = ff_mul_barrett_v2(a1, w1);
+            FpElement a0p = ff_add_v2(a0, t1);
+            FpElement a1p = ff_sub_v2(a0, t1);
+
+            FpElement a2 = data[base + (half << 1)];
+            FpElement a3 = data[base + (half << 1) + half];
+
+            FpElement t2 = ff_mul_barrett_v2(a3, w1);
+            FpElement a2p = ff_add_v2(a2, t2);
+            FpElement a3p = ff_sub_v2(a2, t2);
+
+            FpElement w2 = twiddles[j * stride2];
+            FpElement t3 = ff_mul_barrett_v2(a2p, w2);
+            data[base]              = ff_add_v2(a0p, t3);
+            data[base + (half << 1)] = ff_sub_v2(a0p, t3);
+
+            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement t4 = ff_mul_barrett_v2(a3p, w3);
+            data[base + half]              = ff_add_v2(a1p, t4);
+            data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
+        }
+
+        if (pass + 1 < num_r4_passes) {
+            grid.sync();
+        }
+    }
+}
+
 // ─── Batched Cooperative Launch Helpers ───────────────────────────────────────
 
 static int s_coop_max_blocks_batch = 0;
@@ -676,6 +1104,168 @@ static __host__ int get_coop_max_blocks_batch_barrett() {
     return s_coop_max_blocks_batch_barrett;
 }
 
+// ─── Batched Radix-4 Cooperative Launch Helpers ──────────────────────────────
+
+static int s_coop_max_blocks_r4_batch = 0;
+static int s_coop_max_blocks_r4_batch_barrett = 0;
+
+static __host__ int get_coop_max_blocks_r4_batch() {
+    if (s_coop_max_blocks_r4_batch != 0) return s_coop_max_blocks_r4_batch;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix4_batch_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r4_batch = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r4_batch = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r4_batch == 0) {
+        s_coop_max_blocks_r4_batch = -1;
+    }
+    return s_coop_max_blocks_r4_batch;
+}
+
+static __host__ int get_coop_max_blocks_r4_batch_barrett() {
+    if (s_coop_max_blocks_r4_batch_barrett != 0) return s_coop_max_blocks_r4_batch_barrett;
+
+    int num_blocks_per_sm = 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks_per_sm,
+        ntt_outer_radix4_batch_barrett_kernel,
+        OPT_BLOCK,
+        0
+    );
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        s_coop_max_blocks_r4_batch_barrett = -1;
+        return -1;
+    }
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    s_coop_max_blocks_r4_batch_barrett = num_blocks_per_sm * prop.multiProcessorCount;
+    if (!prop.cooperativeLaunch || s_coop_max_blocks_r4_batch_barrett == 0) {
+        s_coop_max_blocks_r4_batch_barrett = -1;
+    }
+    return s_coop_max_blocks_r4_batch_barrett;
+}
+
+static __host__ bool launch_outer_radix4_batch(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream
+) {
+    int num_r4 = num_outer / 2;
+    if (num_r4 == 0) return false;
+
+    int r4_max = get_coop_max_blocks_r4_batch();
+    if (r4_max <= 0) return false;
+
+    uint32_t total_r4 = static_cast<uint32_t>(batch_size) * (n >> 2);
+    uint32_t needed = (total_r4 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r4_max) < needed)
+                         ? static_cast<uint32_t>(r4_max) : needed;
+
+    int r4_stage = outer_start;
+    for (int done = 0; done < num_r4; ) {
+        int passes = num_r4 - done;
+        if (passes > MAX_R4_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R4_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r4_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &total_r4, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix4_batch_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r4_stage += 2 * passes;
+    }
+
+    if (num_outer % 2 == 1) {
+        int last = outer_start + num_outer - 1;
+        uint32_t half   = 1u << last;
+        uint32_t stride = n / (2u * half);
+        uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        // Process each NTT's leftover stage
+        for (int b = 0; b < batch_size; ++b) {
+            ntt_butterfly_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                d_data + b * n, d_twiddles, n, half, stride);
+        }
+    }
+    return true;
+}
+
+static __host__ bool launch_outer_radix4_batch_barrett(
+    FpElement* d_data, const FpElement* d_twiddles,
+    uint32_t n, int batch_size, int outer_start, int num_outer,
+    cudaStream_t stream
+) {
+    int num_r4 = num_outer / 2;
+    if (num_r4 == 0) return false;
+
+    int r4_max = get_coop_max_blocks_r4_batch_barrett();
+    if (r4_max <= 0) return false;
+
+    uint32_t total_r4 = static_cast<uint32_t>(batch_size) * (n >> 2);
+    uint32_t needed = (total_r4 + OPT_BLOCK - 1) / OPT_BLOCK;
+    uint32_t grid_size = (static_cast<uint32_t>(r4_max) < needed)
+                         ? static_cast<uint32_t>(r4_max) : needed;
+
+    int r4_stage = outer_start;
+    for (int done = 0; done < num_r4; ) {
+        int passes = num_r4 - done;
+        if (passes > MAX_R4_PASSES_PER_COOP_LAUNCH)
+            passes = MAX_R4_PASSES_PER_COOP_LAUNCH;
+
+        int ss = r4_stage;
+        int np = passes;
+        void* args[] = { &d_data, &d_twiddles, &n, &total_r4, &ss, &np };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)ntt_outer_radix4_batch_barrett_kernel,
+            dim3(grid_size), dim3(OPT_BLOCK),
+            args, 0, stream
+        );
+        if (err != cudaSuccess) return false;
+
+        done += passes;
+        r4_stage += 2 * passes;
+    }
+
+    if (num_outer % 2 == 1) {
+        int last = outer_start + num_outer - 1;
+        uint32_t half   = 1u << last;
+        uint32_t stride = n / (2u * half);
+        uint32_t grid_half = (n / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
+        for (int b = 0; b < batch_size; ++b) {
+            ntt_butterfly_barrett_kernel<<<grid_half, OPT_BLOCK, 0, stream>>>(
+                d_data + b * n, d_twiddles, n, half, stride);
+        }
+    }
+    return true;
+}
+
 // ─── Batched Outer Stage Dispatch (Montgomery) ──────────────────────────────
 
 static __host__ void dispatch_outer_stages_batch(
@@ -683,6 +1273,17 @@ static __host__ void dispatch_outer_stages_batch(
     uint32_t N, int batch_size, int outer_start, int outer_end,
     cudaStream_t stream
 ) {
+    int num_outer = outer_end - outer_start;
+
+    // Try radix-4 first
+    if (num_outer >= 2 &&
+        launch_outer_radix4_batch(d_data, d_twiddles, N, batch_size,
+                                  outer_start, num_outer, stream))
+    {
+        return;
+    }
+
+    // Radix-2 cooperative fallback
     uint32_t total_butterflies = static_cast<uint32_t>(batch_size) * (N >> 1);
     int max_blocks = get_coop_max_blocks_batch();
 
@@ -709,7 +1310,6 @@ static __host__ void dispatch_outer_stages_batch(
             );
 
             if (err != cudaSuccess) {
-                // Fallback: process each NTT separately
                 uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
                 for (int b = 0; b < batch_size; ++b) {
                     FpElement* d_ntt = d_data + b * N;
@@ -725,7 +1325,6 @@ static __host__ void dispatch_outer_stages_batch(
             s = batch_end;
         }
     } else {
-        // No cooperative launch: process each NTT separately
         uint32_t grid_half = (N / 2 + OPT_BLOCK - 1) / OPT_BLOCK;
         for (int b = 0; b < batch_size; ++b) {
             FpElement* d_ntt = d_data + b * N;
@@ -746,6 +1345,17 @@ static __host__ void dispatch_outer_stages_batch_barrett(
     uint32_t N, int batch_size, int outer_start, int outer_end,
     cudaStream_t stream
 ) {
+    int num_outer = outer_end - outer_start;
+
+    // Try radix-4 first
+    if (num_outer >= 2 &&
+        launch_outer_radix4_batch_barrett(d_data, d_twiddles, N, batch_size,
+                                          outer_start, num_outer, stream))
+    {
+        return;
+    }
+
+    // Radix-2 cooperative fallback
     uint32_t total_butterflies = static_cast<uint32_t>(batch_size) * (N >> 1);
     int max_blocks = get_coop_max_blocks_batch_barrett();
 
