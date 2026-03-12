@@ -932,10 +932,17 @@ algorithmic one." A concrete benchmark proves this claim with data on our hardwa
 
 ---
 
-### Session 16 — Goldilocks + BabyBear Field Arithmetic
+### Session 16 — Goldilocks + BabyBear Field Arithmetic ✅
 
 **Objective:** Implement modular arithmetic for both fields (GPU + CPU reference) and
 validate with exhaustive tests.
+
+**Result:** Both fields implemented and validated. 374/374 tests pass (333 existing + 41 new).
+- Goldilocks: `ff_goldilocks.cuh` (PTX mul.lo/hi.u64 + Goldilocks reduction), `GlRef` CPU reference
+- BabyBear: `ff_babybear.cuh` (64-bit prod % p), `BbRef` CPU reference
+- GPU throughput kernels: `src/ff_multi_field.cu` (8 kernels)
+- Microbenchmark (mul, n=2^22): BLS 1444μs (2.9 Gops/s), GL 401μs (10.7 Gops/s, **3.6x**), BB 213μs (19.7 Gops/s, **6.8x**)
+- All 3 fields DRAM-bandwidth-bound at 2^22 — speedup tracks element size ratio (32/8=4x, 32/4=8x)
 
 **Part A — Goldilocks field (p = 2^64 − 2^32 + 1):**
 
@@ -1430,8 +1437,8 @@ read/write contiguous blocks regardless of stage.
 | **12** | **v1.5.0** | **L2 diagnostic + radix-8 butterfly** ✅ | **Stockham NO-GO, 4 radix-8 kernels** |
 | **13** | **v1.5.0** | **Radix-8 benchmark + correctness** ✅ | **Montgomery-only radix-8 (15.6 ms), Barrett I-cache regression** |
 | **14** | **v1.5.0** | **OTF twiddle computation** ✅ | **NEGATIVE RESULT: 56.9 ms vs 15.6 ms (+265%). Disabled.** |
-| 15 | v1.5.0 | Benchmark + profile + release v1.5.0 | Target: 15.6 ms at 2^22 |
-| 16 | v1.6.0 | Goldilocks + BabyBear field arithmetic | Multi-field ZKP comparison |
+| **15** | **v1.5.0** | **Benchmark + profile + release v1.5.0** ✅ | **15.5 ms at 2^22. 333 tests.** |
+| **16** | **v1.6.0** | **Goldilocks + BabyBear field arithmetic** ✅ | **GPU+CPU ref, 374 tests. GL 3.6x, BB 6.8x faster mul.** |
 | 17 | v1.6.0 | Multi-field NTT integration + correctness | Field-specific kernel tuning |
 | 18 | v1.6.0 | 3-way benchmark + charts + release v1.6.0 | Portfolio/insight feature |
 | 19 | v1.7.0 | Plantard arithmetic + twiddle precompute | Eliminate 1 big-int mul/butterfly |
@@ -1448,7 +1455,7 @@ read/write contiguous blocks regardless of stage.
 - **v1.4.0: 17.1 ms (Montgomery) / 17.4 ms (Barrett)** — branchless arithmetic (-4.4%) +
   radix-4 outer stages (-30%). CUDA Graphs add negligible improvement (within noise).
   **32% faster than v1.1.0, exceeds 18-22 ms target.**
-- **v1.5.0 (in progress): 15.6 ms (Montgomery radix-8, −8.2% vs v1.4.0)** — Barrett radix-8
+- **v1.5.0: 15.5 ms (Montgomery radix-8, −9.4% vs v1.4.0)** — Barrett radix-8
   disabled (I-cache regression). OTF twiddles: **negative result** (56.9 ms, +265%), disabled.
   333 tests. Final target: **15.6 ms** (no OTF gain).
 - v1.6.0: ~14 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
@@ -1464,7 +1471,7 @@ read/write contiguous blocks regardless of stage.
   Best batch mode remains Barrett at 199 ms.
 - **v1.4.0: ~150 ms (Montgomery batched) / ~159 ms (Barrett batched)** — radix-4 outer stages
   reduce batch time by ~20%. Montgomery faster for batched (fewer instructions per ff_mul).
-- **v1.5.0 (in progress): 139 ms (Montgomery radix-8 batched)** — Barrett batched: 167 ms (radix-4)
+- **v1.5.0: 139 ms (Montgomery radix-8 batched)** — Barrett batched: 167 ms (radix-4)
 
 **Honest ceiling for BLS12-381 on RTX 3060 Laptop:**
 ~8–9 ms at n=2^22. The 4 MB L2 vs 128 MB array means outer stages can never achieve

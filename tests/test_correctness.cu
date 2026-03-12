@@ -3,6 +3,8 @@
 // Phase 1: stub with basic structure. Real tests added in Phase 2/4.
 
 #include "ff_arithmetic.cuh"
+#include "ff_goldilocks.cuh"
+#include "ff_babybear.cuh"
 #include "ntt.cuh"
 #include "pipeline.cuh"
 #include "cuda_utils.cuh"
@@ -2427,6 +2429,496 @@ void test_otf_ntt_leftover_patterns(int log_n, NTTMode mode) {
            mode_name(mode), log_n, leftover, pass, n);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Goldilocks Field Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+extern __global__ void gl_add_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_sub_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_mul_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_sqr_kernel(const GoldilocksElement* __restrict__ a, GoldilocksElement* __restrict__ out, uint32_t n);
+
+void test_goldilocks_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_goldilocks_cpu_self_test...\n");
+
+    // Test 1: 0 + 0 = 0
+    GlRef z = GlRef::zero();
+    TEST_ASSERT(gl_add(z, z) == z, "GL: 0 + 0 = 0");
+
+    // Test 2: 1 * 1 = 1
+    GlRef one = GlRef::one();
+    TEST_ASSERT(gl_mul(one, one) == one, "GL: 1 * 1 = 1");
+
+    // Test 3: a + 0 = a
+    GlRef a = GlRef::from_u64(12345);
+    TEST_ASSERT(gl_add(a, z) == a, "GL: a + 0 = a");
+
+    // Test 4: a - a = 0
+    TEST_ASSERT(gl_sub(a, a) == z, "GL: a - a = 0");
+
+    // Test 5: a * 1 = a
+    TEST_ASSERT(gl_mul(a, one) == a, "GL: a * 1 = a");
+
+    // Test 6: commutativity
+    GlRef b = GlRef::from_u64(67890);
+    TEST_ASSERT(gl_mul(a, b) == gl_mul(b, a), "GL: a*b = b*a");
+    TEST_ASSERT(gl_add(a, b) == gl_add(b, a), "GL: a+b = b+a");
+
+    // Test 7: inverse
+    GlRef a_inv = gl_inv(a);
+    TEST_ASSERT(gl_mul(a, a_inv) == one, "GL: a * a^{-1} = 1");
+
+    // Test 8: (p-1) + 1 = 0 (wrap-around)
+    GlRef pm1 = GlRef::from_u64(GL_P - 1);
+    TEST_ASSERT(gl_add(pm1, one) == z, "GL: (p-1) + 1 = 0");
+
+    // Test 9: 0 - 1 = p - 1
+    TEST_ASSERT(gl_sub(z, one) == pm1, "GL: 0 - 1 = p-1");
+
+    // Test 10: large values
+    GlRef big = GlRef::from_u64(0xFFFFFFFE00000002ULL);  // > p
+    TEST_ASSERT(big.val < GL_P, "GL: from_u64 reduces mod p");
+
+    // Test 11: root of unity basic check
+    GlRef w4 = gl_get_root_of_unity(4);
+    GlRef w4_4 = gl_pow(w4, 4);
+    TEST_ASSERT(w4_4 == one, "GL: omega_4^4 = 1");
+
+    // Test 12: NTT roundtrip at small size
+    size_t n = 8;
+    std::vector<GlRef> data(n);
+    for (size_t i = 0; i < n; ++i) data[i] = GlRef::from_u64(i + 1);
+    std::vector<GlRef> orig = data;
+    gl_ntt_forward_reference(data, n);
+    gl_ntt_inverse_reference(data, n);
+    bool match = true;
+    for (size_t i = 0; i < n; ++i)
+        if (data[i] != orig[i]) { match = false; break; }
+    TEST_ASSERT(match, "GL: CPU NTT roundtrip (n=8)");
+}
+
+void test_goldilocks_gpu_add() {
+    using namespace ff_ref;
+    printf("test_goldilocks_gpu_add...\n");
+
+    const uint32_t N = 1024;
+    std::vector<GoldilocksElement> h_a(N), h_b(N), h_out(N);
+
+    // Fill with test data including edge cases
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (static_cast<uint64_t>(i) * 7 + 13) % GL_P;
+        h_b[i].val = (static_cast<uint64_t>(i) * 11 + 37) % GL_P;
+    }
+    // Edge cases
+    h_a[0].val = GL_P - 1; h_b[0].val = 1;  // wrap
+    h_a[1].val = GL_P - 1; h_b[1].val = GL_P - 1;  // double wrap
+    h_a[2].val = 0;        h_b[2].val = 0;
+
+    GoldilocksElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    gl_add_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        GlRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        GlRef expected = gl_add(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "GL GPU add: all elements match CPU reference");
+    printf("  GL add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_goldilocks_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_goldilocks_gpu_sub...\n");
+
+    const uint32_t N = 1024;
+    std::vector<GoldilocksElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (static_cast<uint64_t>(i) * 7 + 13) % GL_P;
+        h_b[i].val = (static_cast<uint64_t>(i) * 11 + 37) % GL_P;
+    }
+    h_a[0].val = 0; h_b[0].val = 1;  // underflow
+    h_a[1].val = 0; h_b[1].val = GL_P - 1;
+
+    GoldilocksElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    gl_sub_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        GlRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        GlRef expected = gl_sub(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "GL GPU sub: all elements match CPU reference");
+    printf("  GL sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_goldilocks_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_goldilocks_gpu_mul...\n");
+
+    const uint32_t N = 1024;
+    std::vector<GoldilocksElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (static_cast<uint64_t>(i) * 0x123456789ABCULL + 13) % GL_P;
+        h_b[i].val = (static_cast<uint64_t>(i) * 0xDEADBEEF1234ULL + 37) % GL_P;
+    }
+    // Edge cases
+    h_a[0].val = GL_P - 1; h_b[0].val = GL_P - 1;  // max * max
+    h_a[1].val = 0;        h_b[1].val = GL_P - 1;   // 0 * anything
+    h_a[2].val = 1;        h_b[2].val = GL_P - 1;   // 1 * anything
+
+    GoldilocksElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    gl_mul_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        GlRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        GlRef expected = gl_mul(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+        else if (i < 5) {
+            printf("  GL mul MISMATCH [%u]: GPU=%llu, CPU=%llu (a=%llu, b=%llu)\n",
+                   i, (unsigned long long)h_out[i].val, (unsigned long long)expected.val,
+                   (unsigned long long)h_a[i].val, (unsigned long long)h_b[i].val);
+        }
+    }
+    TEST_ASSERT(pass == N, "GL GPU mul: all elements match CPU reference");
+    printf("  GL mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_goldilocks_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_goldilocks_gpu_sqr...\n");
+
+    const uint32_t N = 1024;
+    std::vector<GoldilocksElement> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i)
+        h_a[i].val = (static_cast<uint64_t>(i) * 0xABCDEF01ULL + 7) % GL_P;
+    h_a[0].val = GL_P - 1;
+    h_a[1].val = 0;
+    h_a[2].val = 1;
+
+    GoldilocksElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    gl_sqr_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(GoldilocksElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        GlRef ra = {h_a[i].val};
+        GlRef expected = gl_sqr(ra);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "GL GPU sqr: all elements match CPU reference");
+    printf("  GL sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_goldilocks_algebraic() {
+    using namespace ff_ref;
+    printf("test_goldilocks_algebraic...\n");
+
+    // Distributive: a*(b+c) = a*b + a*c
+    GlRef a = GlRef::from_u64(0x123456789ABCDEF0ULL % GL_P);
+    GlRef b = GlRef::from_u64(0xFEDCBA9876543210ULL % GL_P);
+    GlRef c = GlRef::from_u64(42);
+    GlRef lhs = gl_mul(a, gl_add(b, c));
+    GlRef rhs = gl_add(gl_mul(a, b), gl_mul(a, c));
+    TEST_ASSERT(lhs == rhs, "GL: distributive law a*(b+c) = a*b + a*c");
+
+    // Associative: (a*b)*c = a*(b*c)
+    GlRef lhs2 = gl_mul(gl_mul(a, b), c);
+    GlRef rhs2 = gl_mul(a, gl_mul(b, c));
+    TEST_ASSERT(lhs2 == rhs2, "GL: associative law (a*b)*c = a*(b*c)");
+
+    // Fermat's little theorem: a^p = a (mod p)
+    GlRef a_to_p = gl_pow(a, GL_P);
+    TEST_ASSERT(a_to_p == a, "GL: Fermat's little theorem a^p = a");
+
+    // a^(p-1) = 1 for a != 0
+    GlRef a_to_pm1 = gl_pow(a, GL_P - 1);
+    TEST_ASSERT(a_to_pm1 == GlRef::one(), "GL: a^(p-1) = 1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BabyBear Field Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+extern __global__ void bb_add_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_sub_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_mul_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_sqr_kernel(const BabyBearElement* __restrict__ a, BabyBearElement* __restrict__ out, uint32_t n);
+
+void test_babybear_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_babybear_cpu_self_test...\n");
+
+    BbRef z = BbRef::zero();
+    BbRef one = BbRef::one();
+
+    TEST_ASSERT(bb_add(z, z) == z, "BB: 0 + 0 = 0");
+    TEST_ASSERT(bb_mul(one, one) == one, "BB: 1 * 1 = 1");
+
+    BbRef a = BbRef::from_u32(12345);
+    TEST_ASSERT(bb_add(a, z) == a, "BB: a + 0 = a");
+    TEST_ASSERT(bb_sub(a, a) == z, "BB: a - a = 0");
+    TEST_ASSERT(bb_mul(a, one) == a, "BB: a * 1 = a");
+
+    BbRef b = BbRef::from_u32(67890);
+    TEST_ASSERT(bb_mul(a, b) == bb_mul(b, a), "BB: a*b = b*a");
+    TEST_ASSERT(bb_add(a, b) == bb_add(b, a), "BB: a+b = b+a");
+
+    BbRef a_inv = bb_inv(a);
+    TEST_ASSERT(bb_mul(a, a_inv) == one, "BB: a * a^{-1} = 1");
+
+    BbRef pm1 = BbRef::from_u32(BB_P - 1);
+    TEST_ASSERT(bb_add(pm1, one) == z, "BB: (p-1) + 1 = 0");
+    TEST_ASSERT(bb_sub(z, one) == pm1, "BB: 0 - 1 = p-1");
+
+    // Root of unity
+    BbRef w4 = bb_get_root_of_unity(4);
+    BbRef w4_4 = bb_pow(w4, 4);
+    TEST_ASSERT(w4_4 == one, "BB: omega_4^4 = 1");
+
+    // NTT roundtrip
+    size_t n = 8;
+    std::vector<BbRef> data(n);
+    for (size_t i = 0; i < n; ++i) data[i] = BbRef::from_u32(static_cast<uint32_t>(i + 1));
+    std::vector<BbRef> orig = data;
+    bb_ntt_forward_reference(data, n);
+    bb_ntt_inverse_reference(data, n);
+    bool match = true;
+    for (size_t i = 0; i < n; ++i)
+        if (data[i] != orig[i]) { match = false; break; }
+    TEST_ASSERT(match, "BB: CPU NTT roundtrip (n=8)");
+}
+
+void test_babybear_gpu_add() {
+    using namespace ff_ref;
+    printf("test_babybear_gpu_add...\n");
+
+    const uint32_t N = 1024;
+    std::vector<BabyBearElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (i * 7u + 13u) % BB_P;
+        h_b[i].val = (i * 11u + 37u) % BB_P;
+    }
+    h_a[0].val = BB_P - 1; h_b[0].val = 1;
+    h_a[1].val = BB_P - 1; h_b[1].val = BB_P - 1;
+    h_a[2].val = 0;        h_b[2].val = 0;
+
+    BabyBearElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    bb_add_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        BbRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        BbRef expected = bb_add(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "BB GPU add: all elements match CPU reference");
+    printf("  BB add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_babybear_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_babybear_gpu_sub...\n");
+
+    const uint32_t N = 1024;
+    std::vector<BabyBearElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (i * 7u + 13u) % BB_P;
+        h_b[i].val = (i * 11u + 37u) % BB_P;
+    }
+    h_a[0].val = 0; h_b[0].val = 1;
+    h_a[1].val = 0; h_b[1].val = BB_P - 1;
+
+    BabyBearElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    bb_sub_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        BbRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        BbRef expected = bb_sub(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "BB GPU sub: all elements match CPU reference");
+    printf("  BB sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_babybear_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_babybear_gpu_mul...\n");
+
+    const uint32_t N = 1024;
+    std::vector<BabyBearElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i].val = (i * 123457u + 13u) % BB_P;
+        h_b[i].val = (i * 654321u + 37u) % BB_P;
+    }
+    h_a[0].val = BB_P - 1; h_b[0].val = BB_P - 1;
+    h_a[1].val = 0;        h_b[1].val = BB_P - 1;
+    h_a[2].val = 1;        h_b[2].val = BB_P - 1;
+
+    BabyBearElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    bb_mul_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        BbRef ra = {h_a[i].val}, rb = {h_b[i].val};
+        BbRef expected = bb_mul(ra, rb);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "BB GPU mul: all elements match CPU reference");
+    printf("  BB mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_babybear_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_babybear_gpu_sqr...\n");
+
+    const uint32_t N = 1024;
+    std::vector<BabyBearElement> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i)
+        h_a[i].val = (i * 654321u + 7u) % BB_P;
+    h_a[0].val = BB_P - 1;
+    h_a[1].val = 0;
+    h_a[2].val = 1;
+
+    BabyBearElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    bb_sqr_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        BbRef ra = {h_a[i].val};
+        BbRef expected = bb_sqr(ra);
+        if (h_out[i].val == expected.val) ++pass;
+    }
+    TEST_ASSERT(pass == N, "BB GPU sqr: all elements match CPU reference");
+    printf("  BB sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_babybear_algebraic() {
+    using namespace ff_ref;
+    printf("test_babybear_algebraic...\n");
+
+    BbRef a = BbRef::from_u32(1234567u % BB_P);
+    BbRef b = BbRef::from_u32(7654321u % BB_P);
+    BbRef c = BbRef::from_u32(42);
+
+    // Distributive
+    BbRef lhs = bb_mul(a, bb_add(b, c));
+    BbRef rhs = bb_add(bb_mul(a, b), bb_mul(a, c));
+    TEST_ASSERT(lhs == rhs, "BB: distributive law a*(b+c) = a*b + a*c");
+
+    // Associative
+    BbRef lhs2 = bb_mul(bb_mul(a, b), c);
+    BbRef rhs2 = bb_mul(a, bb_mul(b, c));
+    TEST_ASSERT(lhs2 == rhs2, "BB: associative law (a*b)*c = a*(b*c)");
+
+    // Fermat's little theorem
+    BbRef a_to_p = bb_pow(a, BB_P);
+    TEST_ASSERT(a_to_p == a, "BB: Fermat's little theorem a^p = a");
+
+    BbRef a_to_pm1 = bb_pow(a, BB_P - 1);
+    TEST_ASSERT(a_to_pm1 == BbRef::one(), "BB: a^(p-1) = 1");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -2982,6 +3474,23 @@ int main() {
     test_otf_ntt_leftover_patterns(15, NTTMode::BARRETT);    // 5 outer, %2=1
     test_otf_ntt_leftover_patterns(20, NTTMode::BARRETT);    // 10 outer, %2=0
     test_otf_ntt_leftover_patterns(22, NTTMode::BARRETT);    // 12 outer, %2=0
+
+    // ─── v1.6.0 Session 16: Goldilocks + BabyBear Field Arithmetic Tests ────
+    printf("\n--- v1.6.0 Session 16: Goldilocks field arithmetic ---\n");
+    test_goldilocks_cpu_self_test();
+    test_goldilocks_gpu_add();
+    test_goldilocks_gpu_sub();
+    test_goldilocks_gpu_mul();
+    test_goldilocks_gpu_sqr();
+    test_goldilocks_algebraic();
+
+    printf("\n--- v1.6.0 Session 16: BabyBear field arithmetic ---\n");
+    test_babybear_cpu_self_test();
+    test_babybear_gpu_add();
+    test_babybear_gpu_sub();
+    test_babybear_gpu_mul();
+    test_babybear_gpu_sqr();
+    test_babybear_algebraic();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

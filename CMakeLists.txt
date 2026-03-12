@@ -61,6 +61,7 @@ set_target_properties(ntt_fused_lib PROPERTIES
 # Finite-field arithmetic and NTT kernels compiled as a static library
 add_library(zkp_ntt_core STATIC
     src/ff_mul.cu
+    src/ff_multi_field.cu
     src/ntt_naive.cu
     src/ntt_optimized.cu
     src/ntt_async.cu

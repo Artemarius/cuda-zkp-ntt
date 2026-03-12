@@ -9,7 +9,9 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
   cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
 - **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
   Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
-- **Next (v1.6.0+)**: Goldilocks/BabyBear multi-field comparison, Plantard reduction
+- **v1.6.0 in progress**: Goldilocks (64-bit) + BabyBear (31-bit) field arithmetic complete.
+  NTT kernels for both fields next (Session 17).
+- **Next**: Multi-field NTT integration, Plantard reduction
 
 ---
 
@@ -68,7 +70,18 @@ CMake targets:
 - Montgomery constant: R = 2^256 mod r
 - Montgomery arithmetic: `include/ff_arithmetic.cuh` (CIOS, PTX intrinsics)
 - Barrett arithmetic: `include/ff_barrett.cuh` (standard-form, no domain conversion)
+- Goldilocks field (p = 2^64 − 2^32 + 1): `include/ff_goldilocks.cuh`
+  - Representation: single `uint64_t`, standard form (no Montgomery)
+  - Mul: PTX `mul.lo/hi.u64` → Goldilocks reduction (2^64 ≡ 2^32 − 1 mod p)
+  - ~5-8 instructions per mul vs 528 for BLS12-381
+- BabyBear field (p = 2^31 − 2^27 + 1 = 0x78000001): `include/ff_babybear.cuh`
+  - Representation: single `uint32_t`, standard form
+  - Mul: 32×32→64 product, then `% p` (compiler-optimized constant division)
+  - ~3-5 instructions per mul
 - CPU reference implementation in `tests/ff_reference.h` (plain C++, no CUDA)
+  - BLS12-381: `FpRef` (4×uint64_t Montgomery), Barrett reduction
+  - Goldilocks: `GlRef` (uint64_t), NTT reference
+  - BabyBear: `BbRef` (uint32_t), NTT reference
 
 ### NTT
 - All NTT operate on BLS12-381 scalar field elements
@@ -92,12 +105,15 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
+  ff_goldilocks.cuh   — Goldilocks field (p=2^64-2^32+1, uint64_t): add, sub, mul, pow, inv
+  ff_babybear.cuh     — BabyBear field (p=2^31-2^27+1, uint32_t): add, sub, mul, pow, inv
   ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
   pipeline.cuh        — AsyncNTTPipeline class interface
   twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
+  ff_multi_field.cu   — Goldilocks + BabyBear GPU throughput kernels (add/sub/mul/sqr)
   ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches + CUDA Graph cache
   ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer (Montgomery + Barrett)
   ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
@@ -325,7 +341,7 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.5.0 complete, v1.6.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.5.0** (Sessions 12-15 done).
+Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progress (Session 16 done).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
@@ -334,6 +350,11 @@ Phases 1-8 complete. Current version: **v1.5.0** (Sessions 12-15 done).
 - **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
 - **v1.5.0** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression).
   OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.5 ms Montgomery** at 2^22 (-9% vs v1.4.0). 333 tests.
+
+### In Progress
+- **v1.6.0** — Multi-field NTT (Goldilocks + BabyBear). Session 16 complete: field arithmetic
+  for both fields (GPU + CPU reference). 374 tests. Mul throughput: Goldilocks 3.6x, BabyBear
+  6.8x faster than BLS12-381 (all DRAM-bound at 2^22). Sessions 17-18 remain (NTT kernels + benchmark).
 
 ---
 

@@ -554,6 +554,179 @@ BENCHMARK(BM_FfSqr_Barrett)
     ->Unit(benchmark::kMicrosecond)
     ->Arg(1 << 16)->Arg(1 << 18)->Arg(1 << 20)->Arg(1 << 22);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Goldilocks (64-bit, p = 2^64 - 2^32 + 1) benchmarks
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "ff_goldilocks.cuh"
+#include "ff_babybear.cuh"
+
+extern __global__ void gl_add_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_sub_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_mul_kernel(const GoldilocksElement* __restrict__ a, const GoldilocksElement* __restrict__ b, GoldilocksElement* __restrict__ out, uint32_t n);
+extern __global__ void gl_sqr_kernel(const GoldilocksElement* __restrict__ a, GoldilocksElement* __restrict__ out, uint32_t n);
+
+extern __global__ void bb_add_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_sub_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_mul_kernel(const BabyBearElement* __restrict__ a, const BabyBearElement* __restrict__ b, BabyBearElement* __restrict__ out, uint32_t n);
+extern __global__ void bb_sqr_kernel(const BabyBearElement* __restrict__ a, BabyBearElement* __restrict__ out, uint32_t n);
+
+static void fill_gl_data(std::vector<GoldilocksElement>& h_a,
+                         std::vector<GoldilocksElement>& h_b, uint32_t n) {
+    h_a.resize(n); h_b.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        h_a[i].val = static_cast<uint64_t>(i) * 0x123456789ABCULL + 1;
+        h_b[i].val = static_cast<uint64_t>(i) * 0xDEADBEEF1234ULL + 3;
+    }
+}
+
+static void fill_bb_data(std::vector<BabyBearElement>& h_a,
+                         std::vector<BabyBearElement>& h_b, uint32_t n) {
+    h_a.resize(n); h_b.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        h_a[i].val = (i * 123457u + 1u) % 0x78000001u;
+        h_b[i].val = (i * 654321u + 3u) % 0x78000001u;
+    }
+}
+
+// ─── Goldilocks Add ─────────────────────────────────────────────────────────
+static void BM_GlAdd(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<GoldilocksElement> h_a, h_b;
+    fill_gl_data(h_a, h_b, N);
+
+    GoldilocksElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        gl_add_kernel<<<gs, bs>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_GlAdd)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
+// ─── Goldilocks Mul ─────────────────────────────────────────────────────────
+static void BM_GlMul(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<GoldilocksElement> h_a, h_b;
+    fill_gl_data(h_a, h_b, N);
+
+    GoldilocksElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        gl_mul_kernel<<<gs, bs>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_GlMul)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
+// ─── Goldilocks Sqr ─────────────────────────────────────────────────────────
+static void BM_GlSqr(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<GoldilocksElement> h_a, h_b;
+    fill_gl_data(h_a, h_b, N);
+
+    GoldilocksElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(GoldilocksElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(GoldilocksElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        gl_sqr_kernel<<<gs, bs>>>(d_a, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_GlSqr)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BabyBear (31-bit, p = 2^31 - 2^27 + 1) benchmarks
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── BabyBear Add ───────────────────────────────────────────────────────────
+static void BM_BbAdd(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<BabyBearElement> h_a, h_b;
+    fill_bb_data(h_a, h_b, N);
+
+    BabyBearElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        bb_add_kernel<<<gs, bs>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_BbAdd)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
+// ─── BabyBear Mul ───────────────────────────────────────────────────────────
+static void BM_BbMul(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<BabyBearElement> h_a, h_b;
+    fill_bb_data(h_a, h_b, N);
+
+    BabyBearElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        bb_mul_kernel<<<gs, bs>>>(d_a, d_b, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_b)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_BbMul)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
+// ─── BabyBear Sqr ───────────────────────────────────────────────────────────
+static void BM_BbSqr(benchmark::State& state) {
+    const uint32_t N = static_cast<uint32_t>(state.range(0));
+    std::vector<BabyBearElement> h_a, h_b;
+    fill_bb_data(h_a, h_b, N);
+
+    BabyBearElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+    const int bs = 256, gs = (N + bs - 1) / bs;
+    for (auto _ : state) {
+        bb_sqr_kernel<<<gs, bs>>>(d_a, d_out, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(N));
+    CUDA_CHECK(cudaFree(d_a)); CUDA_CHECK(cudaFree(d_out));
+}
+BENCHMARK(BM_BbSqr)->Unit(benchmark::kMicrosecond)->Arg(1<<16)->Arg(1<<18)->Arg(1<<20)->Arg(1<<22);
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 BENCHMARK_MAIN();

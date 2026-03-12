@@ -573,4 +573,288 @@ inline FpRef fp_sqr_barrett(const FpRef& a) {
     return fp_mul_barrett(a, a);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Goldilocks Field: p = 2^64 - 2^32 + 1
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static constexpr uint64_t GL_P = 0xFFFFFFFF00000001ULL;
+static constexpr uint64_t GL_GENERATOR = 7ULL;  // primitive root
+
+struct GlRef {
+    uint64_t val;  // in [0, p)
+
+    static GlRef zero() { return {0}; }
+    static GlRef one() { return {1}; }
+    static GlRef from_u64(uint64_t v) { return {v % GL_P}; }
+
+    bool operator==(const GlRef& o) const { return val == o.val; }
+    bool operator!=(const GlRef& o) const { return val != o.val; }
+};
+
+inline GlRef gl_add(GlRef a, GlRef b) {
+    uint128_t sum = uint128_t(a.val) + uint128_t(b.val);
+    uint64_t r = static_cast<uint64_t>(sum);
+    uint64_t carry = static_cast<uint64_t>(sum >> 64);
+    if (carry || r >= GL_P) r -= GL_P;
+    return {r};
+}
+
+inline GlRef gl_sub(GlRef a, GlRef b) {
+    if (a.val >= b.val) return {a.val - b.val};
+    return {a.val + GL_P - b.val};
+}
+
+inline GlRef gl_mul(GlRef a, GlRef b) {
+    // 64x64 -> 128-bit product, then Goldilocks reduction
+#ifdef _MSC_VER
+    uint64_t hi;
+    uint64_t lo = _umul128(a.val, b.val, &hi);
+#else
+    unsigned __int128 prod = static_cast<unsigned __int128>(a.val) * b.val;
+    uint64_t lo = static_cast<uint64_t>(prod);
+    uint64_t hi = static_cast<uint64_t>(prod >> 64);
+#endif
+
+    // Reduce: hi * 2^64 + lo ≡ hi * (2^32 - 1) + lo (mod p)
+    uint32_t hi_lo = static_cast<uint32_t>(hi);
+    uint32_t hi_hi = static_cast<uint32_t>(hi >> 32);
+
+#ifdef _MSC_VER
+    // Iterative reduction for MSVC (no __int128 signed arithmetic)
+    uint64_t t = lo;
+    // Subtract hi
+    bool borrow = (t < hi);
+    t -= hi;
+    if (borrow) t += GL_P;
+    // Add hi_lo << 32
+    uint64_t add1 = static_cast<uint64_t>(hi_lo) << 32;
+    uint64_t prev = t;
+    t += add1;
+    if (t < prev) {
+        // overflow: add 2^64 mod p = 2^32 - 1
+        prev = t;
+        t += 0xFFFFFFFFULL;
+        if (t < prev) t += 0xFFFFFFFFULL;
+    }
+    // Add hi_hi * (2^32 - 1)
+    uint64_t add2 = static_cast<uint64_t>(hi_hi) * 0xFFFFFFFFULL;
+    prev = t;
+    t += add2;
+    if (t < prev) {
+        prev = t;
+        t += 0xFFFFFFFFULL;
+        if (t < prev) t += 0xFFFFFFFFULL;
+    }
+    if (t >= GL_P) t -= GL_P;
+    return {t};
+#else
+    __int128 sr = static_cast<__int128>(lo) - static_cast<__int128>(hi)
+                + (static_cast<__int128>(hi_lo) << 32)
+                + static_cast<__int128>(static_cast<uint64_t>(hi_hi) * 0xFFFFFFFFULL);
+    while (sr < 0) sr += GL_P;
+    while (static_cast<unsigned __int128>(sr) >= GL_P) sr -= GL_P;
+    return {static_cast<uint64_t>(sr)};
+#endif
+}
+
+inline GlRef gl_sqr(GlRef a) { return gl_mul(a, a); }
+
+inline GlRef gl_pow(GlRef base, uint64_t exp) {
+    GlRef result = GlRef::one();
+    GlRef b = base;
+    while (exp > 0) {
+        if (exp & 1) result = gl_mul(result, b);
+        b = gl_sqr(b);
+        exp >>= 1;
+    }
+    return result;
+}
+
+inline GlRef gl_inv(GlRef a) { return gl_pow(a, GL_P - 2); }
+
+// Primitive n-th root of unity for Goldilocks.
+// TWO_ADICITY = 32 (p - 1 = 2^32 * (2^32 - 1)).
+inline GlRef gl_get_root_of_unity(size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0);
+    int log_n = 0;
+    { size_t tmp = n; while (tmp > 1) { tmp >>= 1; ++log_n; } }
+    assert(log_n <= 32);
+
+    uint64_t exp = (GL_P - 1) / static_cast<uint64_t>(n);
+    return gl_pow(GlRef::from_u64(GL_GENERATOR), exp);
+}
+
+// Forward NTT (Cooley-Tukey, radix-2) for Goldilocks.
+inline void gl_ntt_forward_reference(std::vector<GlRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0 && data.size() >= n);
+
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        GlRef w = gl_get_root_of_unity(len);
+        for (size_t i = 0; i < n; i += len) {
+            GlRef wj = GlRef::one();
+            for (size_t j = 0; j < len / 2; ++j) {
+                GlRef u = data[i + j];
+                GlRef v = gl_mul(data[i + j + len / 2], wj);
+                data[i + j]           = gl_add(u, v);
+                data[i + j + len / 2] = gl_sub(u, v);
+                wj = gl_mul(wj, w);
+            }
+        }
+    }
+}
+
+// Inverse NTT for Goldilocks.
+inline void gl_ntt_inverse_reference(std::vector<GlRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0 && data.size() >= n);
+
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        GlRef w = gl_inv(gl_get_root_of_unity(len));
+        for (size_t i = 0; i < n; i += len) {
+            GlRef wj = GlRef::one();
+            for (size_t j = 0; j < len / 2; ++j) {
+                GlRef u = data[i + j];
+                GlRef v = gl_mul(data[i + j + len / 2], wj);
+                data[i + j]           = gl_add(u, v);
+                data[i + j + len / 2] = gl_sub(u, v);
+                wj = gl_mul(wj, w);
+            }
+        }
+    }
+
+    GlRef n_inv = gl_inv(GlRef::from_u64(static_cast<uint64_t>(n)));
+    for (size_t i = 0; i < n; ++i)
+        data[i] = gl_mul(data[i], n_inv);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BabyBear Field: p = 2^31 - 2^27 + 1 = 0x78000001
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static constexpr uint32_t BB_P = 0x78000001u;  // 2013265921
+static constexpr uint32_t BB_GENERATOR = 31u;  // primitive root
+
+struct BbRef {
+    uint32_t val;  // in [0, p)
+
+    static BbRef zero() { return {0}; }
+    static BbRef one() { return {1}; }
+    static BbRef from_u32(uint32_t v) { return {v % BB_P}; }
+
+    bool operator==(const BbRef& o) const { return val == o.val; }
+    bool operator!=(const BbRef& o) const { return val != o.val; }
+};
+
+inline BbRef bb_add(BbRef a, BbRef b) {
+    uint32_t sum = a.val + b.val;
+    if (sum >= BB_P || sum < a.val) sum -= BB_P;
+    return {sum};
+}
+
+inline BbRef bb_sub(BbRef a, BbRef b) {
+    if (a.val >= b.val) return {a.val - b.val};
+    return {a.val + BB_P - b.val};
+}
+
+inline BbRef bb_mul(BbRef a, BbRef b) {
+    uint64_t prod = static_cast<uint64_t>(a.val) * b.val;
+    return {static_cast<uint32_t>(prod % BB_P)};
+}
+
+inline BbRef bb_sqr(BbRef a) { return bb_mul(a, a); }
+
+inline BbRef bb_pow(BbRef base, uint32_t exp) {
+    BbRef result = BbRef::one();
+    BbRef b = base;
+    while (exp > 0) {
+        if (exp & 1) result = bb_mul(result, b);
+        b = bb_sqr(b);
+        exp >>= 1;
+    }
+    return result;
+}
+
+inline BbRef bb_inv(BbRef a) { return bb_pow(a, BB_P - 2); }
+
+// Primitive n-th root of unity for BabyBear.
+// TWO_ADICITY = 27 (p - 1 = 2^27 * 15).
+inline BbRef bb_get_root_of_unity(size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0);
+    int log_n = 0;
+    { size_t tmp = n; while (tmp > 1) { tmp >>= 1; ++log_n; } }
+    assert(log_n <= 27);
+
+    uint32_t exp = static_cast<uint32_t>((static_cast<uint64_t>(BB_P) - 1) / n);
+    return bb_pow(BbRef::from_u32(BB_GENERATOR), exp);
+}
+
+// Forward NTT (Cooley-Tukey, radix-2) for BabyBear.
+inline void bb_ntt_forward_reference(std::vector<BbRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0 && data.size() >= n);
+
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        BbRef w = bb_get_root_of_unity(len);
+        for (size_t i = 0; i < n; i += len) {
+            BbRef wj = BbRef::one();
+            for (size_t j = 0; j < len / 2; ++j) {
+                BbRef u = data[i + j];
+                BbRef v = bb_mul(data[i + j + len / 2], wj);
+                data[i + j]           = bb_add(u, v);
+                data[i + j + len / 2] = bb_sub(u, v);
+                wj = bb_mul(wj, w);
+            }
+        }
+    }
+}
+
+// Inverse NTT for BabyBear.
+inline void bb_ntt_inverse_reference(std::vector<BbRef>& data, size_t n) {
+    assert(n >= 2 && (n & (n - 1)) == 0 && data.size() >= n);
+
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+
+    for (size_t len = 2; len <= n; len <<= 1) {
+        BbRef w = bb_inv(bb_get_root_of_unity(len));
+        for (size_t i = 0; i < n; i += len) {
+            BbRef wj = BbRef::one();
+            for (size_t j = 0; j < len / 2; ++j) {
+                BbRef u = data[i + j];
+                BbRef v = bb_mul(data[i + j + len / 2], wj);
+                data[i + j]           = bb_add(u, v);
+                data[i + j + len / 2] = bb_sub(u, v);
+                wj = bb_mul(wj, w);
+            }
+        }
+    }
+
+    BbRef n_inv = bb_inv(BbRef::from_u32(static_cast<uint32_t>(n)));
+    for (size_t i = 0; i < n; ++i)
+        data[i] = bb_mul(data[i], n_inv);
+}
+
 } // namespace ff_ref
