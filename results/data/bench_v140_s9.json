@@ -1,0 +1,64 @@
+{
+  "version": "v1.4.0-s9",
+  "description": "Branchless arithmetic optimization (ff_mul_ptx, ff_add_v2, ff_sub_v2, ff_mul_barrett_v2)",
+  "gpu": "RTX 3060 Laptop GPU (Ampere, 30 SMs, sm_86)",
+  "cuda": "12.8",
+  "measurement": "7-rep median, device-to-device compute only",
+
+  "single_ntt_forward_ms": {
+    "note": "Same run, 7-rep median",
+    "naive": {
+      "32768": 0.128,
+      "65536": 0.258,
+      "262144": 1.38,
+      "1048576": 5.98,
+      "4194304": 26.2
+    },
+    "montgomery": {
+      "32768": 0.142,
+      "65536": 0.268,
+      "262144": 1.26,
+      "1048576": 5.70,
+      "4194304": 24.4
+    },
+    "barrett": {
+      "32768": 0.164,
+      "65536": 0.308,
+      "262144": 1.32,
+      "1048576": 5.69,
+      "4194304": 23.8
+    }
+  },
+
+  "vs_v120_at_2_22": {
+    "note": "Naive 26.2ms unchanged in both versions (consistent thermal state)",
+    "montgomery": {"v120": 25.1, "v140_s9": 24.4, "delta_pct": -2.8},
+    "barrett": {"v120": 24.9, "v140_s9": 23.8, "delta_pct": -4.4}
+  },
+
+  "register_usage": {
+    "before_branchless": {
+      "montgomery_k10": 68,
+      "barrett_k10": 92
+    },
+    "after_branchless": {
+      "montgomery_k10": 66,
+      "barrett_k10": 80
+    }
+  },
+
+  "sass_instruction_counts": {
+    "montgomery_k10": 8784,
+    "barrett_k10": 11936,
+    "instruction_mix_montgomery_k10": {
+      "IADD3": 3156,
+      "IMAD.X": 1845,
+      "IMAD.WIDE.U32": 1811,
+      "IADD3.X": 645,
+      "LOP3.LUT": 378,
+      "IMAD.MOV.U32": 321,
+      "SEL": 175,
+      "SHFL.BFLY": 80
+    }
+  }
+}

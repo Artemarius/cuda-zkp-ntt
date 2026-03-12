@@ -247,6 +247,19 @@ LICENSE                — MIT License
     (1.16x batch speedup vs Barrett's 1.05x) but still slower in absolute terms
   - Root cause documented: transpose overhead + sub-NTT outer stages + L2 thrashing
 
+### Branchless Arithmetic (v1.4.0 Session 9)
+- Switched all NTT hot-path kernels from branchy to branchless arithmetic:
+  - `ff_mul` → `ff_mul_ptx` (branchless conditional reduction via PTX sub.cc + lop3)
+  - `ff_add` → `ff_add_v2` (branchless PTX carry chain + lop3 select)
+  - `ff_sub` → `ff_sub_v2` (branchless PTX subtract + lop3 select)
+  - `ff_mul_barrett` → `ff_mul_barrett_v2` (branchless 2× conditional subtraction via PTX)
+- **Eliminates warp divergence** in comparison and conditional reduction loops
+- **Register usage**: Montgomery K=10: 68→66 (-2), Barrett K=10: 92→80 (-12, -13%)
+- **SASS instruction mix (Montgomery K=10)**: IADD3 36%, IMAD.WIDE 21%, IMAD.X 21%, LOP3 4%
+  Compiler generates good carry chains; IADD3-dominant (2-cycle) as MoMA targets
+- **Measured (n=2^22, 7-rep median):** Barrett 24.9→23.8 ms (**-4.4%**),
+  Montgomery 25.1→24.4 ms (**-2.8%**). Outer stages unchanged (memory-bound).
+
 ---
 
 ## Phase Status
@@ -254,15 +267,18 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for future release plans (v1.2.0-v1.4.0).
 
-Phases 1-8 complete. Current version: **v1.3.0**.
+Phases 1-8 complete. Current version: **v1.3.0** (v1.4.0 Session 9 in progress).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 
-### Future Releases
+### In Progress
 - **v1.4.0** — Register optimization + outer-stage improvements + CUDA Graphs (target: ~18-22 ms)
+  - Session 9 (complete): Branchless arithmetic → Barrett 23.8 ms at 2^22 (-4.4%)
+  - Session 10 (next): L2-aware outer-stage scheduling + radix-4 outer stages
+  - Session 11: CUDA Graphs + final polish + release
 
 ---
 

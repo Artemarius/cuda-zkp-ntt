@@ -43,6 +43,9 @@ FpElement fp_shfl_xor(const FpElement& val, int xor_mask) {
 // via shuffle, compute v = ff_mul(w, B), then:
 //   top:    result = ff_add(A, v)
 //   bottom: result = ff_sub(A, v)
+//
+// v1.4.0: Uses branchless ff_mul_ptx / ff_add_v2 / ff_sub_v2 to eliminate
+// warp divergence in comparison and conditional reduction loops.
 
 __device__ __forceinline__
 FpElement butterfly_shfl(const FpElement& my_elem, const FpElement& twiddle,
@@ -52,9 +55,9 @@ FpElement butterfly_shfl(const FpElement& my_elem, const FpElement& twiddle,
     FpElement A = is_top ? my_elem : partner;
     FpElement B = is_top ? partner : my_elem;
 
-    FpElement v = ff_mul(B, twiddle);
+    FpElement v = ff_mul_ptx(B, twiddle);
 
-    return is_top ? ff_add(A, v) : ff_sub(A, v);
+    return is_top ? ff_add_v2(A, v) : ff_sub_v2(A, v);
 }
 
 // ─── Fused Kernel: Warp-Shuffle + Shared-Memory ─────────────────────────────
@@ -123,9 +126,9 @@ __global__ void ntt_fused_stages_kernel(
 
         FpElement w = twiddles[j * stride];
         FpElement u = sdata[idx_top];
-        FpElement v = ff_mul(sdata[idx_bot], w);
-        sdata[idx_top] = ff_add(u, v);
-        sdata[idx_bot] = ff_sub(u, v);
+        FpElement v = ff_mul_ptx(sdata[idx_bot], w);
+        sdata[idx_top] = ff_add_v2(u, v);
+        sdata[idx_bot] = ff_sub_v2(u, v);
         __syncthreads();
     }
 
@@ -181,7 +184,7 @@ void launch_fused_k10(
 // Standard-form data + twiddles; no Montgomery domain conversion needed.
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Barrett warp-shuffle butterfly helper
+// Barrett warp-shuffle butterfly helper (branchless v1.4.0)
 __device__ __forceinline__
 FpElement butterfly_shfl_barrett(const FpElement& my_elem, const FpElement& twiddle,
                                  int xor_mask, bool is_top) {
@@ -190,9 +193,9 @@ FpElement butterfly_shfl_barrett(const FpElement& my_elem, const FpElement& twid
     FpElement A = is_top ? my_elem : partner;
     FpElement B = is_top ? partner : my_elem;
 
-    FpElement v = ff_mul_barrett(B, twiddle);
+    FpElement v = ff_mul_barrett_v2(B, twiddle);
 
-    return is_top ? ff_add(A, v) : ff_sub(A, v);
+    return is_top ? ff_add_v2(A, v) : ff_sub_v2(A, v);
 }
 
 // Barrett fused kernel: same structure as Montgomery, uses ff_mul_barrett
@@ -247,9 +250,9 @@ __global__ void ntt_fused_stages_barrett_kernel(
 
         FpElement w = twiddles[j * stride];
         FpElement u = sdata[idx_top];
-        FpElement v = ff_mul_barrett(sdata[idx_bot], w);
-        sdata[idx_top] = ff_add(u, v);
-        sdata[idx_bot] = ff_sub(u, v);
+        FpElement v = ff_mul_barrett_v2(sdata[idx_bot], w);
+        sdata[idx_top] = ff_add_v2(u, v);
+        sdata[idx_bot] = ff_sub_v2(u, v);
         __syncthreads();
     }
 

@@ -99,9 +99,9 @@ __global__ void ntt_outer_fused_kernel(
             uint32_t tw_idx  = j * stride;
 
             FpElement u = data[idx_top];
-            FpElement v = ff_mul(data[idx_bot], twiddles[tw_idx]);
-            data[idx_top] = ff_add(u, v);
-            data[idx_bot] = ff_sub(u, v);
+            FpElement v = ff_mul_ptx(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add_v2(u, v);
+            data[idx_bot] = ff_sub_v2(u, v);
         }
 
         // Global barrier between stages (all blocks must complete before next stage)
@@ -343,9 +343,9 @@ __global__ void ntt_outer_fused_barrett_kernel(
             uint32_t tw_idx  = j * stride;
 
             FpElement u = data[idx_top];
-            FpElement v = ff_mul_barrett(data[idx_bot], twiddles[tw_idx]);
-            data[idx_top] = ff_add(u, v);
-            data[idx_bot] = ff_sub(u, v);
+            FpElement v = ff_mul_barrett_v2(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add_v2(u, v);
+            data[idx_bot] = ff_sub_v2(u, v);
         }
 
         if (s + 1 < end_stage) {
@@ -373,9 +373,9 @@ __global__ void ntt_butterfly_barrett_kernel(
     uint32_t tw_idx  = j * stride;
 
     FpElement u = data[idx_top];
-    FpElement v = ff_mul_barrett(data[idx_bot], twiddles[tw_idx]);
-    data[idx_top] = ff_add(u, v);
-    data[idx_bot] = ff_sub(u, v);
+    FpElement v = ff_mul_barrett_v2(data[idx_bot], twiddles[tw_idx]);
+    data[idx_top] = ff_add_v2(u, v);
+    data[idx_bot] = ff_sub_v2(u, v);
 }
 
 // Barrett scale kernel (for n^{-1} in inverse NTT)
@@ -384,7 +384,7 @@ __global__ void ntt_scale_barrett_kernel(
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    data[i] = ff_mul_barrett(data[i], scalar);
+    data[i] = ff_mul_barrett_v2(data[i], scalar);
 }
 
 // ─── Barrett Cooperative Launch Helpers ──────────────────────────────────────
@@ -572,9 +572,9 @@ __global__ void ntt_outer_fused_batch_kernel(
             uint32_t tw_idx  = j * stride;
 
             FpElement u = data[idx_top];
-            FpElement v = ff_mul(data[idx_bot], twiddles[tw_idx]);
-            data[idx_top] = ff_add(u, v);
-            data[idx_bot] = ff_sub(u, v);
+            FpElement v = ff_mul_ptx(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add_v2(u, v);
+            data[idx_bot] = ff_sub_v2(u, v);
         }
 
         if (s + 1 < end_stage) {
@@ -610,9 +610,9 @@ __global__ void ntt_outer_fused_batch_barrett_kernel(
             uint32_t tw_idx  = j * stride;
 
             FpElement u = data[idx_top];
-            FpElement v = ff_mul_barrett(data[idx_bot], twiddles[tw_idx]);
-            data[idx_top] = ff_add(u, v);
-            data[idx_bot] = ff_sub(u, v);
+            FpElement v = ff_mul_barrett_v2(data[idx_bot], twiddles[tw_idx]);
+            data[idx_top] = ff_add_v2(u, v);
+            data[idx_bot] = ff_sub_v2(u, v);
         }
 
         if (s + 1 < end_stage) {

@@ -168,10 +168,150 @@ FpElement ff_mul_barrett(const FpElement& a, const FpElement& b) {
     return result;
 }
 
+// ─── ff_mul_barrett_v2: branchless final reduction ──────────────────────────
+// Same Barrett algorithm as ff_mul_barrett, but uses PTX sub.cc chain + lop3
+// for branchless conditional subtraction. Eliminates warp divergence in the
+// comparison and conditional subtract loops.
+//
+// Barrett guarantees r < 3p after step 4, so at most 2 subtractions needed.
+// Each subtraction: S = r - p, mask = (r >= p) ? 0 : 0xFFFFFFFF, then select.
+
+__device__ __forceinline__
+FpElement ff_mul_barrett_v2(const FpElement& a, const FpElement& b) {
+    // ── Steps 1-4: identical to ff_mul_barrett ───────────────────────────────
+
+    // Step 1: Full 512-bit product z = a * b
+    uint32_t z[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) z[i] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint64_t prod = (uint64_t)a.limbs[j] * (uint64_t)b.limbs[i]
+                          + (uint64_t)z[i + j] + (uint64_t)carry;
+            z[i + j] = (uint32_t)prod;
+            carry = (uint32_t)(prod >> 32);
+        }
+        z[i + 8] = carry;
+    }
+
+    // Step 2: Barrett quotient estimate
+    uint32_t q2[18];
+    #pragma unroll
+    for (int i = 0; i < 18; ++i) q2[i] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = 0; j < 9; ++j) {
+            uint64_t prod = (uint64_t)z[7 + j] * (uint64_t)BLS12_381_BARRETT_MU[i]
+                          + (uint64_t)q2[i + j] + (uint64_t)carry;
+            q2[i + j] = (uint32_t)prod;
+            carry = (uint32_t)(prod >> 32);
+        }
+        q2[i + 9] = carry;
+    }
+
+    // Step 3: r2 = (q3 * p) mod 2^288
+    uint32_t r2[9];
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) r2[i] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t carry = 0;
+        const int j_limit = (9 - i) < 8 ? (9 - i) : 8;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j >= j_limit) break;
+            uint64_t prod = (uint64_t)q2[9 + i] * (uint64_t)BLS12_381_MODULUS[j]
+                          + (uint64_t)r2[i + j] + (uint64_t)carry;
+            r2[i + j] = (uint32_t)prod;
+            carry = (uint32_t)(prod >> 32);
+        }
+        if (i + j_limit < 9) {
+            r2[i + j_limit] += carry;
+        }
+    }
+
+    // Step 4: r = z[0..8] - r2[0..8] (mod 2^288)
+    uint32_t r[9];
+    {
+        uint32_t borrow = 0;
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            uint64_t diff = (uint64_t)z[i] - (uint64_t)r2[i] - (uint64_t)borrow;
+            r[i] = (uint32_t)diff;
+            borrow = (diff >> 63) ? 1u : 0u;
+        }
+    }
+
+    // ── Step 5: Branchless conditional subtraction (2 iterations) ────────────
+    // Each iteration: S = r - p (with 9th limb), mask from borrow.
+    // If r >= p (no borrow), use S; else keep r.
+
+    #pragma unroll
+    for (int iter = 0; iter < 2; ++iter) {
+        uint32_t S[9];
+        uint32_t mask;
+
+        // S[0..7] = r[0..7] - p[0..7], S[8] = r[8] - 0 - borrow
+        // All in one carry chain for correct borrow propagation.
+        // Outputs: S[0..8] = %0..%8, mask = %9  (10 outputs)
+        // Inputs:  r[0..8] = %10..%18, MOD[0..7] = %19..%26  (17 inputs)
+        asm("sub.cc.u32   %0, %10, %19;\n\t"
+            "subc.cc.u32  %1, %11, %20;\n\t"
+            "subc.cc.u32  %2, %12, %21;\n\t"
+            "subc.cc.u32  %3, %13, %22;\n\t"
+            "subc.cc.u32  %4, %14, %23;\n\t"
+            "subc.cc.u32  %5, %15, %24;\n\t"
+            "subc.cc.u32  %6, %16, %25;\n\t"
+            "subc.cc.u32  %7, %17, %26;\n\t"
+            "subc.u32     %8, %18, 0;\n\t"      // S[8] = r[8] - 0 - borrow
+            "shr.s32      %9, %8, 31;"           // mask = sign bit (0 or 0xFFFFFFFF)
+            : "=r"(S[0]), "=r"(S[1]), "=r"(S[2]), "=r"(S[3]),
+              "=r"(S[4]), "=r"(S[5]), "=r"(S[6]), "=r"(S[7]),
+              "=r"(S[8]), "=r"(mask)
+            : "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]),
+              "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7]), "r"(r[8]),
+              "r"(BLS12_381_MODULUS[0]), "r"(BLS12_381_MODULUS[1]),
+              "r"(BLS12_381_MODULUS[2]), "r"(BLS12_381_MODULUS[3]),
+              "r"(BLS12_381_MODULUS[4]), "r"(BLS12_381_MODULUS[5]),
+              "r"(BLS12_381_MODULUS[6]), "r"(BLS12_381_MODULUS[7])
+        );
+
+        // Select: mask=0 → use S (reduced), mask=0xFFFFFFFF → keep r
+        // lop3 0xD8: (S & ~mask) | (r & mask)
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            asm("lop3.b32 %0, %1, %2, %3, 0xD8;"
+                : "=r"(r[i])
+                : "r"(S[i]), "r"(r[i]), "r"(mask));
+        }
+    }
+
+    // ── Return result ────────────────────────────────────────────────────────
+    FpElement result;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        result.limbs[i] = r[i];
+    }
+    return result;
+}
+
 // ─── Barrett squaring ────────────────────────────────────────────────────────
 // Dedicated squaring optimization deferred; delegate to ff_mul_barrett.
 
 __device__ __forceinline__
 FpElement ff_sqr_barrett(const FpElement& a) {
     return ff_mul_barrett(a, a);
+}
+
+__device__ __forceinline__
+FpElement ff_sqr_barrett_v2(const FpElement& a) {
+    return ff_mul_barrett_v2(a, a);
 }
