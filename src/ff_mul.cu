@@ -197,3 +197,19 @@ __global__ void ff_sqr_soa_kernel(
     FpElement a = load_fp_soa(a_limbs, tid, n);
     store_fp_soa(out_limbs, tid, n, ff_sqr(a));
 }
+
+// ─── Plantard Multiplication Kernel ─────────────────────────────────────────
+// b[] contains Plantard-form twiddles: T = -w * R^2 mod p
+// Output: a * w mod p (standard form)
+#include "ff_plantard.cuh"
+
+__global__ void ff_mul_plantard_kernel(
+    const FpElement* __restrict__ a,
+    const FpElement* __restrict__ b,
+    FpElement* __restrict__ out,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = ff_mul_plantard(a[tid], b[tid]);
+}

@@ -1099,14 +1099,20 @@ The achieved 6.2x speedup tracks the DRAM traffic ratio (8x) discounted by fixed
 
 ---
 
-## v1.7.0 — Plantard Reduction for BLS12-381
+## v1.7.0 — Plantard Reduction for BLS12-381 (NEGATIVE RESULT)
 
 **Goal:** Implement Plantard modular reduction as an alternative to Montgomery/Barrett for
 the compute-bound fused inner kernel. Plantard eliminates one big-integer multiplication
 per twiddle multiply by precomputing twiddle-specific Plantard constants.
 
-**Expected improvement:** 5–15% on fused inner kernel → 2–5% total NTT improvement.
-This is a targeted optimization for the inner kernel (now ~35% of total time post-radix-8).
+**NEGATIVE RESULT (Session 19):** Plantard requires **944 SASS instructions** per multiply —
+79% more than Montgomery v2 (528 SASS). The z × μ step (512×512-bit multiply mod R²) costs
+136 MADs alone, more than the entire Montgomery CIOS (136 MADs total). Plantard's advantage
+only applies to word-size moduli (32/64 bits); for 256-bit multi-limb BLS12-381, both product
+and reduction are O(n²) schoolbook multiplies with no shortcut. Session 20 cancelled.
+
+**Original expected improvement:** 5–15% on fused inner kernel → 2–5% total NTT improvement.
+This was a targeted optimization for the inner kernel (now ~35% of total time post-radix-8).
 
 **Rationale:** Unlike MoMA (which requires SPIRAL code generation and has 381-bit efficiency
 problems), Plantard is a clean mathematical technique with proven GPU results. Özcan & Savaş
@@ -1120,7 +1126,7 @@ less dramatic but still saves one 8-limb multiplication per butterfly.
 
 ---
 
-### Session 19 — Plantard Arithmetic + Twiddle Precomputation
+### Session 19 — Plantard Arithmetic + Twiddle Precomputation ✅ COMPLETE (NEGATIVE RESULT)
 
 **Objective:** Implement Plantard reduction for BLS12-381 and precompute Plantard-form
 twiddle factors.
@@ -1196,56 +1202,11 @@ is amortized over all NTT invocations.
 
 ---
 
-### Session 20 — Plantard NTT Integration + Benchmark + Release v1.7.0
+### Session 20 — ~~Plantard NTT Integration + Benchmark + Release v1.7.0~~ CANCELLED
 
-**Objective:** Integrate Plantard into the fused inner kernel, benchmark, release.
-
-**Tasks:**
-- Add `NTTMode::PLANTARD` to the NTT API
-- Integrate Plantard into fused K=10 kernel:
-  - New fused kernel variant using `ff_mul_plantard` for twiddle × element multiply
-  - `ff_add_v2` / `ff_sub_v2` remain unchanged (Plantard outputs standard-form)
-  - Add to `ntt_fused_kernels.cu` (separate instantiation, same TU pattern)
-- Integrate into outer stages:
-  - Since outer stages are memory-bound, Plantard's compute savings may not help
-  - Test both: Plantard outer stages vs Montgomery/Barrett outer stages
-  - If no improvement, keep Plantard for inner kernel only + Montgomery/Barrett outer
-  - This "mixed-mode" approach uses the best arithmetic for each kernel's bottleneck
-- Plantard twiddle cache: precompute and cache alongside Montgomery/Barrett twiddles
-- Benchmark: {Montgomery, Barrett, Plantard, Plantard+Montgomery-outer} × {2^15..2^22}
-  - Focus on fused kernel time (use ncu `--kernel-id` to isolate)
-  - Full NTT time for all modes
-- Profile: register usage, IPC, occupancy for Plantard fused kernel vs Montgomery
-- Full regression sweep
-- Update analysis.md, README, CLAUDE.md
-- Tag v1.7.0
-
-**Test plan — Plantard NTT integration:**
-- **Forward NTT vs CPU reference:**
-  - Plantard mode: all sizes 2^10..2^22
-- **Roundtrip INTT(NTT(x)) = x:**
-  - Plantard mode: all sizes 2^10..2^22
-- **Cross-validation (Plantard NTT vs Montgomery NTT vs Barrett NTT):**
-  - Bitwise identical output at all sizes 2^10..2^22
-- **Batched Plantard:**
-  - B=8 vs sequential at 2^15, 2^18, 2^22
-  - Batched Plantard vs batched Montgomery (bitwise identical)
-- **Mixed-mode validation:**
-  - Plantard-inner + Montgomery-outer vs pure Montgomery (should be identical if
-    conversion between representations is correct at kernel boundary)
-
-**Expected results (n=2^22, single NTT):**
-- Pure Plantard: ~12–14 ms (inner kernel 5–15% faster, outer unchanged)
-- Plantard inner + radix-8 outer: ~11–13 ms
-- vs v1.5.0 baseline: 2–5% improvement
-
-**Deliverables:**
-- `NTTMode::PLANTARD` in public API
-- Plantard fused kernels in `ntt_fused_kernels.cu`
-- Plantard twiddle cache
-- Benchmark data: `results/data/bench_v170.json`
-- All tests green (target: ~370 total)
-- Git tag v1.7.0
+**CANCELLED:** Session 19 demonstrated that Plantard arithmetic is 79% slower than Montgomery
+for 256-bit BLS12-381 (944 SASS vs 528 SASS). Integrating a slower multiplication into the
+NTT pipeline would degrade performance. No `NTTMode::PLANTARD` will be added.
 
 ---
 
@@ -1428,8 +1389,8 @@ read/write contiguous blocks regardless of stage.
 | **16** | **v1.6.0** | **Goldilocks + BabyBear field arithmetic** ✅ | **GPU+CPU ref, 374 tests. GL 3.6x, BB 6.8x faster mul.** |
 | **17** | **v1.6.0** | **Multi-field NTT integration + correctness** ✅ | **Fused K=8-11 + radix-8/4/2 outer, batched. 458 tests.** |
 | **18** | **v1.6.0** | **3-way benchmark + charts + release v1.6.0** ✅ | **BLS 15.1ms, GL 3.6ms (4.2x), BB 2.4ms (6.2x). 458 tests.** |
-| 19 | v1.7.0 | Plantard arithmetic + twiddle precompute | Eliminate 1 big-int mul/butterfly |
-| 20 | v1.7.0 | Plantard NTT integration + benchmark + release v1.7.0 | ~2–5% total improvement |
+| **19** | **v1.7.0** | **Plantard arithmetic + twiddle precompute** ✅ | **NEGATIVE RESULT**: 944 SASS (+79% vs Montgomery 528). 471 tests. |
+| **20** | **v1.7.0** | ~~Plantard NTT integration~~ | **CANCELLED** — Plantard arithmetic slower than Montgomery |
 | 21 | v1.8.0 | Stockham kernel design + implementation | Coalesced outer-stage access |
 | 22 | v1.8.0 | Stockham correctness + edge cases | Ping-pong buffer validation |
 | 23 | v1.8.0 | Stockham benchmark + release v1.8.0 | Conditional on L2 diagnostic |
@@ -1446,7 +1407,7 @@ read/write contiguous blocks regardless of stage.
   disabled (I-cache regression). OTF twiddles: **negative result** (56.9 ms, +265%), disabled.
   333 tests. Final target: **15.6 ms** (no OTF gain).
 - v1.6.0: ~14 ms BLS / ~1.2 ms Goldilocks / ~0.4 ms BabyBear — **multi-field** (projected)
-- v1.7.0: ~13.5 ms (Plantard inner kernel, −4% vs v1.5.0) — **projected**
+- v1.7.0: **NEGATIVE RESULT** — Plantard 944 SASS vs Montgomery 528 (+79%). No NTT integration.
 - v1.8.0: **CANCELLED** (Stockham NO-GO — L2 58.5% = bandwidth-bound)
 
 **Batch throughput (8× 2^22 NTTs):**

@@ -3367,6 +3367,328 @@ void test_bb_ntt_inverse_explicit(int log_n) {
     CUDA_CHECK(cudaFree(d_data));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Plantard Arithmetic Tests (v1.7.0 Session 19 — NEGATIVE RESULT investigation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+extern __global__ void ff_mul_plantard_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
+
+// CPU reference: Plantard mul on standard-form elements
+static FpElement cpu_plantard_mul(const FpElement& a, const FpElement& t_plant) {
+    ff_ref::FpRef ra = ff_ref::FpRef::from_u32(a.limbs);
+    ff_ref::FpRef rt = ff_ref::FpRef::from_u32(t_plant.limbs);
+    ff_ref::FpRef rc = ff_ref::fp_mul_plantard(ra, rt);
+    FpElement result;
+    rc.to_u32(result.limbs);
+    return result;
+}
+
+// Convert standard-form twiddle to Plantard form
+static FpElement cpu_to_plantard_twiddle(const FpElement& w_std) {
+    ff_ref::FpRef rw = ff_ref::FpRef::from_u32(w_std.limbs);
+    ff_ref::FpRef rt = ff_ref::fp_to_plantard_twiddle(rw);
+    FpElement result;
+    rt.to_u32(result.limbs);
+    return result;
+}
+
+void test_plantard_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_plantard_cpu_self_test...\n");
+
+    // Test 1: Plantard mu constant verification: p * mu ≡ 1 mod R^2
+    {
+        // Verify by checking p * mu mod 2^64 = 1 (the lowest 64 bits)
+        // p[0] = 0xffffffff00000001, mu[0] = 0x0000000100000001
+        // p[0] * mu[0] mod 2^64 should contribute to 1
+        Plant512 p512;
+        for (int i = 0; i < 8; ++i) p512.limbs[i] = 0;
+        p512.limbs[0] = MOD[0]; p512.limbs[1] = MOD[1];
+        p512.limbs[2] = MOD[2]; p512.limbs[3] = MOD[3];
+        Plant512 mu512;
+        for (int i = 0; i < 8; ++i) mu512.limbs[i] = PLANTARD_MU[i];
+
+        Plant512 product = plant512_mul_lo(p512, mu512);
+        // product should be 1 (mod 2^512)
+        bool is_one = (product.limbs[0] == 1);
+        for (int i = 1; i < 8; ++i) is_one = is_one && (product.limbs[i] == 0);
+        TEST_ASSERT(is_one, "p * mu mod R^2 should be 1");
+    }
+
+    // Test 2: Plantard(a, -w*R^2) should give a*w mod p
+    {
+        FpRef a = FpRef::from_u64(42);
+        FpRef w = FpRef::from_u64(17);
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        FpRef expected = fp_mul_barrett(a, w);
+        TEST_ASSERT(result == expected, "Plantard(42, T(17)) should equal Barrett(42, 17)");
+    }
+
+    // Test 3: a=0 should give 0
+    {
+        FpRef a = FpRef::zero();
+        FpRef w = FpRef::from_u64(123);
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        TEST_ASSERT(result == FpRef::zero(), "Plantard(0, T(w)) should be 0");
+    }
+
+    // Test 4: w=0 -> T=0, Plantard should give 0
+    {
+        FpRef a = FpRef::from_u64(42);
+        FpRef w = FpRef::zero();
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        TEST_ASSERT(result == FpRef::zero(), "Plantard(a, T(0)) should be 0");
+    }
+
+    // Test 5: Identity — a*1 = a
+    {
+        FpRef a = FpRef::from_u64(999999);
+        FpRef w = FpRef::from_u64(1);
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        TEST_ASSERT(result == a, "Plantard(a, T(1)) should be a");
+    }
+
+    // Test 6: (p-1) * (p-1) edge case
+    {
+        FpRef a, w;
+        for (int i = 0; i < 4; ++i) {
+            a.limbs[i] = MOD[i];
+            w.limbs[i] = MOD[i];
+        }
+        // a = p, but we need a < p. Use p-1.
+        a = fp_sub(a, FpRef::from_u64(1));
+        w = fp_sub(w, FpRef::from_u64(1));
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        FpRef expected = fp_mul_barrett(a, w);
+        TEST_ASSERT(result == expected, "Plantard((p-1), T(p-1)) should match Barrett");
+    }
+}
+
+void test_plantard_vs_barrett() {
+    using namespace ff_ref;
+    printf("test_plantard_vs_barrett (1024 random pairs)...\n");
+
+    int pass = 0;
+    const int N = 1024;
+    uint32_t state = 0xDEADBEEF;
+
+    for (int i = 0; i < N; ++i) {
+        // Generate random elements < p
+        FpRef a, w;
+        for (int j = 0; j < 4; ++j) {
+            state = state * 1664525u + 1013904223u;
+            a.limbs[j] = static_cast<uint64_t>(state) |
+                          (static_cast<uint64_t>(state * 2654435761u) << 32);
+            state = state * 1664525u + 1013904223u;
+            w.limbs[j] = static_cast<uint64_t>(state) |
+                          (static_cast<uint64_t>(state * 2654435761u) << 32);
+        }
+        // Ensure < p
+        a.limbs[3] &= 0x3FFFFFFFFFFFFFFFULL;
+        w.limbs[3] &= 0x3FFFFFFFFFFFFFFFULL;
+
+        FpRef t_plant = fp_to_plantard_twiddle(w);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        FpRef expected = fp_mul_barrett(a, w);
+        if (result == expected) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Plantard vs Barrett mismatch");
+    printf("  %d/%d matched\n", pass, N);
+}
+
+void test_plantard_vs_montgomery() {
+    using namespace ff_ref;
+    printf("test_plantard_vs_montgomery (1024 random pairs)...\n");
+
+    int pass = 0;
+    const int N = 1024;
+
+    for (int i = 0; i < N; ++i) {
+        FpElement a_gpu = make_large_standard_fp(static_cast<uint32_t>(i * 3 + 7));
+        FpElement w_gpu = make_large_standard_fp(static_cast<uint32_t>(i * 3 + 2000));
+
+        FpRef a_ref = FpRef::from_u32(a_gpu.limbs);
+        FpRef w_ref = FpRef::from_u32(w_gpu.limbs);
+
+        // Plantard: a * w mod p (standard form)
+        FpRef t_plant = fp_to_plantard_twiddle(w_ref);
+        FpRef plantard_result = fp_mul_plantard(a_ref, t_plant);
+
+        // Montgomery: to_mont(a) * to_mont(w) -> from_mont -> standard form
+        FpRef a_mont = to_montgomery(a_ref);
+        FpRef w_mont = to_montgomery(w_ref);
+        FpRef mont_result_mont = fp_mul(a_mont, w_mont);
+        FpRef mont_result = from_montgomery(mont_result_mont);
+
+        if (plantard_result == mont_result) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Plantard vs Montgomery mismatch");
+    printf("  %d/%d matched\n", pass, N);
+}
+
+void test_plantard_gpu() {
+    printf("test_plantard_gpu (1024 elements)...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_t(N), h_out(N);
+
+    // Generate standard-form inputs and Plantard twiddles
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_large_standard_fp(i * 2 + 1);
+        FpElement w_std = make_large_standard_fp(i * 2 + 5000);
+        h_t[i] = cpu_to_plantard_twiddle(w_std);
+    }
+
+    FpElement *d_a, *d_t, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_t,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_t, h_t.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    ff_mul_plantard_kernel<<<(N + 255) / 256, 256>>>(d_a, d_t, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass_count = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FpElement expected = cpu_plantard_mul(h_a[i], h_t[i]);
+        if (h_out[i] == expected) ++pass_count;
+    }
+
+    TEST_ASSERT(pass_count == (int)N, "ff_mul_plantard GPU vs CPU reference mismatch");
+    printf("  ff_mul_plantard GPU: %d/%u matched\n", pass_count, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_t));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_plantard_gpu_vs_barrett_gpu() {
+    printf("test_plantard_gpu_vs_barrett_gpu (1024 elements)...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FpElement> h_a(N), h_w(N), h_t_plant(N);
+    std::vector<FpElement> h_plant_out(N), h_barrett_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = make_large_standard_fp(i * 7 + 11);
+        h_w[i] = make_large_standard_fp(i * 7 + 3000);
+        h_t_plant[i] = cpu_to_plantard_twiddle(h_w[i]);
+    }
+
+    FpElement *d_a, *d_w, *d_t, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_w,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_t,   N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+
+    // Plantard GPU
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_t, h_t_plant.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ff_mul_plantard_kernel<<<(N + 255) / 256, 256>>>(d_a, d_t, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_plant_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Barrett GPU
+    CUDA_CHECK(cudaMemcpy(d_w, h_w.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ff_mul_barrett_kernel<<<(N + 255) / 256, 256>>>(d_a, d_w, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_barrett_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (h_plant_out[i] == h_barrett_out[i]) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Plantard GPU vs Barrett GPU mismatch");
+    printf("  Plantard vs Barrett GPU: %d/%u matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_w));
+    CUDA_CHECK(cudaFree(d_t));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_plantard_twiddle_precomputation() {
+    using namespace ff_ref;
+    printf("test_plantard_twiddle_precomputation...\n");
+
+    // For n=1024, check that Plantard twiddles produce correct NTT-style results
+    const size_t n = 1024;
+    FpRef omega = get_root_of_unity(n);
+    FpRef omega_std = from_montgomery(omega);
+    FpRef one = FpRef::from_u64(1);
+
+    FpRef wk = one;
+    int pass = 0;
+    for (size_t k = 0; k < n / 2; ++k) {
+        FpRef t_plant = fp_to_plantard_twiddle(wk);
+
+        // Test: Plantard(a, t_plant) == a * wk mod p
+        FpRef a = FpRef::from_u64(k + 100);
+        FpRef result = fp_mul_plantard(a, t_plant);
+        FpRef expected = fp_mul_barrett(a, wk);
+        if (result == expected) ++pass;
+
+        // Advance twiddle (standard form)
+        wk = fp_mul_barrett(wk, omega_std);
+    }
+    TEST_ASSERT(pass == (int)(n / 2), "Plantard twiddle precomputation mismatch");
+    printf("  %d/%zu twiddle values verified\n", pass, n / 2);
+}
+
+void test_plantard_algebraic() {
+    using namespace ff_ref;
+    printf("test_plantard_algebraic...\n");
+
+    // Test commutativity: a*w == w*a via Plantard
+    // Note: Plantard(a, T(w)) gives a*w. Plantard(w, T(a)) gives w*a.
+    // These should be equal.
+    int pass_comm = 0, pass_assoc = 0;
+    const int N = 256;
+
+    for (int i = 0; i < N; ++i) {
+        uint64_t seed_a = static_cast<uint64_t>(i * 13 + 1);
+        uint64_t seed_w = static_cast<uint64_t>(i * 17 + 100);
+        FpRef a = FpRef::from_u64(seed_a);
+        FpRef w = FpRef::from_u64(seed_w);
+
+        FpRef t_w = fp_to_plantard_twiddle(w);
+        FpRef t_a = fp_to_plantard_twiddle(a);
+        FpRef aw = fp_mul_plantard(a, t_w);
+        FpRef wa = fp_mul_plantard(w, t_a);
+        if (aw == wa) ++pass_comm;
+    }
+    TEST_ASSERT(pass_comm == N, "Plantard commutativity failure");
+    printf("  Commutativity: %d/%d\n", pass_comm, N);
+
+    // Test associativity: (a*b)*c == a*(b*c) via Barrett (Plantard is for twiddle mul)
+    for (int i = 0; i < N; ++i) {
+        FpRef a = FpRef::from_u64(static_cast<uint64_t>(i * 5 + 1));
+        FpRef b = FpRef::from_u64(static_cast<uint64_t>(i * 5 + 2));
+        FpRef c = FpRef::from_u64(static_cast<uint64_t>(i * 5 + 3));
+
+        // (a*b)*c via Plantard
+        FpRef ab = fp_mul_barrett(a, b);
+        FpRef t_c = fp_to_plantard_twiddle(c);
+        FpRef ab_c = fp_mul_plantard(ab, t_c);
+
+        // a*(b*c) via Plantard
+        FpRef bc = fp_mul_barrett(b, c);
+        FpRef t_bc = fp_to_plantard_twiddle(bc);
+        FpRef a_bc = fp_mul_plantard(a, t_bc);
+
+        if (ab_c == a_bc) ++pass_assoc;
+    }
+    TEST_ASSERT(pass_assoc == N, "Plantard associativity failure");
+    printf("  Associativity: %d/%d\n", pass_assoc, N);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -4027,6 +4349,16 @@ int main() {
     test_bb_ntt_batch_roundtrip(10, 4);
     test_bb_ntt_batch_roundtrip(15, 8);
     test_bb_ntt_batch_roundtrip(18, 2);
+
+    // ── Plantard Arithmetic (v1.7.0 Session 19 — NEGATIVE RESULT) ──
+    printf("\n--- Plantard arithmetic tests (negative result investigation) ---\n");
+    test_plantard_cpu_self_test();
+    test_plantard_vs_barrett();
+    test_plantard_vs_montgomery();
+    test_plantard_gpu();
+    test_plantard_gpu_vs_barrett_gpu();
+    test_plantard_twiddle_precomputation();
+    test_plantard_algebraic();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

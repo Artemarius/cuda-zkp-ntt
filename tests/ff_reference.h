@@ -857,4 +857,126 @@ inline void bb_ntt_inverse_reference(std::vector<BbRef>& data, size_t n) {
         data[i] = bb_mul(data[i], n_inv);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Plantard Modular Arithmetic for BLS12-381
+// NEGATIVE RESULT: 264 MADs vs Montgomery CIOS 136 MADs for 256-bit modulus.
+// Plantard's advantage (eliminating one big-int multiply) only applies to
+// word-size moduli. For multi-limb 256-bit, both product and reduction are O(n^2).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 512-bit type for Plantard intermediate values (8 x uint64_t, little-endian)
+struct Plant512 {
+    uint64_t limbs[8];
+};
+
+// mu = p^{-1} mod 2^512 (8 x uint64_t, little-endian)
+static constexpr std::array<uint64_t, 8> PLANTARD_MU = {{
+    0x0000000100000001ULL,  // limbs64[0]
+    0xac45a4000001a402ULL,  // limbs64[1]
+    0xe7e4d3e8fffb13f9ULL,  // limbs64[2]
+    0xc2bbc54f2840d7c6ULL,  // limbs64[3]
+    0x126d1ba9fe75c03fULL,  // limbs64[4]
+    0xef9dd73b4a284c49ULL,  // limbs64[5]
+    0x81a4751084a126a4ULL,  // limbs64[6]
+    0x72fe25abadd63363ULL   // limbs64[7]
+}};
+
+// -R^2 mod p (for Plantard twiddle conversion: T = -w * R^2 mod p)
+static constexpr std::array<uint64_t, 4> NEG_R2_MOD = {{
+    0x3666166e0c0d6394ULL,
+    0x2850b637786bffdbULL,
+    0x2d66c371974d9e76ULL,
+    0x6ca4cd798a437e37ULL
+}};
+
+// Multiply two 512-bit values, return low 512 bits (mod 2^512)
+inline Plant512 plant512_mul_lo(const Plant512& a, const Plant512& b) {
+    Plant512 r;
+    for (int i = 0; i < 8; ++i) r.limbs[i] = 0;
+
+    for (int i = 0; i < 8; ++i) {
+        uint128_t carry = 0;
+        for (int j = 0; j < 8; ++j) {
+            if (i + j >= 8) break;
+            carry += uint128_t(a.limbs[j]) * b.limbs[i] + r.limbs[i + j];
+            r.limbs[i + j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+    }
+    return r;
+}
+
+// Full 256x256 -> 512-bit product as Plant512
+inline Plant512 plant_wide_mul(const FpRef& a, const FpRef& b) {
+    Wide512 w = fp_wide_mul(a, b);
+    Plant512 r;
+    for (int i = 0; i < 8; ++i) r.limbs[i] = w.limbs[i];
+    return r;
+}
+
+// Plantard reduction: PRedc(W, T) = W * T * (-R^{-2}) mod p
+// Algorithm:
+//   1. z = W * T (512-bit product)
+//   2. c = z * mu mod R^2 (low 512 bits of 512x512 product)
+//   3. q = upper(c) + 1 (c[4..7] + 1, in 64-bit limbs)
+//   4. r = upper(q * p) (upper 256 bits of q*p)
+//   5. if r == p, return 0
+inline FpRef fp_plantard_reduce(const Plant512& z) {
+    // Step 2: c = z * mu mod R^2
+    Plant512 mu_val;
+    for (int i = 0; i < 8; ++i) mu_val.limbs[i] = PLANTARD_MU[i];
+    Plant512 c = plant512_mul_lo(z, mu_val);
+
+    // Step 3: q = upper half of c + 1 = c[4..7] + 1
+    uint64_t q[5];
+    uint128_t carry_q = 1; // the "+1"
+    for (int i = 0; i < 4; ++i) {
+        carry_q += uint128_t(c.limbs[4 + i]);
+        q[i] = static_cast<uint64_t>(carry_q);
+        carry_q >>= 64;
+    }
+    q[4] = static_cast<uint64_t>(carry_q);
+
+    // Step 4: r = floor(q * p / R) = upper 256 bits of q*p
+    // q is at most 257 bits (5 limbs), p is 256 bits (4 limbs)
+    uint64_t qp[9];
+    for (int i = 0; i < 9; ++i) qp[i] = 0;
+
+    for (int i = 0; i < 5; ++i) {
+        uint128_t carry = 0;
+        for (int j = 0; j < 4; ++j) {
+            if (i + j >= 9) break;
+            carry += uint128_t(q[i]) * MOD[j] + qp[i + j];
+            qp[i + j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        if (i + 4 < 9) qp[i + 4] += static_cast<uint64_t>(carry);
+    }
+
+    // r = qp[4..7]
+    FpRef result;
+    for (int i = 0; i < 4; ++i) result.limbs[i] = qp[4 + i];
+
+    // Step 5: if r == p, return 0
+    if (result.limbs == MOD) {
+        return FpRef::zero();
+    }
+    return result;
+}
+
+// Plantard multiply: PRedc(a, t_plant) where t_plant = -w * R^2 mod p
+// Result: a * w mod p (standard form in/out)
+inline FpRef fp_mul_plantard(const FpRef& a, const FpRef& t_plant) {
+    Plant512 z = plant_wide_mul(a, t_plant);
+    return fp_plantard_reduce(z);
+}
+
+// Convert twiddle w (standard form) to Plantard form: T = -w * R^2 mod p
+// Uses Barrett multiplication: T = w * (-R^2 mod p) mod p
+inline FpRef fp_to_plantard_twiddle(const FpRef& w_std) {
+    FpRef neg_r2;
+    neg_r2.limbs = NEG_R2_MOD;
+    return fp_mul_barrett(w_std, neg_r2);
+}
+
 } // namespace ff_ref

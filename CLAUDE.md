@@ -12,7 +12,9 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
 - **v1.6.0**: Goldilocks (64-bit) + BabyBear (31-bit) full NTT + 3-way benchmark complete.
   At n=2^22: BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x faster), BabyBear 2.4ms (6.2x faster).
   458 tests. Speedup converges at large sizes (outer stages memory-bound, not arithmetic-bound).
-- **Next**: Plantard reduction (v1.7.0)
+- **v1.7.0**: Plantard reduction — **NEGATIVE RESULT** (944 SASS, +79% vs Montgomery 528).
+  Plantard's advantage (eliminating one big-int multiply) only applies to word-size moduli.
+  For 256-bit BLS12-381, the z×μ step (512×512 schoolbook) costs 136 MADs alone. 471 tests.
 
 ---
 
@@ -71,6 +73,10 @@ CMake targets:
 - Montgomery constant: R = 2^256 mod r
 - Montgomery arithmetic: `include/ff_arithmetic.cuh` (CIOS, PTX intrinsics)
 - Barrett arithmetic: `include/ff_barrett.cuh` (standard-form, no domain conversion)
+- Plantard arithmetic: `include/ff_plantard.cuh` — **NEGATIVE RESULT** for BLS12-381.
+  944 SASS instructions vs Montgomery 528 (+79%). Full algorithm requires z×μ (512×512
+  schoolbook, 136 MADs) + q×p (64 MADs) on top of the 64-MAD product. Only viable for
+  word-size moduli (32/64 bits). Infrastructure retained for reference.
 - Goldilocks field (p = 2^64 − 2^32 + 1): `include/ff_goldilocks.cuh`
   - Representation: single `uint64_t`, standard form (no Montgomery)
   - Mul: PTX `mul.lo/hi.u64` → Goldilocks reduction (2^64 ≡ 2^32 − 1 mod p)
@@ -110,6 +116,7 @@ include/
   cuda_utils.cuh      — CUDA_CHECK macro, timing utilities
   ff_arithmetic.cuh   — Fp element type, Montgomery mul, add, sub, inv
   ff_barrett.cuh      — Barrett modular multiplication (standard-form, no Montgomery)
+  ff_plantard.cuh     — Plantard modular multiplication (NEGATIVE RESULT for BLS12-381)
   ff_goldilocks.cuh   — Goldilocks field (p=2^64-2^32+1, uint64_t): add, sub, mul, pow, inv
   ff_babybear.cuh     — BabyBear field (p=2^31-2^27+1, uint32_t): add, sub, mul, pow, inv
   ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -357,7 +364,7 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 planned, v1.8.0 Stockham cancelled).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 negative result, v1.8.0 Stockham cancelled).
 
 Phases 1-8 complete. Current version: **v1.6.0** released.
 
@@ -371,6 +378,9 @@ Phases 1-8 complete. Current version: **v1.6.0** released.
 - **v1.6.0** — Multi-field NTT: Goldilocks (64-bit) + BabyBear (31-bit). 3-way benchmark at n=2^22:
   BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x), BabyBear 2.4ms (6.2x). Speedup converges at large sizes
   (outer stages memory-bound). 458 tests.
+- **v1.7.0** — Plantard reduction: **negative result**. 944 SASS (+79% vs Montgomery 528) for BLS12-381.
+  Plantard's advantage (eliminating one multiply) only applies to word-size moduli (32/64-bit).
+  NTT integration cancelled. 471 tests.
 
 ---
 
