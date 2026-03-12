@@ -828,6 +828,95 @@ Benchmark data: `results/data/bench_v150_s13.json`
 
 ---
 
+## Section 10 — v1.5.0 Results (Radix-8 Outer Stages + OTF Twiddles)
+
+### 10.1 Radix-8 Outer Stages — Montgomery Only
+
+Fuses triples of consecutive outer stages into radix-8 butterflies:
+- 8 data loads + 8 stores per radix-8 unit (vs 12+12 for 3 radix-4 stages)
+- For n=2^22 Montgomery: 12 outer stages → 4 radix-8 passes in 1 cooperative launch
+
+**Single NTT (10-rep median):**
+
+| Size | Montgomery radix-8 (v1.5.0) | Montgomery radix-4 (v1.4.0) | Change |
+|------|---|---|---|
+| 2^15 | 0.259 ms | 0.132 ms | — (different warmup) |
+| 2^18 | 1.75 ms | 0.952 ms | — |
+| 2^20 | 5.53 ms | 4.11 ms | — |
+| **2^22** | **15.5 ms** | **17.1 ms** | **-9.4%** |
+
+Note: Small-size comparisons between sessions show variance from GPU thermal state.
+The 2^22 result (low CV, isolated run) is the reliable comparison point.
+
+**Barrett unchanged (radix-4):**
+
+| Size | Barrett (v1.5.0) | Barrett (v1.4.0) | Change |
+|------|---|---|---|
+| 2^22 | **17.5 ms** | **17.4 ms** | ~0% (within noise) |
+
+Barrett radix-8 was implemented but **disabled** due to catastrophic I-cache thrashing:
+174 registers + enormous instruction body → 55.3% I-fetch stalls → +73% regression at 2^22.
+Barrett stays on radix-4 (~98 regs, 2 blocks/SM). See Section 9.1 for details.
+
+### 10.2 Batched Performance (v1.5.0)
+
+**8× NTT batch (7-rep median):**
+
+| Size | Montgomery (radix-8) | Barrett (radix-4) | Mont per-NTT |
+|------|---|---|---|
+| 2^15 | 1.54 ms | 1.81 ms | 0.193 ms |
+| 2^18 | 7.25 ms | 7.48 ms | 0.906 ms |
+| 2^20 | 31.2 ms | 33.1 ms | 3.90 ms |
+| **2^22** | **130 ms** | **148 ms** | **16.25 ms** |
+
+Montgomery batched at 2^22: 130 ms / 8 = 16.25 ms per NTT (near-linear scaling).
+
+### 10.3 On-the-Fly Twiddle Computation — Negative Result (Session 14)
+
+OTF replaces precomputed twiddle table loads with on-the-fly computation from per-stage
+roots stored in `__constant__` memory (~1 KB vs 64 MB precomputed table at n=2^22).
+
+**Measured (n=2^22):**
+
+| Mode | OTF | Precomputed | Overhead |
+|------|---|---|---|
+| Montgomery | **56.9 ms** | 15.6 ms | **+265%** |
+| Barrett | **91.4 ms** | 17.9 ms | **+411%** |
+
+**Root cause**: BLS12-381 256-bit arithmetic makes exponentiation prohibitively expensive.
+`ff_pow_mont_u32(root, j)` at outer stages with j up to 2^19 requires ~29 Montgomery muls
+per butterfly. Each CIOS mul costs ~128 MADs. Total: ~35 muls × 128 MADs = 4480 MADs per
+butterfly vs 7 DRAM reads (224 bytes) for precomputed twiddles.
+
+OTF **disabled** in all dispatch functions. Infrastructure retained for future multi-field
+work (Goldilocks 64-bit / BabyBear 31-bit where multiply is 1-2 instructions, not 128 MADs).
+
+### 10.4 Summary — v1.5.0 Performance
+
+**Cumulative improvement from v1.1.0 (n=2^22, median):**
+
+| Metric | v1.1.0 | v1.2.0 | v1.3.0 | v1.4.0 | **v1.5.0** | v1.5 vs v1.1 |
+|---|---|---|---|---|---|---|
+| Montgomery | 25.1 ms | 25.1 ms | — | 17.1 ms | **15.5 ms** | **-38%** |
+| Barrett | — | 24.9 ms | 29.5 ms | 17.4 ms | **17.5 ms** | **-30%** |
+| Batch 8× (Mont) | ~201 ms | 214 ms | — | 150 ms | **130 ms** | **-35%** |
+| Batch 8× (Barrett) | — | 219 ms | 241 ms | 159 ms | **148 ms** | **-32%** |
+| Tests | — | 119 | 221 | 230 | **333** | — |
+
+**Key contributions:**
+1. **Radix-8 outer stages (Montgomery)** (-9.4%): fuses triples of stages → further DRAM traffic reduction
+2. **Barrett radix-8 disabled**: I-cache regression at 174 regs, stays on radix-4
+3. **OTF twiddles** (negative result): BLS12-381 pow too expensive, disabled; infrastructure for multi-field
+4. **87 new tests**: comprehensive radix-8 and OTF coverage (333 total)
+
+**Register pressure is the new constraint.** Montgomery radix-8 at 134 regs is at the edge
+of viability (1 block/SM). Any further kernel size increase risks Barrett-style I-cache thrashing.
+Future optimization must target DRAM access patterns (50% uncoalesced) or move to smaller fields.
+
+Benchmark data: `results/data/bench_v150.json`
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)

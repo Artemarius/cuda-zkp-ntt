@@ -429,6 +429,119 @@ def plot_all_modes_comparison():
     print(f"  {path}")
 
 
+def plot_v150_vs_v140():
+    """v1.5.0 vs v1.4.0 single NTT latency comparison at all sizes."""
+    scales = ["2^15", "2^16", "2^18", "2^20", "2^22"]
+
+    # v1.4.0 medians
+    mont_v14 = [0.132, 0.244, 0.952, 4.11, 17.1]
+    # v1.5.0 medians
+    mont_v15 = [0.259, 0.624, 1.75,  5.53, 15.5]
+
+    x = np.arange(len(scales))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bars1 = ax.bar(x - w/2, mont_v14, w, label="v1.4.0 Montgomery (radix-4)", color="#5B9BD5", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x + w/2, mont_v15, w, label="v1.5.0 Montgomery (radix-8)", color="#ED7D31", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Single NTT Latency — v1.4.0 vs v1.5.0 (Montgomery)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.set_ylim(0.05, 30)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Annotate delta at 2^22
+    delta = (mont_v15[-1] / mont_v14[-1] - 1) * 100
+    color = "#006400" if delta < 0 else "#C00000"
+    sign = "" if delta < 0 else "+"
+    ax.annotate(f"{sign}{delta:.0f}%",
+                xy=(x[-1] + w/2, mont_v15[-1]),
+                xytext=(0, 6), textcoords="offset points",
+                ha="center", fontsize=9, fontweight="bold", color=color)
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "v150_vs_v140.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_version_history():
+    """NTT latency progression across all versions at n=2^22."""
+    versions = ["v1.1\nMont", "v1.2\nBarrett", "v1.3\n4-Step", "v1.4\nRadix-4", "v1.5\nRadix-8"]
+    times = [25.1, 24.9, 29.5, 17.1, 15.5]
+    colors = ["#A5A5A5", "#70AD47", "#9B59B6", "#5B9BD5", "#ED7D31"]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bars = ax.bar(versions, times, color=colors, edgecolor="white", linewidth=0.5)
+
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("NTT at n=2^22 — Version History (Best Mode Each Release)")
+    ax.set_ylim(0, 35)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f"{t:.1f} ms", ha="center", fontweight="bold", fontsize=10)
+
+    # Highlight best
+    ax.annotate("Best\n-38% vs v1.1", xy=(4, 15.5), xytext=(3.2, 8),
+                arrowprops=dict(arrowstyle="->", color="#006400"),
+                fontsize=9, fontweight="bold", color="#006400")
+
+    # Mark negative results
+    ax.annotate("Negative\nresult", xy=(2, 29.5), xytext=(2.5, 33),
+                arrowprops=dict(arrowstyle="->", color="#C00000"),
+                fontsize=8, color="#C00000")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "version_history.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_v150_batched():
+    """v1.5.0 batched NTT: Montgomery radix-8 vs Barrett radix-4."""
+    sizes = ["2^15", "2^18", "2^20", "2^22"]
+    mont_batch =    [1.54, 7.25, 31.2, 130]
+    barrett_batch = [1.81, 7.48, 33.1, 148]
+
+    x = np.arange(len(sizes))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bars1 = ax.bar(x - w/2, mont_batch, w, label="Montgomery (radix-8)", color="#ED7D31", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x + w/2, barrett_batch, w, label="Barrett (radix-4)", color="#70AD47", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size (batch of 8)")
+    ax.set_ylabel("Total Latency (ms)")
+    ax.set_title("Batched 8x NTT — Montgomery vs Barrett (v1.5.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sizes)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Annotate delta at 2^22
+    delta = (barrett_batch[-1] / mont_batch[-1] - 1) * 100
+    ax.annotate(f"+{delta:.0f}%",
+                xy=(x[-1] + w/2, barrett_batch[-1]),
+                xytext=(0, 6), textcoords="offset points",
+                ha="center", fontsize=9, fontweight="bold", color="#C00000")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "v150_batched.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
 if __name__ == "__main__":
     print("Generating benchmark charts...")
     plot_ntt_compute()
@@ -441,4 +554,7 @@ if __name__ == "__main__":
     plot_four_step_vs_barrett()
     plot_four_step_batch()
     plot_all_modes_comparison()
+    plot_v150_vs_v140()
+    plot_version_history()
+    plot_v150_batched()
     print("Done.")

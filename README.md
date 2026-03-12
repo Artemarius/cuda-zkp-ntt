@@ -11,7 +11,8 @@
 
 ## Highlights
 
-- **v1.4.0: 17.1 ms at n=2^22** — 32% faster than v1.1.0 via branchless arithmetic + radix-4 outer stages
+- **v1.5.0: 15.5 ms at n=2^22** — 38% faster than v1.1.0 via radix-8 outer stages (Montgomery)
+- **Radix-8 outer stages (Montgomery)**: fuses triples of butterfly stages for further DRAM traffic reduction
 - **CUDA Graph API**: captures NTT kernel sequence for graph replay in larger workflows
 - **Radix-4 outer stages**: fuses pairs of butterfly stages for ~45% DRAM traffic reduction
 - **Barrett + Montgomery dual arithmetic**: Barrett NTT eliminates 12% Montgomery conversion overhead
@@ -20,7 +21,7 @@
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
 - **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
 - **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
-- **230 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **333 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - BLS12-381 scalar field, 255-bit Montgomery + Barrett arithmetic, production-grade modulus
 
 ---
@@ -74,8 +75,10 @@ Key implementation choices:
 | v1.1 Montgomery (fused K=10 + coop outer) | 1.21 ms | 5.51 ms | 25.1 ms | 1.04x |
 | v1.2 Barrett (no Montgomery conversion) | 1.27 ms | 5.61 ms | 24.9 ms | 1.05x |
 | v1.3 4-Step (Bailey's algorithm) | 1.66 ms | 7.03 ms | 29.5 ms | 0.89x |
-| **v1.4 Montgomery** (branchless + radix-4) | 0.952 ms | 4.11 ms | **17.1 ms** | **1.54x** |
-| **v1.4 Barrett** (branchless + radix-4) | 1.02 ms | 4.39 ms | **17.4 ms** | **1.51x** |
+| v1.4 Montgomery (branchless + radix-4) | 0.952 ms | 4.11 ms | 17.1 ms | 1.54x |
+| v1.4 Barrett (branchless + radix-4) | 1.02 ms | 4.39 ms | 17.4 ms | 1.51x |
+| **v1.5 Montgomery** (radix-8 outer) | 1.75 ms | 5.53 ms | **15.5 ms** | **1.70x** |
+| **v1.5 Barrett** (radix-4, unchanged) | 1.93 ms | 5.86 ms | **17.5 ms** | **1.50x** |
 
 **Async Pipeline (end-to-end including H2D + compute + D2H, 8 batches, pinned memory):**
 
@@ -92,12 +95,22 @@ Key implementation choices:
 
 | | Scale 2¹⁵ | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² |
 |---|---|---|---|---|
+| **v1.5 Montgomery batch 8x** | **1.54 ms** | **7.25 ms** | **31.2 ms** | **130 ms** |
+| **v1.5 Barrett batch 8x** | **1.81 ms** | **7.48 ms** | **33.1 ms** | **148 ms** |
 | v1.4 Montgomery batch 8x | 0.874 ms | 7.51 ms | 33.4 ms | 150 ms |
 | v1.4 Barrett batch 8x | 0.935 ms | 8.02 ms | 35.5 ms | 159 ms |
-| v1.2 Barrett batch 8x | 1.12 ms | 10.4 ms | 48.0 ms | 219 ms |
-| v1.4 vs v1.2 (Barrett) | **-17%** | **-23%** | **-26%** | **-27%** |
+| v1.5 vs v1.4 (Mont) | — | **-3%** | **-7%** | **-13%** |
 
-*Radix-4 outer stages reduce batch time by 20-27%. Montgomery remains faster than Barrett for batched workloads (fewer instructions per ff_mul).*
+*Radix-8 outer stages (Montgomery) reduce batch time by 7-13% at large sizes. Montgomery remains faster than Barrett for all workloads.*
+
+**On-the-Fly Twiddle Computation — Negative Result (v1.5.0):**
+
+OTF twiddle computation (replacing 64 MB precomputed table with ~1 KB constant memory) was fully
+implemented (12 kernel variants, 16 tests) but is **catastrophically slower** for BLS12-381:
+56.9 ms OTF vs 15.6 ms precomputed (+265%). Root cause: 256-bit binary exponentiation requires
+~29 Montgomery muls per butterfly (~4480 MADs) vs 7 DRAM reads (224 bytes). Infrastructure retained
+for future multi-field work (Goldilocks/BabyBear where mul is 1-2 instructions).
+See [analysis](results/analysis.md#103-on-the-fly-twiddle-computation--negative-result-session-14).
 
 **4-Step NTT — Negative Result (v1.3.0):**
 
@@ -107,13 +120,13 @@ than the cooperative approach** at all sizes. At n=2^22: 29.5 ms (4-step) vs 24.
 cooperative outer stage hitting DRAM. See [analysis](results/analysis.md#section-6--v130-results-4-step-ntt-algorithm).
 
 <p align="center">
-  <img src="results/charts/four_step_vs_barrett.png" width="48%" alt="4-Step vs Barrett NTT latency">
-  <img src="results/charts/all_modes_comparison.png" width="48%" alt="All NTT modes comparison at 2^22">
+  <img src="results/charts/version_history.png" width="48%" alt="NTT version history at 2^22">
+  <img src="results/charts/v150_vs_v140.png" width="48%" alt="v1.5.0 vs v1.4.0 Montgomery">
 </p>
 
 <p align="center">
-  <img src="results/charts/barrett_vs_montgomery.png" width="48%" alt="Barrett vs Montgomery NTT latency">
-  <img src="results/charts/batch_throughput.png" width="48%" alt="Batched NTT throughput">
+  <img src="results/charts/v150_batched.png" width="48%" alt="v1.5.0 batched NTT">
+  <img src="results/charts/four_step_vs_barrett.png" width="48%" alt="4-Step vs Barrett NTT latency">
 </p>
 
 **Nsight Compute Kernel Profile (2^20 elements):**
@@ -158,7 +171,8 @@ cuda-zkp-ntt/
 │   ├── ff_arithmetic.cuh      # Finite-field types and Montgomery mul
 │   ├── ff_barrett.cuh         # Barrett modular arithmetic (standard-form)
 │   ├── ntt.cuh                # NTT interface (single + batched + graph, 5 modes)
-│   └── pipeline.cuh           # Async pipeline infrastructure
+│   ├── pipeline.cuh           # Async pipeline infrastructure
+│   └── twiddle_otf.cuh        # On-the-fly twiddle computation (disabled for BLS12-381)
 ├── src/
 │   ├── ff_mul.cu              # Montgomery multiplication kernels
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)

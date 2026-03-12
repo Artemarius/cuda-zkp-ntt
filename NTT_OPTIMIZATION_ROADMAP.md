@@ -883,45 +883,29 @@ Warp divergence in the pow loop (`if ((exp >> bit) & 1)`) further degrades throu
 
 ---
 
-### Session 15 — v1.5.0 Benchmark + Profile + Release
+### Session 15 — v1.5.0 Benchmark + Profile + Release ✅
 
 **Objective:** Comprehensive benchmarking of radix-8 (OTF disabled — negative result),
 profiling, release.
 
-**Tasks:**
+**Completed:**
 - Full benchmark matrix: {Montgomery, Barrett} × {2^15..2^22}
-  - Single NTT forward, 7-rep median
+  - Single NTT forward, 7-10 rep median
   - Batched 8×, 7-rep median
-- Profile with ncu:
-  - Radix-8 kernel: register usage, occupancy, DRAM throughput, IPC
-  - Compare radix-8 vs radix-4: DRAM bytes read/written (should show ~33% reduction)
-- Capture screenshots: radix-8 roofline
-- Generate benchmark charts: v1.5.0 vs v1.4.0 bar chart at all sizes
-- Full regression sweep: all 333 existing tests pass
-- Update `results/analysis.md` (new section: "Radix-8 Analysis + OTF Negative Result")
-- Update `results/data/bench_v150.json`
-- Update README performance tables
-- Tag v1.5.0 release
-
-**Expected results (n=2^22):**
-- Radix-8 (Montgomery): ~15.6 ms (−8.2% vs v1.4.0's 17.0 ms)
-- Barrett (radix-4, unchanged): ~17.9 ms
-- Batched 8× Montgomery: ~135 ms; Barrett: ~151 ms
-
-**Test plan — v1.5.0 release regression sweep:**
-- All existing tests pass (333/333 — no regressions)
-- Full test matrix: {NAIVE, OPTIMIZED, BARRETT} × {single, batch-1, batch-8}
-  × {forward, roundtrip} × {2^10..2^22}
-- Radix-8 cross-validation: radix-8 == radix-4 at all sizes (bitwise)
-- OTF tests pass (OTF disabled in dispatch but tests exercise the infrastructure)
-- CUDA Graph tests still pass
-- **Test count**: 333 total
-
-**Deliverables:**
-- Updated benchmark tables + charts (radix-8)
-- ncu screenshots (radix-8 roofline)
-- Full regression pass (all tests green)
+- Profile data from Session 12 (ncu-rep files in `results/data/`)
+- 3 new benchmark charts: v1.5.0 vs v1.4.0, version history, batched comparison
+- Full regression sweep: **333/333 tests pass**
+- Updated `results/analysis.md` (Section 10: v1.5.0 Results)
+- Updated `results/data/bench_v150.json`
+- Updated README performance tables
 - Git tag v1.5.0
+
+**Measured results (n=2^22, 10-rep median):**
+- Montgomery (radix-8): **15.5 ms** (−9.4% vs v1.4.0's 17.1 ms)
+- Barrett (radix-4, unchanged): **17.5 ms**
+- Batched 8× Montgomery: **130 ms**; Barrett: **148 ms**
+
+**Benchmark data:** `results/data/bench_v150.json`
 
 ---
 

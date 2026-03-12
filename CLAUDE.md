@@ -9,8 +9,7 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
   cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
 - **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
   Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
-- **Next (v1.5.0+)**: Benchmark + release v1.5.0,
-  Goldilocks/BabyBear multi-field comparison, Plantard reduction
+- **Next (v1.6.0+)**: Goldilocks/BabyBear multi-field comparison, Plantard reduction
 
 ---
 
@@ -326,15 +325,15 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.4.0** (v1.5.0 in progress, Sessions 12-14 done).
+Phases 1-8 complete. Current version: **v1.5.0** (Sessions 12-15 done).
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
 - **v1.2.0** — Barrett arithmetic + batched NTT. 24.9 ms single (Barrett, 2^22), 1.52x batch throughput at 2^15. 119 tests.
 - **v1.3.0** — 4-Step NTT (Bailey's algorithm). **Negative result**: 29.5 ms at 2^22 (+18% vs Barrett). 221 tests.
 - **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
-- **v1.5.0 (in progress)** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression).
-  OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.6 ms Montgomery** at 2^22 (-8% vs v1.4.0). 333 tests.
+- **v1.5.0** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression).
+  OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.5 ms Montgomery** at 2^22 (-9% vs v1.4.0). 333 tests.
 
 ---
 
