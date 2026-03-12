@@ -917,9 +917,95 @@ Benchmark data: `results/data/bench_v150.json`
 
 ---
 
+## Section 8 — Multi-Field NTT Comparison (v1.6.0)
+
+### 8.1 Overview
+
+v1.6.0 adds Goldilocks (p = 2^64 − 2^32 + 1, 64-bit) and BabyBear (p = 2^31 − 2^27 + 1, 31-bit)
+NTT implementations alongside the existing BLS12-381 (256-bit). This enables a 3-way performance
+comparison that reveals how field element size affects the inner/outer bottleneck ratio.
+
+**Charts**: `charts/multifield_latency.png`, `charts/multifield_speedup.png`,
+`charts/multifield_throughput.png`, `charts/multifield_batch.png`, `charts/version_history_v160.png`
+
+### 8.2 Single NTT Latency
+
+| Size | BLS12-381 (ms) | Goldilocks (ms) | BabyBear (ms) | GL speedup | BB speedup |
+|------|----------------|-----------------|----------------|------------|------------|
+| 2^10 | 0.181 | 0.013 | 0.009 | 13.6x | 19.7x |
+| 2^12 | 0.199 | 0.024 | 0.016 | 8.4x | 12.1x |
+| 2^15 | 0.288 | 0.033 | 0.025 | 8.8x | 11.7x |
+| 2^16 | 0.366 | 0.056 | 0.039 | 6.5x | 9.4x |
+| 2^18 | 1.046 | 0.139 | 0.093 | 7.5x | 11.2x |
+| 2^20 | 3.953 | 0.762 | 0.398 | 5.2x | 9.9x |
+| **2^22** | **15.07** | **3.60** | **2.45** | **4.2x** | **6.2x** |
+
+### 8.3 Batched 8x NTT Latency
+
+| Size | BLS12-381 (ms) | Goldilocks (ms) | BabyBear (ms) |
+|------|----------------|-----------------|----------------|
+| 2^15 | 0.952 | 0.126 | 0.083 |
+| 2^16 | 1.708 | 0.271 | 0.144 |
+| 2^18 | 6.807 | 1.194 | 0.691 |
+| 2^20 | 28.56 | 5.557 | 3.149 |
+| 2^22 | 120.2 | 31.41 | 21.08 |
+
+### 8.4 Throughput at n=2^22
+
+| Field | Element Size | Latency | Throughput | DRAM Traffic |
+|-------|-------------|---------|------------|--------------|
+| BLS12-381 | 32 bytes | 15.07 ms | 278 M elem/s | ~256 MB (R+W) |
+| Goldilocks | 8 bytes | 3.60 ms | 1,164 M elem/s | ~64 MB (R+W) |
+| BabyBear | 4 bytes | 2.45 ms | 1,715 M elem/s | ~32 MB (R+W) |
+
+### 8.5 Key Analysis
+
+**Speedup converges at large sizes.** At 2^10, BabyBear is 19.7x faster than BLS12-381.
+At 2^22, only 6.2x. This confirms the bottleneck analysis:
+
+1. **Small sizes (2^10-2^15)**: Entirely fused in shared memory. Arithmetic dominance
+   means field size matters a lot. BabyBear mul is ~3-5 instructions vs BLS12-381's 528 SASS
+   instructions — speedup tracks the arithmetic ratio.
+
+2. **Large sizes (2^20-2^22)**: Outer stages dominate. These are memory-bound (DRAM read-modify-write).
+   The DRAM traffic difference is 8x (BLS 32B vs BB 4B per element), but the achieved speedup
+   is only 6.2x because:
+   - Outer stages have 50% uncoalesced accesses (stride-h butterfly pattern)
+   - L2 hit rate ~58% for all fields (structural, not size-dependent)
+   - Kernel launch overhead and bit-reverse costs are similar
+
+3. **Batch efficiency**: All fields show good batch efficiency at small sizes (~2.4x for GL/BB
+   at 2^15, meaning batching is beneficial). At 2^22, batch efficiency is close to 1.0x for all
+   fields because the GPU is already saturated by a single NTT.
+
+**Implications for ZKP systems:**
+- Goldilocks (Plonky2/3): 4.2x faster NTT at proof-relevant sizes — a major practical win
+- BabyBear (RISC Zero): 6.2x faster — enables higher-throughput STARK proving
+- BLS12-381: optimized as far as DRAM bandwidth allows on this GPU (~15 ms floor at 2^22)
+
+### 8.6 Version History Summary (n=2^22)
+
+| Version | Best Mode | Latency | vs v1.1 |
+|---------|-----------|---------|---------|
+| v1.1 | Montgomery | 25.1 ms | baseline |
+| v1.2 | Barrett | 24.9 ms | -1% |
+| v1.3 | 4-Step | 29.5 ms | +18% (negative) |
+| v1.4 | Montgomery radix-4 | 17.1 ms | -32% |
+| v1.5 | Montgomery radix-8 | 15.5 ms | -38% |
+| **v1.6** | **BabyBear** | **2.4 ms** | **-90%** |
+| v1.6 | Goldilocks | 3.6 ms | -86% |
+| v1.6 | BLS12-381 | 15.1 ms | -40% |
+
+**Tests**: 458/458 pass (all fields)
+
+Benchmark data: `results/data/bench_v160.json`
+
+---
+
 ## Methodology Notes
 
 - All GPU timings use `cudaEvent_t` start/stop (not CPU wall clock)
-- Benchmark runs: 10 warm-up, 100 measured iterations, median reported
+- Benchmark runs: 2 warm-up, 7 measured iterations, median reported (v1.6.0)
+- Earlier sections: 10 warm-up, 100 measured iterations, median reported
 - Nsight Compute disables CUPTI sampling that interferes with timing — profile runs are separate from benchmark runs
 - Profiling adds overhead; reported benchmark numbers come from unmodified release builds

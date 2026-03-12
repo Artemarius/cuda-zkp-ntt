@@ -542,6 +542,224 @@ def plot_v150_batched():
     print(f"  {path}")
 
 
+def plot_multifield_latency():
+    """3-field NTT latency comparison (v1.6.0)."""
+    scales = ["2^10", "2^12", "2^15", "2^16", "2^18", "2^20", "2^22"]
+    bls = [0.181, 0.199, 0.288, 0.366, 1.046, 3.953, 15.073]
+    gl  = [0.013, 0.024, 0.033, 0.056, 0.139, 0.762,  3.603]
+    bb  = [0.009, 0.016, 0.025, 0.039, 0.093, 0.398,  2.446]
+
+    x = np.arange(len(scales))
+    w = 0.25
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(x - w, bls, w, label="BLS12-381 (256-bit)", color="#5B9BD5", edgecolor="white", linewidth=0.5)
+    ax.bar(x,     gl,  w, label="Goldilocks (64-bit)", color="#ED7D31", edgecolor="white", linewidth=0.5)
+    ax.bar(x + w, bb,  w, label="BabyBear (31-bit)",   color="#70AD47", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Single NTT Latency — 3-Field Comparison (v1.6.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.set_ylim(0.005, 30)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Annotate at 2^22
+    for i, (val, label) in enumerate([(bls[-1], "15.1"), (gl[-1], "3.6"), (bb[-1], "2.4")]):
+        ax.annotate(f"{label} ms",
+                    xy=(x[-1] + (i-1)*w, val),
+                    xytext=(0, 6), textcoords="offset points",
+                    ha="center", fontsize=8, fontweight="bold")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "multifield_latency.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_multifield_speedup():
+    """Goldilocks and BabyBear speedup vs BLS12-381 (v1.6.0)."""
+    scales = ["2^10", "2^12", "2^15", "2^16", "2^18", "2^20", "2^22"]
+    gl_speedup = [13.62, 8.43, 8.78, 6.49, 7.50, 5.19, 4.18]
+    bb_speedup = [19.67, 12.12, 11.71, 9.39, 11.22, 9.92, 6.16]
+
+    x = np.arange(len(scales))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars1 = ax.bar(x - w/2, gl_speedup, w, label="Goldilocks / BLS12-381", color="#ED7D31", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x + w/2, bb_speedup, w, label="BabyBear / BLS12-381",   color="#70AD47", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Speedup (x faster than BLS12-381)")
+    ax.set_title("Multi-Field NTT Speedup vs BLS12-381 (v1.6.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper right")
+    ax.set_ylim(0, 25)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, sp in zip(bars1, gl_speedup):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f"{sp:.1f}x", ha="center", fontsize=7, fontweight="bold", color="#C55A11")
+    for bar, sp in zip(bars2, bb_speedup):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f"{sp:.1f}x", ha="center", fontsize=7, fontweight="bold", color="#2E7D32")
+
+    # Annotation: explain convergence
+    ax.annotate("Speedup decreases at large sizes:\nouter stages are memory-bound,\nnot arithmetic-bound",
+                xy=(6, 6.16), xytext=(4.5, 18),
+                arrowprops=dict(arrowstyle="->", color="#666666"),
+                fontsize=8, color="#666666", ha="center",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", edgecolor="#cccccc"))
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "multifield_speedup.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_multifield_throughput():
+    """Elements/sec throughput for all 3 fields (v1.6.0)."""
+    scales = ["2^10", "2^12", "2^15", "2^16", "2^18", "2^20", "2^22"]
+    n_vals = [1024, 4096, 32768, 65536, 262144, 1048576, 4194304]
+
+    bls_ms = [0.181, 0.199, 0.288, 0.366, 1.046, 3.953, 15.073]
+    gl_ms  = [0.013, 0.024, 0.033, 0.056, 0.139, 0.762,  3.603]
+    bb_ms  = [0.009, 0.016, 0.025, 0.039, 0.093, 0.398,  2.446]
+
+    # Throughput in millions of elements per second
+    bls_tp = [n / (t * 1e3) for n, t in zip(n_vals, bls_ms)]  # M elem/s
+    gl_tp  = [n / (t * 1e3) for n, t in zip(n_vals, gl_ms)]
+    bb_tp  = [n / (t * 1e3) for n, t in zip(n_vals, bb_ms)]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(scales))
+    ax.plot(x, bls_tp, "o-", color="#5B9BD5", linewidth=2, markersize=7, label="BLS12-381 (256-bit)")
+    ax.plot(x, gl_tp,  "s-", color="#ED7D31", linewidth=2, markersize=7, label="Goldilocks (64-bit)")
+    ax.plot(x, bb_tp,  "^-", color="#70AD47", linewidth=2, markersize=7, label="BabyBear (31-bit)")
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Throughput (M elements/sec)")
+    ax.set_title("NTT Throughput — 3-Field Comparison (v1.6.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.grid(axis="x", alpha=0.15, linestyle="--")
+
+    # Annotate peak throughputs at 2^22
+    for tp, label, color in [(bls_tp[-1], "BLS", "#5B9BD5"),
+                              (gl_tp[-1], "GL", "#ED7D31"),
+                              (bb_tp[-1], "BB", "#70AD47")]:
+        ax.annotate(f"{tp:.0f} M/s",
+                    xy=(x[-1], tp), xytext=(8, 0), textcoords="offset points",
+                    fontsize=8, fontweight="bold", color=color, va="center")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "multifield_throughput.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_multifield_batch():
+    """Batch efficiency per field: batch/sequential ratio (v1.6.0)."""
+    scales = ["2^15", "2^16", "2^18", "2^20", "2^22"]
+
+    # Single NTT × 8 (sequential cost estimate)
+    bls_s1 = [0.288, 0.366, 1.046, 3.953, 15.073]
+    gl_s1  = [0.033, 0.056, 0.139, 0.762,  3.603]
+    bb_s1  = [0.025, 0.039, 0.093, 0.398,  2.446]
+
+    # Batched 8×
+    bls_b8 = [0.952, 1.708, 6.807, 28.558, 120.223]
+    gl_b8  = [0.126, 0.271, 1.194,  5.557,  31.408]
+    bb_b8  = [0.083, 0.144, 0.691,  3.149,  21.077]
+
+    # Batch efficiency = (8 × single) / batched
+    bls_eff = [8 * s / b for s, b in zip(bls_s1, bls_b8)]
+    gl_eff  = [8 * s / b for s, b in zip(gl_s1, gl_b8)]
+    bb_eff  = [8 * s / b for s, b in zip(bb_s1, bb_b8)]
+
+    x = np.arange(len(scales))
+    w = 0.25
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars1 = ax.bar(x - w, bls_eff, w, label="BLS12-381", color="#5B9BD5", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x,     gl_eff,  w, label="Goldilocks", color="#ED7D31", edgecolor="white", linewidth=0.5)
+    bars3 = ax.bar(x + w, bb_eff,  w, label="BabyBear",   color="#70AD47", edgecolor="white", linewidth=0.5)
+
+    ax.set_xlabel("NTT Size")
+    ax.set_ylabel("Batch Efficiency (8x single / batched)")
+    ax.set_title("Batched 8x NTT Efficiency — 3-Field Comparison (v1.6.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales)
+    ax.legend(loc="upper right")
+    ax.set_ylim(0, 3.5)
+    ax.axhline(y=1.0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Label: >1 = batching is beneficial, <1 = overhead
+    ax.text(0.02, 0.95, "> 1.0 = batching saves time\n< 1.0 = batching adds overhead",
+            transform=ax.transAxes, fontsize=8, color="#666666", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", edgecolor="#cccccc"))
+
+    for bars in [bars1, bars2, bars3]:
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2, h + 0.05,
+                    f"{h:.2f}", ha="center", fontsize=7, fontweight="bold")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "multifield_batch.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
+def plot_version_history_v160():
+    """NTT latency progression across all versions at n=2^22 (updated for v1.6.0)."""
+    versions = ["v1.1\nBLS Mont", "v1.2\nBLS Barrett", "v1.3\nBLS 4-Step", "v1.4\nBLS Radix-4",
+                "v1.5\nBLS Radix-8", "v1.6\nGoldilocks", "v1.6\nBabyBear"]
+    times = [25.1, 24.9, 29.5, 17.1, 15.5, 3.6, 2.4]
+    colors = ["#A5A5A5", "#70AD47", "#9B59B6", "#5B9BD5", "#ED7D31", "#ED7D31", "#70AD47"]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(versions, times, color=colors, edgecolor="white", linewidth=0.5)
+
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("NTT at n=2^22 — Version History + Multi-Field (v1.6.0)")
+    ax.set_ylim(0, 35)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f"{t:.1f} ms", ha="center", fontweight="bold", fontsize=9)
+
+    # Divider between BLS versions and multi-field
+    ax.axvline(x=4.5, color="#999999", linestyle="--", linewidth=1, alpha=0.5)
+    ax.text(2.0, 33, "BLS12-381 optimization history", ha="center", fontsize=9, color="#555555")
+    ax.text(5.5, 33, "Multi-field (v1.6.0)", ha="center", fontsize=9, color="#555555")
+
+    # Mark negative result
+    ax.annotate("Negative\nresult", xy=(2, 29.5), xytext=(2.5, 32),
+                arrowprops=dict(arrowstyle="->", color="#C00000"),
+                fontsize=8, color="#C00000")
+
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "version_history_v160.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  {path}")
+
+
 if __name__ == "__main__":
     print("Generating benchmark charts...")
     plot_ntt_compute()
@@ -557,4 +775,9 @@ if __name__ == "__main__":
     plot_v150_vs_v140()
     plot_version_history()
     plot_v150_batched()
+    plot_multifield_latency()
+    plot_multifield_speedup()
+    plot_multifield_throughput()
+    plot_multifield_batch()
+    plot_version_history_v160()
     print("Done.")

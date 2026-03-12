@@ -1,0 +1,93 @@
+{
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "sm": "8.6",
+  "sms": 30,
+  "reps": 7,
+  "batch_size": 8,
+  "results": [
+    {
+      "log_n": 10,
+      "n": 1024,
+      "bls_single_ms": 0.1812,
+      "gl_single_ms": 0.0133,
+      "bb_single_ms": 0.0092,
+      "bls_batch_ms": 0.1915,
+      "gl_batch_ms": 0.0133,
+      "bb_batch_ms": 0.0101,
+      "gl_speedup": 13.62,
+      "bb_speedup": 19.67
+    },
+    {
+      "log_n": 12,
+      "n": 4096,
+      "bls_single_ms": 0.1987,
+      "gl_single_ms": 0.0236,
+      "bb_single_ms": 0.0164,
+      "bls_batch_ms": 0.2703,
+      "gl_batch_ms": 0.0276,
+      "bb_batch_ms": 0.0205,
+      "gl_speedup": 8.43,
+      "bb_speedup": 12.12
+    },
+    {
+      "log_n": 15,
+      "n": 32768,
+      "bls_single_ms": 0.2877,
+      "gl_single_ms": 0.0328,
+      "bb_single_ms": 0.0246,
+      "bls_batch_ms": 0.9523,
+      "gl_batch_ms": 0.1260,
+      "bb_batch_ms": 0.0829,
+      "gl_speedup": 8.78,
+      "bb_speedup": 11.71
+    },
+    {
+      "log_n": 16,
+      "n": 65536,
+      "bls_single_ms": 0.3656,
+      "gl_single_ms": 0.0563,
+      "bb_single_ms": 0.0389,
+      "bls_batch_ms": 1.7080,
+      "gl_batch_ms": 0.2714,
+      "bb_batch_ms": 0.1444,
+      "gl_speedup": 6.49,
+      "bb_speedup": 9.39
+    },
+    {
+      "log_n": 18,
+      "n": 262144,
+      "bls_single_ms": 1.0455,
+      "gl_single_ms": 0.1394,
+      "bb_single_ms": 0.0932,
+      "bls_batch_ms": 6.8065,
+      "gl_batch_ms": 1.1940,
+      "bb_batch_ms": 0.6912,
+      "gl_speedup": 7.50,
+      "bb_speedup": 11.22
+    },
+    {
+      "log_n": 20,
+      "n": 1048576,
+      "bls_single_ms": 3.9526,
+      "gl_single_ms": 0.7619,
+      "bb_single_ms": 0.3983,
+      "bls_batch_ms": 28.5583,
+      "gl_batch_ms": 5.5572,
+      "bb_batch_ms": 3.1488,
+      "gl_speedup": 5.19,
+      "bb_speedup": 9.92
+    },
+    {
+      "log_n": 22,
+      "n": 4194304,
+      "bls_single_ms": 15.0725,
+      "gl_single_ms": 3.6035,
+      "bb_single_ms": 2.4455,
+      "bls_batch_ms": 120.2227,
+      "gl_batch_ms": 31.4081,
+      "bb_batch_ms": 21.0770,
+      "gl_speedup": 4.18,
+      "bb_speedup": 6.16
+    }
+  ]
+}

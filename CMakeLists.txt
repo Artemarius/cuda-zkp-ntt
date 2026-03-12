@@ -104,6 +104,15 @@ set_target_properties(ff_microbench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# ─── Multi-Field NTT Benchmark ───────────────────────────────────────────────
+add_executable(bench_multifield
+    benchmarks/bench_multifield.cu
+)
+target_link_libraries(bench_multifield PRIVATE zkp_ntt_core)
+set_target_properties(bench_multifield PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # ─── Clean Profiling Binary ───────────────────────────────────────────────────
 # Minimal binary with command-line mode/size args for Nsight Compute
 add_executable(ntt_profile
@@ -126,6 +135,7 @@ message(STATUS "")
 message(STATUS "  Targets:")
 message(STATUS "    test_correctness  — NTT correctness validation")
 message(STATUS "    bench_ntt         — Google Benchmark harness")
+message(STATUS "    bench_multifield  — 3-field NTT benchmark (BLS/GL/BB)")
 message(STATUS "    ff_microbench     — Finite-field op throughput")
 message(STATUS "    ntt_profile       — Clean binary for Nsight Compute")
 message(STATUS "==========================================")

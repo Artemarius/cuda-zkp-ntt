@@ -11,18 +11,18 @@
 
 ## Highlights
 
+- **v1.6.0: 3-field NTT** — BLS12-381 (15.1 ms), Goldilocks (3.6 ms, 4.2x faster), BabyBear (2.4 ms, 6.2x faster) at n=2^22
+- **Multi-field comparison** demonstrates memory-bound convergence: speedup shrinks at large sizes as DRAM traffic dominates
 - **v1.5.0: 15.5 ms at n=2^22** — 38% faster than v1.1.0 via radix-8 outer stages (Montgomery)
-- **Radix-8 outer stages (Montgomery)**: fuses triples of butterfly stages for further DRAM traffic reduction
 - **CUDA Graph API**: captures NTT kernel sequence for graph replay in larger workflows
-- **Radix-4 outer stages**: fuses pairs of butterfly stages for ~45% DRAM traffic reduction
 - **Barrett + Montgomery dual arithmetic**: Barrett NTT eliminates 12% Montgomery conversion overhead
 - **Batched NTT**: process 8 independent NTTs in 3-4 kernel launches (vs 32 sequential); **1.52x throughput** at 2^15
 - **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT (Direction A)
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
 - **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
 - **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
-- **333 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
-- BLS12-381 scalar field, 255-bit Montgomery + Barrett arithmetic, production-grade modulus
+- **458 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- 3 fields: BLS12-381 (256-bit), Goldilocks (64-bit, Plonky2/3), BabyBear (31-bit, RISC Zero)
 
 ---
 
@@ -80,6 +80,21 @@ Key implementation choices:
 | **v1.5 Montgomery** (radix-8 outer) | 1.75 ms | 5.53 ms | **15.5 ms** | **1.70x** |
 | **v1.5 Barrett** (radix-4, unchanged) | 1.93 ms | 5.86 ms | **17.5 ms** | **1.50x** |
 
+**Multi-Field NTT Comparison (v1.6.0, single NTT, 7-rep median):**
+
+| Field | Element Size | Scale 2¹⁵ | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² | Speedup vs BLS |
+|---|---|---|---|---|---|---|
+| **BLS12-381** | 256-bit (32 B) | 0.288 ms | 1.05 ms | 3.95 ms | **15.1 ms** | 1.0x |
+| **Goldilocks** | 64-bit (8 B) | 0.033 ms | 0.139 ms | 0.762 ms | **3.6 ms** | **4.2x** |
+| **BabyBear** | 31-bit (4 B) | 0.025 ms | 0.093 ms | 0.398 ms | **2.4 ms** | **6.2x** |
+
+*Speedup decreases at larger sizes because outer stages are memory-bound (DRAM bandwidth), not arithmetic-bound. At n=2^10, BabyBear is 19.7x faster (arithmetic-dominated). At n=2^22, only 6.2x (DRAM-dominated).*
+
+<p align="center">
+  <img src="results/charts/multifield_latency.png" width="48%" alt="Multi-field NTT latency">
+  <img src="results/charts/multifield_speedup.png" width="48%" alt="Multi-field speedup vs BLS12-381">
+</p>
+
 **Async Pipeline (end-to-end including H2D + compute + D2H, 8 batches, pinned memory):**
 
 | | Scale 2¹⁸ | Scale 2²⁰ | Scale 2²² |
@@ -120,13 +135,13 @@ than the cooperative approach** at all sizes. At n=2^22: 29.5 ms (4-step) vs 24.
 cooperative outer stage hitting DRAM. See [analysis](results/analysis.md#section-6--v130-results-4-step-ntt-algorithm).
 
 <p align="center">
-  <img src="results/charts/version_history.png" width="48%" alt="NTT version history at 2^22">
-  <img src="results/charts/v150_vs_v140.png" width="48%" alt="v1.5.0 vs v1.4.0 Montgomery">
+  <img src="results/charts/version_history_v160.png" width="48%" alt="NTT version history + multi-field">
+  <img src="results/charts/multifield_throughput.png" width="48%" alt="Multi-field throughput comparison">
 </p>
 
 <p align="center">
   <img src="results/charts/v150_batched.png" width="48%" alt="v1.5.0 batched NTT">
-  <img src="results/charts/four_step_vs_barrett.png" width="48%" alt="4-Step vs Barrett NTT latency">
+  <img src="results/charts/multifield_batch.png" width="48%" alt="Multi-field batch efficiency">
 </p>
 
 **Nsight Compute Kernel Profile (2^20 elements):**
@@ -168,24 +183,32 @@ See [`results/analysis.md`](results/analysis.md) for the full annotated analysis
 cuda-zkp-ntt/
 ├── include/
 │   ├── cuda_utils.cuh         # CUDA_CHECK macro, GPU timer
-│   ├── ff_arithmetic.cuh      # Finite-field types and Montgomery mul
+│   ├── ff_arithmetic.cuh      # BLS12-381 Montgomery mul (256-bit)
 │   ├── ff_barrett.cuh         # Barrett modular arithmetic (standard-form)
-│   ├── ntt.cuh                # NTT interface (single + batched + graph, 5 modes)
+│   ├── ff_goldilocks.cuh      # Goldilocks field (64-bit, Plonky2/3)
+│   ├── ff_babybear.cuh        # BabyBear field (31-bit, RISC Zero)
+│   ├── ntt.cuh                # BLS12-381 NTT (single + batched + graph, 5 modes)
+│   ├── ntt_goldilocks.cuh     # Goldilocks NTT (forward/inverse, single/batched)
+│   ├── ntt_babybear.cuh       # BabyBear NTT (forward/inverse, single/batched)
 │   ├── pipeline.cuh           # Async pipeline infrastructure
 │   └── twiddle_otf.cuh        # On-the-fly twiddle computation (disabled for BLS12-381)
 ├── src/
-│   ├── ff_mul.cu              # Montgomery multiplication kernels
+│   ├── ff_mul.cu              # BLS12-381 Montgomery multiplication kernels
+│   ├── ff_multi_field.cu      # Goldilocks + BabyBear GPU throughput kernels
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
-│   ├── ntt_optimized.cu       # NTT host dispatch: K selection + cooperative outer fusion
+│   ├── ntt_optimized.cu       # BLS12-381 NTT: K selection + cooperative outer fusion
 │   ├── ntt_fused_kernels.cu   # Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC)
 │   ├── ntt_4step.cu           # 4-Step NTT: transpose, twiddle multiply, Bailey's algorithm
+│   ├── ntt_goldilocks.cu      # Goldilocks NTT: fused K=8-11 + cooperative outer
+│   ├── ntt_babybear.cu        # BabyBear NTT: fused K=8-11 + cooperative outer
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   ├── test_correctness.cu    # Validation against CPU reference
+│   ├── test_correctness.cu    # Validation against CPU reference (458 tests)
 │   └── ff_reference.h         # CPU-only finite field + NTT reference oracle
 ├── benchmarks/
-│   ├── bench_ntt.cu           # Google Benchmark: NTT latency vs scale
+│   ├── bench_ntt.cu           # Google Benchmark: BLS12-381 NTT latency vs scale
+│   ├── bench_multifield.cu    # 3-way benchmark: BLS vs Goldilocks vs BabyBear
 │   └── ff_microbench.cu       # Isolated FF_add / FF_mul throughput
 ├── profiling/
 │   ├── scripts/               # Nsight Compute / Systems automation scripts
@@ -289,7 +312,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). OTF twiddle computation was a negative result for BLS12-381 but infrastructure is retained for multi-field work. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
 
 ---
 

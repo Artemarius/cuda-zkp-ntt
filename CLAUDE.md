@@ -9,10 +9,10 @@ Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field compar
   cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
 - **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
   Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
-- **v1.6.0 in progress**: Goldilocks (64-bit) + BabyBear (31-bit) field arithmetic + NTT kernels complete.
-  Session 17 done: full NTT for both fields (fused K=8-11 + cooperative radix-8/4/2 outer + batched). 458 tests.
-  Session 18 remains (benchmark + charts + release).
-- **Next**: Multi-field NTT benchmark, Plantard reduction
+- **v1.6.0**: Goldilocks (64-bit) + BabyBear (31-bit) full NTT + 3-way benchmark complete.
+  At n=2^22: BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x faster), BabyBear 2.4ms (6.2x faster).
+  458 tests. Speedup converges at large sizes (outer stages memory-bound, not arithmetic-bound).
+- **Next**: Plantard reduction (v1.7.0)
 
 ---
 
@@ -136,6 +136,7 @@ tests/
 
 benchmarks/
   bench_ntt.cu        — Google Benchmark: latency vs scale for all variants
+  bench_multifield.cu — 3-way NTT benchmark: BLS12-381 vs Goldilocks vs BabyBear (JSON output)
   ff_microbench.cu    — Instruction throughput: FF_add, FF_mul, FF_sqr isolated
 
 profiling/
@@ -159,7 +160,7 @@ scripts/
     build.yml          — CI: compile on Linux (CUDA 12.8/12.6) + Windows (MSVC)
 
 GUIDE.md               — Deep-dive: ZKP math, NTT, finite fields, GPU optimization
-NTT_OPTIMIZATION_ROADMAP.md — Future release plans (v1.2.0-v1.4.0) with session breakdown
+NTT_OPTIMIZATION_ROADMAP.md — Release plans (v1.2.0-v1.8.0) with session breakdown
 LICENSE                — MIT License
 ```
 
@@ -199,6 +200,14 @@ LICENSE                — MIT License
 - v1.4.0: 17.1 ms Montgomery / 17.4 ms Barrett (radix-4 outer)
 - v1.5.0: **15.5 ms Montgomery** (radix-8 outer) / 17.5 ms Barrett (radix-4, unchanged)
 - Barrett radix-8 disabled: 174 regs → I-cache thrashing → +73% regression
+
+### Multi-Field NTT Performance (v1.6.0, n=2^22, 7-rep median)
+- BLS12-381 Montgomery: **15.1 ms** (32B/element, 256 MB DRAM traffic)
+- Goldilocks: **3.6 ms** (8B/element, 64 MB DRAM traffic) — **4.2x faster**
+- BabyBear: **2.4 ms** (4B/element, 32 MB DRAM traffic) — **6.2x faster**
+- Speedup converges at large sizes: 19.7x (BB, 2^10) → 6.2x (BB, 2^22)
+  because outer stages are memory-bound, not arithmetic-bound
+- Batched 8× at 2^22: BLS 120ms, GL 31ms, BB 21ms
 
 ### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
 - Alternative to Montgomery: operates on standard-form integers directly (no domain conversion)
@@ -348,9 +357,9 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.5.0 complete, v1.6.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 planned, v1.8.0 Stockham cancelled).
 
-Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progress (Session 17 done).
+Phases 1-8 complete. Current version: **v1.6.0** released.
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
@@ -359,11 +368,9 @@ Phases 1-8 complete. Current version: **v1.5.0** released, **v1.6.0** in progres
 - **v1.4.0** — Branchless arithmetic + radix-4 outer stages + CUDA Graphs. **17.1 ms Montgomery / 17.4 ms Barrett** at 2^22 (-32% vs v1.1.0). 230 tests.
 - **v1.5.0** — Radix-8 outer (Montgomery only; Barrett disabled due to I-cache regression).
   OTF twiddles: **negative result** (56.9ms vs 15.6ms, disabled). **15.5 ms Montgomery** at 2^22 (-9% vs v1.4.0). 333 tests.
-
-### In Progress
-- **v1.6.0** — Multi-field NTT (Goldilocks + BabyBear). Session 17 complete: full NTT kernels
-  for both fields (fused K=8-11, cooperative radix-8/4/2 outer, single + batched, forward + inverse).
-  458 tests. Session 18 remains (benchmark + charts + release).
+- **v1.6.0** — Multi-field NTT: Goldilocks (64-bit) + BabyBear (31-bit). 3-way benchmark at n=2^22:
+  BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x), BabyBear 2.4ms (6.2x). Speedup converges at large sizes
+  (outer stages memory-bound). 458 tests.
 
 ---
 
