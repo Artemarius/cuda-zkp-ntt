@@ -167,12 +167,12 @@ LICENSE                — MIT License
 - Twiddle factors: precomputed table in global memory, cached in L1
 - For n=2^22: 4 total launches (1 bit-reverse + 1 fused K=10 + 2 cooperative outer)
 
-### NTT Time Breakdown (n=2^22, v1.1.0 → v1.5.0-s13)
-- Bit-reverse: ~0.3 ms (1%), Montgomery conversions: ~3.0 ms (12%)
-- Fused K=10 (stages 0-9): ~2.5 ms (10%) — **compute-bound** (69%, IPC 2.41)
-- Cooperative outer (stages 10-21): ~19.4 ms (77%) → ~11 ms (radix-4) → **~9 ms (radix-8 Montgomery)**
+### NTT Time Breakdown (n=2^22, v1.1.0 → v1.5.0)
+- Bit-reverse: ~0.3 ms (2%), Montgomery conversions: ~3.0 ms (19%)
+- Fused K=10 (stages 0-9): ~2.5 ms (16%) — **compute-bound** (69%, IPC 2.41)
+- Cooperative outer (stages 10-21): ~19.4 ms (v1.1) → ~11 ms (radix-4) → **~9 ms (radix-8 Montgomery)**
 - v1.4.0: 17.1 ms Montgomery / 17.4 ms Barrett (radix-4 outer)
-- v1.5.0-s13: **15.6 ms Montgomery** (radix-8 outer) / 18.0 ms Barrett (radix-4, unchanged)
+- v1.5.0: **15.5 ms Montgomery** (radix-8 outer) / 17.5 ms Barrett (radix-4, unchanged)
 - Barrett radix-8 disabled: 174 regs → I-cache thrashing → +73% regression
 
 ### Barrett Reduction (implemented, v1.2.0 Sessions 1-2 — MoMA-inspired)
@@ -323,7 +323,7 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.4.0 complete, v1.5.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.5.0 complete, v1.6.0-v1.7.0 planned, v1.8.0 Stockham cancelled).
 
 Phases 1-8 complete. Current version: **v1.5.0** (Sessions 12-15 done).
 

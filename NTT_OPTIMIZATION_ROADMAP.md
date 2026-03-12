@@ -1,25 +1,26 @@
 # NTT Optimization Roadmap — Future Releases
 
-## Current State (v1.4.0)
+## Current State (v1.5.0)
 
-**Benchmark (RTX 3060 Laptop, n=2^22):** 17.1 ms Montgomery / 17.4 ms Barrett (single NTT, compute only)
-**Previous target:** ≤20 ms — **exceeded** (17.1 ms = −32% vs v1.1.0's 25.2 ms)
+**Benchmark (RTX 3060 Laptop, n=2^22):** 15.5 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
+**Previous target:** ≤20 ms — **exceeded** (15.5 ms = −38% vs v1.1.0's 25.2 ms)
 
-### Where Time Goes (n=2^22, v1.4.0 — 3 kernel launches)
+### Where Time Goes (n=2^22, v1.5.0 — 3 kernel launches)
 
 | Phase | Duration | % of Total | Bottleneck |
 |---|---|---|---|
 | Bit-reverse permutation | ~0.3 ms | 2% | Memory (scatter) |
-| Fused K=10 (stages 0-9) | ~6 ms | 35% | **Compute** (69%, IPC 2.41) |
-| 6 radix-4 outer passes (stages 10-21) | ~11 ms | 65% | **Memory** (DRAM, ~300 GB/s) |
+| Fused K=10 (stages 0-9) | ~2.5 ms | 16% | **Compute** (69%, IPC 2.41) |
+| 4 radix-8 outer passes (stages 10-21) | ~9 ms | 58% | **Memory** (DRAM, ~300 GB/s) |
+| Montgomery conversions | ~3.0 ms | 19% | Memory (element-wise) |
 
-**Roofline gap**: Outer stages at ~11 ms vs theoretical floor of ~0.89 ms (320 MB / 360 GB/s
-peak). **Gap to roofline: ~12×.** Suggests memory-latency-bound (L1/L2 miss penalty), not
-bandwidth-bound. L2 diagnostic planned for Session 12 to confirm.
+**L2 diagnostic (Session 12)**: L2 hit rate = 58.5% at 2^22 → bandwidth-bound, not latency-bound.
+Stockham v1.8.0 **cancelled** — sequential access won't improve already-effective L2 reuse.
 
-**Key lesson from v1.1–v1.4**: Every win came from reducing DRAM traffic in outer stages.
-Arithmetic optimizations (Barrett, branchless) gave marginal results. The path forward is
-higher-radix fusion (radix-8) and eliminating twiddle DRAM traffic (OTF computation).
+**Key lesson from v1.1–v1.5**: Every win came from reducing DRAM traffic in outer stages.
+Arithmetic optimizations (Barrett, branchless, OTF twiddles) gave marginal/negative results.
+Register pressure is the new constraint: Montgomery radix-8 at 134 regs is at the edge;
+Barrett radix-8 at 174 regs caused I-cache thrashing (+73% regression).
 
 ### Key Gaps vs State-of-the-Art
 
@@ -715,9 +716,9 @@ Montgomery and Barrett now nearly identical at 2^22 (conversion overhead vs heav
 stages into radix-8 butterflies, and eliminate twiddle DRAM traffic via on-the-fly computation.
 Preceded by L2 cache diagnostic to inform this and future releases.
 
-**Measured improvement (after Session 14):** Montgomery radix-8 gives **−8.2%** (15.6 ms vs 17.0 ms).
+**Final result (v1.5.0 released):** Montgomery radix-8 gives **−9.4%** (**15.5 ms** vs v1.4.0's 17.1 ms).
 Barrett radix-8 **disabled** (I-cache regression: 29.5 ms, +73%). OTF twiddles: **negative result**
-(56.9 ms, +265% — BLS12-381 exponentiation too expensive). Final target: **15.6 ms**.
+(56.9 ms, +265% — BLS12-381 exponentiation too expensive). Batched 8× Montgomery: **130 ms**.
 
 **Rationale:** v1.4.0's radix-4 gave −30% by halving outer-stage DRAM passes (12→6).
 Radix-8 fuses 3 stages per pass: 12→4 passes (another −33% from radix-4 baseline).
