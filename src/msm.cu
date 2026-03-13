@@ -10,6 +10,11 @@
 //   - Parallel bucket reduction: Hillis-Steele suffix scan + tree reduce
 //     replaces single-thread running sum (O(B) → O(log B) depth)
 //
+// v2.1.0 Session 28 improvements:
+//   - Window auto-tuner: c capped at 11 (parallel reduction limit)
+//   - Stream-ordered memory pools: cudaMallocAsync/cudaFreeAsync for
+//     automatic allocation caching across repeated MSM calls
+//
 // Algorithm:
 //   1. For each window w (sequentially):
 //      a. Extract signed window digits (with carry propagation)
@@ -338,22 +343,22 @@ void msm_g1(G1Affine* result,
         G1Jacobian *d_base_jac, *d_out_jac;
         uint32_t *d_sc;
         G1Affine *d_out_aff;
-        CUDA_CHECK(cudaMalloc(&d_base_jac, sizeof(G1Jacobian)));
-        CUDA_CHECK(cudaMalloc(&d_out_jac, sizeof(G1Jacobian)));
-        CUDA_CHECK(cudaMalloc(&d_sc, 8 * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_out_aff, sizeof(G1Affine)));
-        CUDA_CHECK(cudaMemcpy(d_base_jac, &base_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_sc, h_scalar, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMallocAsync(&d_base_jac, sizeof(G1Jacobian), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_out_jac, sizeof(G1Jacobian), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_sc, 8 * sizeof(uint32_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_out_aff, sizeof(G1Affine), stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_base_jac, &base_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_sc, h_scalar, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
         msm_scalar_mul_kernel<<<1, 1, 0, stream>>>(d_base_jac, d_sc, d_out_jac, 1);
         msm_to_affine_kernel<<<1, 1, 0, stream>>>(d_out_jac, d_out_aff, 1);
         CUDA_CHECK(cudaMemcpyAsync(result, d_out_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        CUDA_CHECK(cudaFree(d_base_jac));
-        CUDA_CHECK(cudaFree(d_out_jac));
-        CUDA_CHECK(cudaFree(d_sc));
-        CUDA_CHECK(cudaFree(d_out_aff));
+        CUDA_CHECK(cudaFreeAsync(d_base_jac, stream));
+        CUDA_CHECK(cudaFreeAsync(d_out_jac, stream));
+        CUDA_CHECK(cudaFreeAsync(d_sc, stream));
+        CUDA_CHECK(cudaFreeAsync(d_out_aff, stream));
         return;
     }
 
@@ -362,7 +367,10 @@ void msm_g1(G1Affine* result,
     int total_windows = num_windows + 1;  // +1 for carry overflow window
     uint32_t num_buckets = (1u << (c - 1)) + 1;  // signed: buckets 0..2^(c-1)
 
-    // ─── Allocate working memory ───────────────────────────────────────────
+    // ─── Allocate working memory (stream-ordered pool) ────────────────────
+    // Using cudaMallocAsync/cudaFreeAsync for automatic allocation caching.
+    // The CUDA memory pool reuses allocations across repeated MSM calls,
+    // eliminating per-call allocation overhead after the first invocation.
     uint32_t *d_bucket_ids = nullptr, *d_packed_values = nullptr;
     uint32_t *d_sorted_bucket_ids = nullptr, *d_sorted_packed_values = nullptr;
     uint32_t *d_segment_offsets = nullptr;
@@ -371,15 +379,15 @@ void msm_g1(G1Affine* result,
     G1Jacobian *d_window_results = nullptr;
     G1Jacobian *d_final_result = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_bucket_ids, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_packed_values, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sorted_bucket_ids, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sorted_packed_values, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_segment_offsets, (num_buckets + 1) * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_carries, n * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_buckets, num_buckets * sizeof(G1Jacobian)));
-    CUDA_CHECK(cudaMalloc(&d_window_results, total_windows * sizeof(G1Jacobian)));
-    CUDA_CHECK(cudaMalloc(&d_final_result, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMallocAsync(&d_bucket_ids, n * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_packed_values, n * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_sorted_bucket_ids, n * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_sorted_packed_values, n * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_segment_offsets, (num_buckets + 1) * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_carries, n * sizeof(uint8_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_buckets, num_buckets * sizeof(G1Jacobian), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_window_results, total_windows * sizeof(G1Jacobian), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_final_result, sizeof(G1Jacobian), stream));
 
     // CUB sort temp storage — query once, reuse for all windows
     void *d_sort_temp = nullptr;
@@ -389,7 +397,7 @@ void msm_g1(G1Affine* result,
         d_bucket_ids, d_sorted_bucket_ids,
         d_packed_values, d_sorted_packed_values,
         (int)n, 0, c, stream);
-    CUDA_CHECK(cudaMalloc(&d_sort_temp, sort_temp_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d_sort_temp, sort_temp_bytes, stream));
 
     const int BLOCK = 256;
     int grid_n = ((int)n + BLOCK - 1) / BLOCK;
@@ -497,23 +505,23 @@ void msm_g1(G1Affine* result,
 
     // Convert to affine
     G1Affine *d_result_aff;
-    CUDA_CHECK(cudaMalloc(&d_result_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMallocAsync(&d_result_aff, sizeof(G1Affine), stream));
 
     msm_to_affine_kernel<<<1, 1, 0, stream>>>(d_final_result, d_result_aff, 1);
 
     CUDA_CHECK(cudaMemcpyAsync(result, d_result_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Cleanup
-    CUDA_CHECK(cudaFree(d_bucket_ids));
-    CUDA_CHECK(cudaFree(d_packed_values));
-    CUDA_CHECK(cudaFree(d_sorted_bucket_ids));
-    CUDA_CHECK(cudaFree(d_sorted_packed_values));
-    CUDA_CHECK(cudaFree(d_segment_offsets));
-    CUDA_CHECK(cudaFree(d_carries));
-    CUDA_CHECK(cudaFree(d_buckets));
-    CUDA_CHECK(cudaFree(d_window_results));
-    CUDA_CHECK(cudaFree(d_final_result));
-    CUDA_CHECK(cudaFree(d_sort_temp));
-    CUDA_CHECK(cudaFree(d_result_aff));
+    // Cleanup (stream-ordered: CUDA memory pool caches for reuse)
+    CUDA_CHECK(cudaFreeAsync(d_bucket_ids, stream));
+    CUDA_CHECK(cudaFreeAsync(d_packed_values, stream));
+    CUDA_CHECK(cudaFreeAsync(d_sorted_bucket_ids, stream));
+    CUDA_CHECK(cudaFreeAsync(d_sorted_packed_values, stream));
+    CUDA_CHECK(cudaFreeAsync(d_segment_offsets, stream));
+    CUDA_CHECK(cudaFreeAsync(d_carries, stream));
+    CUDA_CHECK(cudaFreeAsync(d_buckets, stream));
+    CUDA_CHECK(cudaFreeAsync(d_window_results, stream));
+    CUDA_CHECK(cudaFreeAsync(d_final_result, stream));
+    CUDA_CHECK(cudaFreeAsync(d_sort_temp, stream));
+    CUDA_CHECK(cudaFreeAsync(d_result_aff, stream));
 }

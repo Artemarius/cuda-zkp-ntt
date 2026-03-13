@@ -6324,6 +6324,316 @@ void test_msm_minimal_pippenger() {
     CUDA_CHECK(cudaFree(d_scalars));
 }
 
+// ─── v2.1.0 Session 28: Window Auto-Tuning + Memory Pool Tests ──────────────
+
+// Test: window auto-tuner cap at c=11 (parallel reduction limit)
+void test_msm_window_cap() {
+    printf("test_msm_window_cap...\n");
+
+    // At n=2^22 and above, c must be capped at 11
+    TEST_ASSERT(msm_optimal_window(1 << 22) == 11, "MSM window cap: n=2^22 -> c=11 (was 12)");
+    TEST_ASSERT(msm_optimal_window(1 << 24) == 11, "MSM window cap: n=2^24 -> c=11 (was 13)");
+    TEST_ASSERT(msm_optimal_window(1 << 26) == 11, "MSM window cap: n=2^26 -> c=11 (was 14)");
+
+    // Existing sizes should be unchanged
+    TEST_ASSERT(msm_optimal_window(1 << 10) == 6, "MSM window: n=2^10 -> c=6 unchanged");
+    TEST_ASSERT(msm_optimal_window(1 << 14) == 8, "MSM window: n=2^14 -> c=8 unchanged");
+    TEST_ASSERT(msm_optimal_window(1 << 18) == 10, "MSM window: n=2^18 -> c=10 unchanged");
+    TEST_ASSERT(msm_optimal_window(1 << 20) == 11, "MSM window: n=2^20 -> c=11 unchanged");
+
+    // Verify bucket count fits parallel reduction (2^(c-1) <= 1024)
+    for (int log_n = 10; log_n <= 26; ++log_n) {
+        int c = msm_optimal_window((size_t)1 << log_n);
+        uint32_t active_buckets = (1u << (c - 1));  // num_buckets - 1
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "MSM window n=2^%d: c=%d -> %u active buckets <= 1024", log_n, c, active_buckets);
+        TEST_ASSERT(active_buckets <= 1024, msg);
+    }
+}
+
+// Test: MSM on-curve at n=32768 (c=8, exercises pool reuse path)
+void test_msm_on_curve_32k() {
+    using namespace ff_ref;
+    printf("test_msm_on_curve_32k...\n");
+
+    const int n = 32768;
+
+    // Use generator point for all bases (valid on-curve)
+    G1Affine gen;
+    for (int i = 0; i < 12; ++i) {
+        gen.x.limbs[i] = G1_GEN_X[i];
+        gen.y.limbs[i] = G1_GEN_Y[i];
+    }
+    gen.infinity = false;
+
+    std::vector<G1Affine> h_bases(n, gen);
+
+    // Pseudo-random scalars
+    std::vector<uint32_t> h_scalars(n * 8);
+    for (int i = 0; i < n; ++i) {
+        uint32_t state = 42 + i * 1103515245u + 12345u;
+        for (int l = 0; l < 8; ++l) {
+            state = state * 1103515245u + 12345u;
+            h_scalars[i * 8 + l] = state;
+        }
+        h_scalars[i * 8 + 7] &= 0x73ffffffu;
+    }
+
+    G1Affine* d_bases;
+    uint32_t* d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    // Verify on-curve
+    G1AffineRef ref;
+    ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    ref.infinity = gpu_result.infinity;
+
+    TEST_ASSERT(g1_is_on_curve_ref(ref),
+                "MSM on-curve n=32768 (c=8, memory pool)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM repeated calls reuse memory pool (correctness after multiple calls)
+void test_msm_pool_reuse() {
+    using namespace ff_ref;
+    printf("test_msm_pool_reuse...\n");
+
+    const int N = 64;
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Different scalars for each run
+    uint32_t scalars1[N * 8] = {0};
+    uint32_t scalars2[N * 8] = {0};
+    for (int i = 0; i < N; ++i) {
+        scalars1[i * 8] = (uint32_t)(i + 1);
+        scalars2[i * 8] = (uint32_t)(N - i);
+    }
+
+    G1AffineRef cpu1 = msm_naive_ref(cpu_bases.data(), scalars1, N);
+    G1AffineRef cpu2 = msm_naive_ref(cpu_bases.data(), scalars2, N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+    // Run 1 — pool allocates fresh
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars1, N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    G1Affine gpu1;
+    msm_g1(&gpu1, d_bases, d_scalars, N);
+    TEST_ASSERT(g1_affine_eq(gpu1, cpu1), "MSM pool reuse: run 1 correct");
+
+    // Run 2 — pool should reuse cached allocations
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars2, N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    G1Affine gpu2;
+    msm_g1(&gpu2, d_bases, d_scalars, N);
+    TEST_ASSERT(g1_affine_eq(gpu2, cpu2), "MSM pool reuse: run 2 correct (reused pool)");
+
+    // Run 3 — same as run 1, verify no stale data from run 2
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars1, N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    G1Affine gpu3;
+    msm_g1(&gpu3, d_bases, d_scalars, N);
+    TEST_ASSERT(g1_affine_eq(gpu3, cpu1), "MSM pool reuse: run 3 matches run 1 (no stale data)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with explicit window size verification at boundary n
+void test_msm_window_boundary() {
+    using namespace ff_ref;
+    printf("test_msm_window_boundary...\n");
+
+    // n=2^20 is the boundary where c=11 (max for parallel reduce)
+    // num_buckets = 2^10 + 1 = 1025, active = 1024 (exactly at limit)
+    int c = msm_optimal_window(1 << 20);
+    TEST_ASSERT(c == 11, "MSM window boundary: n=2^20 -> c=11");
+    uint32_t num_buckets = (1u << (c - 1)) + 1;
+    TEST_ASSERT(num_buckets == 1025, "MSM window boundary: num_buckets=1025");
+    TEST_ASSERT(num_buckets - 1 == 1024, "MSM window boundary: active=1024 (thread limit)");
+
+    // n=2^21 also gets c=11 now (capped)
+    c = msm_optimal_window(1 << 21);
+    TEST_ASSERT(c == 11, "MSM window boundary: n=2^21 -> c=11 (capped from 11)");
+
+    // n=2^22 would have been c=12 (from formula), now capped at 11
+    c = msm_optimal_window(1 << 22);
+    TEST_ASSERT(c == 11, "MSM window boundary: n=2^22 -> c=11 (capped from 12)");
+}
+
+// Test: MSM cross-validate at n=128 with varied scalars
+// Verifies MSM correctness with a mix of single-limb scalars
+void test_msm_window_independence() {
+    using namespace ff_ref;
+    printf("test_msm_window_independence...\n");
+
+    const int N = 128;
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Varied single-limb scalars (exercises multiple bucket occupancies)
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        h_scalars[i * 8] = (uint32_t)((i * 37 + 13) % 256);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result),
+                "MSM window independence: n=128 varied scalars");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with non-default stream (exercises stream-ordered memory pool)
+void test_msm_nondefault_stream() {
+    using namespace ff_ref;
+    printf("test_msm_nondefault_stream...\n");
+
+    const int N = 32;
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    uint32_t scalars[N * 8] = {0};
+    for (int i = 0; i < N; ++i) {
+        scalars[i * 8] = (uint32_t)(i * 3 + 7);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), scalars, N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars, N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    // Use non-default stream
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N, stream);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result),
+                "MSM non-default stream: n=32 matches CPU");
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM consecutive calls with different sizes (pool adapts)
+void test_msm_varying_sizes() {
+    using namespace ff_ref;
+    printf("test_msm_varying_sizes...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Test sizes: 8, 64, 16 (vary to stress pool reallocation)
+    int sizes[] = {8, 64, 16};
+
+    for (int si = 0; si < 3; ++si) {
+        int N = sizes[si];
+
+        std::vector<G1AffineRef> cpu_bases(N);
+        std::vector<G1Affine> h_bases(N);
+        std::vector<uint32_t> scalars(N * 8, 0);
+
+        for (int i = 0; i < N; ++i) {
+            uint32_t s[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+            cpu_bases[i] = g1_scalar_mul_ref(cpu_g, s);
+            cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+            cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+            h_bases[i].infinity = false;
+            scalars[i * 8] = (uint32_t)(i + si + 1);
+        }
+
+        G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), scalars.data(), N);
+
+        G1Affine *d_bases;
+        uint32_t *d_scalars;
+        CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+        CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_scalars, scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        G1Affine gpu_result;
+        msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "MSM varying sizes: n=%d (pool adapts)", N);
+        TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), msg);
+
+        CUDA_CHECK(cudaFree(d_bases));
+        CUDA_CHECK(cudaFree(d_scalars));
+    }
+}
+
+// Test: MSM formula edge cases (small n)
+void test_msm_window_small_n() {
+    printf("test_msm_window_small_n...\n");
+
+    TEST_ASSERT(msm_optimal_window(0) == 1, "MSM window: n=0 -> c=1");
+    TEST_ASSERT(msm_optimal_window(1) == 1, "MSM window: n=1 -> c=1");
+    TEST_ASSERT(msm_optimal_window(2) == 4, "MSM window: n=2 -> c=4 (min clamp)");
+    TEST_ASSERT(msm_optimal_window(3) == 4, "MSM window: n=3 -> c=4 (min clamp)");
+    TEST_ASSERT(msm_optimal_window(15) == 4, "MSM window: n=15 -> c=4");
+    TEST_ASSERT(msm_optimal_window(16) == 4, "MSM window: n=16 -> c=4 (log2=4, 4/2+1=3, clamped)");
+    TEST_ASSERT(msm_optimal_window(256) == 5, "MSM window: n=256 -> c=5 (log2=8, 8/2+1=5)");
+    TEST_ASSERT(msm_optimal_window(1024) == 6, "MSM window: n=1024 -> c=6 (log2=10, 10/2+1=6)");
+}
+
 // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────────
 
 // Helper: make standard-form FpElement from a small integer
@@ -7976,6 +8286,17 @@ int main() {
     test_msm_high_bits_64();
     test_msm_alternating_pattern();
     test_msm_minimal_pippenger();
+
+    // ─── v2.1.0 Session 28: Window Auto-Tuning + Memory Pool Tests ──────────
+    printf("\n--- v2.1.0 Session 28: Window Auto-Tuning + Memory Pool ---\n");
+    test_msm_window_cap();
+    test_msm_window_boundary();
+    test_msm_window_small_n();
+    test_msm_window_independence();
+    test_msm_pool_reuse();
+    test_msm_nondefault_stream();
+    test_msm_varying_sizes();
+    test_msm_on_curve_32k();
 
     // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────
     printf("\n--- v2.0.0 Session 23: Polynomial Operations ---\n");

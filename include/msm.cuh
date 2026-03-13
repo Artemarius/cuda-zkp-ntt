@@ -20,9 +20,17 @@ void msm_g1(G1Affine* result,
             cudaStream_t stream = 0);
 
 // Optimal window size for Pippenger's method with signed-digit recoding.
-// Heuristic: c = floor(log2(n)/2) + 1, clamped to [4, 16].
-// With signed digits, bucket count = 2^(c-1), so optimal c shifts up by ~1
-// compared to unsigned. Fine-tuning deferred to Session 28.
+//
+// GPU cost model: total ≈ W * [sort(n,c) + n/B + O(c)] + W*c
+//   W = ceil(255/c) windows, B = 2^(c-1) signed-digit buckets
+//   Dominant cost is W * sort(n) — larger c → fewer windows → fewer sorts
+//   Accumulation cost n/B decreases with larger c (more parallel buckets)
+//   Parallel reduction cost O(log B) ≈ O(c) is small
+//
+// Heuristic: c = floor(log2(n)/2) + 1, clamped to [4, 11].
+// Upper cap = 11 ensures num_buckets-1 = 2^(c-1) ≤ 1024, which is the
+// maximum thread count for the parallel bucket reduction kernel.
+// Lower cap = 4 (9 buckets) prevents degenerate windows.
 inline int msm_optimal_window(size_t n) {
     if (n <= 1) return 1;
     int log_n = 0;
@@ -30,6 +38,6 @@ inline int msm_optimal_window(size_t n) {
     while (tmp > 1) { tmp >>= 1; ++log_n; }
     int c = log_n / 2 + 1;
     if (c < 4) c = 4;
-    if (c > 16) c = 16;
+    if (c > 11) c = 11;  // parallel reduction limit: 2^(c-1) <= 1024
     return c;
 }

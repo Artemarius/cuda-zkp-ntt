@@ -1,7 +1,8 @@
 // benchmarks/bench_msm.cu
 // MSM benchmark: Pippenger's bucket method at various sizes.
-// Measures wall-clock time (7-rep median) for sizes 2^10..2^18.
+// Measures wall-clock time (7-rep median) for sizes 2^10..2^20.
 // Outputs JSON to stdout for plotting.
+// v2.1.0: signed-digit recoding, parallel bucket reduction, memory pools.
 
 #include "msm.cuh"
 #include "ec_g1.cuh"
@@ -120,7 +121,7 @@ int main(int argc, char** argv) {
     // Memory budget: n points * 96B (G1Affine) + n * 32B (scalars) + sort temp
     // At n=2^18: 262K * 128B = 32 MB + sort temp ~10 MB = ~42 MB — fine
     // At n=2^20: 1M * 128B = 128 MB + sort temp ~40 MB = ~170 MB — fits in 6 GB
-    int log_sizes[] = {10, 12, 14, 15, 16, 18};
+    int log_sizes[] = {10, 12, 14, 15, 16, 18, 20};
     int num_sizes = sizeof(log_sizes) / sizeof(log_sizes[0]);
 
     fprintf(stderr, "%-8s %-12s %-12s %-12s\n",
