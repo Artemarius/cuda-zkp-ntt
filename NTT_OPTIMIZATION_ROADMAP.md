@@ -1514,6 +1514,230 @@ Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
 
 ---
 
+## v2.1.0 — Production MSM (PLANNED)
+
+**Goal:** Replace correctness-focused single-thread MSM with production-quality parallel Pippenger.
+Current: 261ms at 2^10, 42.6s at 2^18. Target: 50-100x speedup.
+
+**Key optimizations:** Signed-digit window recoding (halves bucket count), parallel bucket
+accumulation (one warp per bucket, CUB run-length encode), parallel bucket reduction
+(tree-reduce running sum), optimal window auto-tuning (c ≈ log2(n)).
+
+### Session 26 — Signed-Digit Recoding + Parallel Bucket Accumulation
+
+**Objective:** Replace naive bucket accumulation with signed-digit recoding and truly parallel accumulation.
+
+**Deliverables:**
+1. Signed-digit scalar recoding kernel:
+   - Extract signed digits in range `[-(2^(c-1)-1), 2^(c-1)]` per (scalar, window)
+   - Halves bucket count from `2^c` to `2^(c-1)`; negative digits negate the point
+   - Output: `(abs_bucket_id, sign_flag, point_index)` tuples
+2. Revised window size selection:
+   - Remove `c >= 4` clamp; use `c = max(1, round(log2(n)))` tuned for RTX 3060
+   - For n=2^18: c=15 → W=17 windows, 2^14=16384 buckets per window
+3. Parallel bucket accumulation:
+   - CUB sort by bucket_id → CUB `DeviceRunLengthEncode` for bucket boundaries
+   - One warp per bucket; sequential mixed addition within warp
+   - Large buckets: multiple warps with tree reduction
+4. Point negation for signed digits (fused into accumulation)
+
+**Tests (~20 new, cumulative ~641):**
+- Signed-digit extraction preserves scalar value (reconstruct from digits)
+- Edge cases: scalar=0, 1, p-1, all-ones
+- Parallel vs sequential accumulation: bitwise match at n=8..64
+- msm_g1_v2 vs msm_g1 cross-validation at n=1..64
+- On-curve checks at n=128, 256
+
+### Session 27 — Parallel Bucket Reduction + Window Combination
+
+**Objective:** Replace single-thread bucket reduction with parallel tree reduction.
+
+**Deliverables:**
+1. Parallel running-sum bucket reduction:
+   - Divide 2^(c-1) buckets into blocks of 32 (one warp each)
+   - Each warp reduces its block sequentially (~32 EC adds)
+   - Tree-reduce across blocks: 512 warps → 16 warps → 1 result (for c=15)
+2. Window combination (keep Horner, small W ≈ 17-32 is acceptable sequential)
+3. Batch affine inversion for final Jacobian→affine conversion
+
+**Tests (~15 new, cumulative ~656):**
+- Parallel reduction at c=4,8,12: cross-validate with naive MSM
+- Full pipeline v2 at n=256, 1024, 2^14, 2^16
+- Determinism test
+- Window combination: Horner consistency for small cases
+
+### Session 28 — Performance Tuning + Benchmark + Release v2.1.0
+
+**Objective:** Auto-tune window sizes, optimize memory management, produce benchmark numbers.
+
+**Deliverables:**
+1. Window size auto-tuner: empirical sweep c=4..16, encode optimal c(n) lookup
+2. Memory pool: single `cudaMalloc` for all working storage, reuse across windows
+3. Comprehensive benchmark: all sizes 2^10..2^20, v1 vs v2 speedup
+4. Optional: integrate production MSM into Groth16 `assemble_proof()`
+
+**Performance targets:**
+- n=2^10: < 5ms (from 261ms, ~50x)
+- n=2^14: < 50ms (from 2.7s, ~50x)
+- n=2^18: < 500ms (from 42.6s, ~85x)
+
+**Tests (~10 new, cumulative ~666):**
+- Regression: all existing MSM tests pass with v2 backend
+- Large-scale cross-validation: n=2^12, 2^14, 2^16
+- Memory stress test: n=2^18 on 6 GB VRAM
+- Groth16 integration: GPU proof still matches CPU proof
+
+---
+
+## v2.2.0 — Pairing Verification (PLANNED)
+
+**Goal:** Implement BLS12-381 optimal Ate pairing for Groth16 proof verification.
+Complete the prove→verify loop. Mathematical capstone of the project.
+
+**Field tower:** Fq → Fq2 (done) → Fq6 (cubic over Fq2) → Fq12 (quadratic over Fq6)
+**BLS12-381 parameter:** u = -0xd201000000010000 (64-bit, Hamming weight 5)
+
+### Session 29 — Fq6 Arithmetic
+
+**Objective:** Implement Fq6 = Fq2[v] / (v^3 − β) where β = (1+u) is the Fq2 nonresidue.
+
+**Deliverables:**
+1. `include/ff_fq6.cuh` — GPU Fq6 arithmetic:
+   - `Fq6Element = {Fq2Element c0, c1, c2}` (element = c0 + c1·v + c2·v²)
+   - `fq6_add/sub/neg` (component-wise, 3 Fq2 ops each)
+   - `fq6_mul` (Karatsuba-like cubic: 6 Fq2 muls = 18 Fq muls)
+   - `fq6_sqr` (specialized, cheaper than mul)
+   - `fq6_inv` (via norm to Fq2)
+   - `fq6_mul_by_nonresidue` (multiply by v: shift + `fq2_mul_by_nonresidue`)
+   - `fq6_mul_by_01`, `fq6_mul_by_1` (sparse mul for Miller loop)
+   - `fq6_frobenius_map` (precomputed Frobenius coefficients)
+2. CPU reference `Fq6Ref` in `tests/ff_reference.h`
+3. GPU test kernels in `src/ff_fq_kernels.cu`
+
+**Tests (~25 new, cumulative ~691):**
+- CPU self-test: add/sub/mul/sqr/inv round-trip, algebraic identities
+- GPU vs CPU: add, sub, mul, sqr at N=1024
+- Inverse: a · a^{-1} = 1 for random elements
+- Distributivity: (a+b)·c = a·c + b·c
+- Frobenius: f^q identity
+- Sparse mul: `mul_by_01` matches general mul with zeroed coefficients
+
+### Session 30 — Fq12 Arithmetic
+
+**Objective:** Implement Fq12 = Fq6[w] / (w² − v), completing the tower.
+
+**Deliverables:**
+1. `include/ff_fq12.cuh` — GPU Fq12 arithmetic:
+   - `Fq12Element = {Fq6Element c0, c1}` (element = c0 + c1·w)
+   - `fq12_add/sub/neg/mul/sqr/inv/conjugate`
+   - `fq12_mul`: Karatsuba (3 Fq6 muls = 54 Fq muls)
+   - `fq12_frobenius_map` (precomputed coefficients from Sage/Python)
+   - `fq12_mul_by_034` (sparse mul for Miller loop line functions)
+2. CPU reference `Fq12Ref` in `tests/ff_reference.h`
+3. Frobenius coefficients: roots of unity `(1+u)^((q^k-1)/6)` hardcoded as constants
+
+**Note:** Fq12Element = 576 bytes. GPU pairing will spill to local memory (~216 registers
+for f + T alone). Acceptable for correctness; performance optimization is future work.
+
+**Tests (~20 new, cumulative ~711):**
+- CPU self-test: add/sub/mul/sqr/inv
+- GPU vs CPU: add, sub, mul, sqr
+- Inverse: a · a^{-1} = 1
+- Conjugation: for unitary elements, conjugate = inverse
+- Frobenius: f^{q^k} identity for k=1,2,3,6,12
+- Sparse mul: `mul_by_034` matches general mul
+
+### Session 31 — Miller Loop
+
+**Objective:** Implement the optimal Ate Miller loop for BLS12-381.
+
+**Deliverables:**
+1. `include/pairing.cuh` — line evaluation + Miller loop:
+   - `line_double_step(T, Q, P)` — tangent line at T∈G2, evaluated at P∈G1
+   - `line_add_step(T, Q, P)` — chord line through T,Q∈G2, evaluated at P∈G1
+   - Lines produce sparse Fq12 elements (3 non-zero coefficients)
+2. Miller loop implementation:
+   - Iterate bits of |u| (MSB→LSB): f = f² · line_double; if bit=1: f *= line_add
+   - u negative → conjugate(f), negate T
+   - Use `fq12_mul_by_034` for line accumulation (not general Fq12 mul)
+   - |u| has 5 set bits → only 4 addition steps in 63 iterations
+3. `src/pairing.cu` — GPU kernel (single-thread for correctness)
+4. CPU reference Miller loop in `tests/ff_reference.h`
+
+**Tests (~15 new, cumulative ~726):**
+- Line evaluation: doubling/addition lines match CPU reference
+- Trivial inputs: e(O, Q) = 1, e(P, O) = 1
+- e(G1, G2): compute reference, verify match
+- Bilinearity: e(aP, Q) = e(P, aQ) = e(P,Q)^a for a=2,3
+- Linearity: e(P, Q+R) = e(P,Q) · e(P,R)
+- GPU vs CPU bitwise match
+
+### Session 32 — Final Exponentiation
+
+**Objective:** Implement f^((q^12 − 1) / r), completing the pairing.
+
+**Deliverables:**
+1. Easy part: f^((q^6 − 1)(q^2 + 1))
+   - `f1 = conjugate(f) · inv(f)` (= f^(q^6−1))
+   - `f2 = frobenius_map_2(f1) · f1` (= f1^(q^2+1))
+2. Hard part: f2^((q^4 − q^2 + 1) / r)
+   - Decompose using curve parameter u (Devegili/Scott method)
+   - ~10 Fq12 sqr + ~10 Fq12 mul + ~4 Frobenius + ~3 exp-by-|u|
+   - Each exp-by-|u|: ~63 squarings + 4 multiplications in Fq12
+3. Combined `pairing(P, Q)` = final_exp(miller_loop(P, Q))
+4. CPU reference final exponentiation
+
+**Tests (~15 new, cumulative ~741):**
+- Easy part: f^(q^6−1) is unitary (norm = 1)
+- exp_by_u: matches direct computation
+- Full pairing: e(G1, G2) matches known test vector
+- Bilinearity: e(aP, bQ) = e(P,Q)^(ab) for a=2, b=3
+- Non-degeneracy: e(G1, G2) ≠ 1
+- GPU vs CPU bitwise match
+
+### Session 33 — Groth16 Verification + Release v2.2.0
+
+**Objective:** Implement Groth16 verification equation, complete prove→verify loop.
+
+**Deliverables:**
+1. `VerifyingKey` struct: precomputed e(α,β), [γ]_2, [δ]_2, IC points
+2. `groth16_verify(vk, proof, public_inputs)` → bool
+   - Verification: e(π_A, π_B) = e(α,β) · e(L_pub, γ) · e(π_C, δ)
+   - Multi-pairing: product of Miller loops before single final exponentiation
+3. Fix simplified π_C (add r·B_g1 term) for correct verification
+4. End-to-end: prove → verify for toy circuit
+5. Benchmark + analysis + release
+
+**Tests (~20 new, cumulative ~761):**
+- VK generation: all elements on correct curves
+- Valid proof: verify returns true
+- Corrupted π_A/π_B/π_C: verify returns false
+- Wrong public input: verify returns false
+- Multiple witnesses: x=3, 5, 10, 100
+- GPU vs CPU verify match
+- End-to-end roundtrip: setup → prove → verify
+
+---
+
+### Session Summary (v2.1.0 + v2.2.0)
+
+| Session | Release | Objective | New Tests | Cumulative |
+|---------|---------|-----------|-----------|------------|
+| 26 | v2.1.0 | Signed-digit + parallel bucket accumulation | ~20 | ~641 |
+| 27 | v2.1.0 | Parallel bucket reduction + window combination | ~15 | ~656 |
+| 28 | v2.1.0 | Tuning + benchmark + release | ~10 | ~666 |
+| 29 | v2.2.0 | Fq6 arithmetic | ~25 | ~691 |
+| 30 | v2.2.0 | Fq12 arithmetic | ~20 | ~711 |
+| 31 | v2.2.0 | Miller loop | ~15 | ~726 |
+| 32 | v2.2.0 | Final exponentiation | ~15 | ~741 |
+| 33 | v2.2.0 | Groth16 verification + release | ~20 | ~761 |
+
+**Dependencies:** Sessions 26→27→28 (linear). Sessions 29→30→31→32→33 (linear).
+v2.1.0 and v2.2.0 are independent tracks. Session 33 optionally benefits from v2.1.0
+production MSM in Groth16 proof generation, but can use v2.0.0 MSM.
+
+---
+
 ## References
 
 - **MoMA**: Zhang & Franchetti, "Code Generation for Cryptographic Kernels using Multi-word

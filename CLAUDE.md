@@ -398,9 +398,17 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 negative result, v1.8.0 Stockham cancelled, v2.0.0 Groth16 complete).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v2.2.0 planned).
 
 Phases 1-8 complete. Current version: **v2.0.0** released.
+
+### Planned Releases
+- **v2.1.0** — Production MSM: signed-digit recoding, parallel bucket accumulation/reduction,
+  window auto-tuning. Target: 50-100x speedup over v2.0.0 correctness-focused MSM.
+  Sessions 26-28.
+- **v2.2.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
+  final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
+  Sessions 29-33.
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.

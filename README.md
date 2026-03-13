@@ -11,18 +11,20 @@
 
 ## Highlights
 
+- **v2.0.0: End-to-end Groth16 prover** — Fq/Fq2 field arithmetic, G1/G2 elliptic curve ops, MSM (Pippenger), polynomial operations, toy circuit x^3+x+5=y. GPU proof matches CPU proof bitwise.
 - **v1.6.0: 3-field NTT** — BLS12-381 (15.1 ms), Goldilocks (3.6 ms, 4.2x faster), BabyBear (2.4 ms, 6.2x faster) at n=2^22
 - **Multi-field comparison** demonstrates memory-bound convergence: speedup shrinks at large sizes as DRAM traffic dominates
-- **v1.5.0: 15.5 ms at n=2^22** — 38% faster than v1.1.0 via radix-8 outer stages (Montgomery)
+- **15.5 ms at n=2^22** — 38% faster than v1.1.0 via radix-8 outer stages (Montgomery)
 - **CUDA Graph API**: captures NTT kernel sequence for graph replay in larger workflows
 - **Barrett + Montgomery dual arithmetic**: Barrett NTT eliminates 12% Montgomery conversion overhead
 - **Batched NTT**: process 8 independent NTTs in 3-4 kernel launches (vs 32 sequential); **1.52x throughput** at 2^15
-- **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT (Direction A)
+- **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
 - **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
-- **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX (Direction B)
-- **458 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX
+- **621 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - 3 fields: BLS12-381 (256-bit), Goldilocks (64-bit, Plonky2/3), BabyBear (31-bit, RISC Zero)
+- **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%)
 
 ---
 
@@ -173,7 +175,41 @@ The fused radix-256 kernel transforms the workload from memory-bound to **comput
   <img src="results/charts/sass_instruction_reduction.png" width="48%" alt="SASS instruction reduction">
 </p>
 
-See [`results/analysis.md`](results/analysis.md) for the full annotated analysis with Nsight Compute screenshots.
+See [`results/analysis.md`](results/analysis.md) for the full annotated NTT analysis with Nsight Compute screenshots.
+
+---
+
+## v2.0.0 — Groth16 GPU Primitives
+
+End-to-end GPU-accelerated Groth16 prover for BLS12-381, connecting NTT, coset NTT, MSM (Pippenger), and elliptic curve arithmetic.
+
+**New primitives:**
+- **Fq** (381-bit base field, 12×u32 CIOS Montgomery): add/sub/mul/sqr/inv/neg
+- **Fq2** (quadratic extension, Karatsuba): 3 Fq muls per Fq2 mul
+- **G1/G2** (Jacobian projective): point add, double, scalar_mul, affine conversion, on-curve checks
+- **MSM** (Pippenger): CUB radix sort → bucket accumulation → running sum → Horner combination
+- **Polynomial ops**: coset NTT, pointwise mul/sub, scale kernels
+- **Groth16 pipeline**: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
+
+**Toy circuit: x³ + x + 5 = y** (4 R1CS constraints, 6 variables, domain_size=256).
+GPU proof matches CPU proof bitwise (cross-validated).
+
+**MSM benchmark (RTX 3060, 7-rep median):**
+
+| Size | Latency | Throughput |
+|------|---------|------------|
+| 2^10 | 261 ms | 3.9 pts/ms |
+| 2^14 | 2,697 ms | 6.1 pts/ms |
+| 2^18 | 42,603 ms | 6.2 pts/ms |
+
+*Correctness-focused implementation (single-thread bucket reduction). Production MSM (v2.1.0 planned) will be orders of magnitude faster.*
+
+<p align="center">
+  <img src="results/charts/msm_scaling.png" width="48%" alt="MSM scaling">
+  <img src="results/charts/groth16_pipeline.png" width="48%" alt="Groth16 pipeline breakdown">
+</p>
+
+See [`results/analysis_v200.md`](results/analysis_v200.md) for the v2.0.0 performance analysis.
 
 ---
 
@@ -183,19 +219,32 @@ See [`results/analysis.md`](results/analysis.md) for the full annotated analysis
 cuda-zkp-ntt/
 ├── include/
 │   ├── cuda_utils.cuh         # CUDA_CHECK macro, GPU timer
-│   ├── ff_arithmetic.cuh      # BLS12-381 Montgomery mul (256-bit)
+│   ├── ff_arithmetic.cuh      # BLS12-381 Fr Montgomery mul (256-bit, 8×u32)
 │   ├── ff_barrett.cuh         # Barrett modular arithmetic (standard-form)
+│   ├── ff_plantard.cuh        # Plantard modular arithmetic (negative result)
 │   ├── ff_goldilocks.cuh      # Goldilocks field (64-bit, Plonky2/3)
 │   ├── ff_babybear.cuh        # BabyBear field (31-bit, RISC Zero)
+│   ├── ff_fq.cuh              # BLS12-381 Fq base field (381-bit, 12×u32 Montgomery)
+│   ├── ff_fq2.cuh             # Fq2 quadratic extension (Karatsuba, 3 Fq muls)
+│   ├── ec_g1.cuh              # G1 elliptic curve ops (Jacobian projective)
+│   ├── ec_g2.cuh              # G2 elliptic curve ops (over Fq2)
+│   ├── msm.cuh                # GPU MSM (Pippenger's bucket method, G1)
+│   ├── poly_ops.cuh           # Polynomial ops (coset NTT, pointwise mul/sub)
+│   ├── groth16.cuh            # Groth16 prover API (R1CS, ProvingKey, Proof)
 │   ├── ntt.cuh                # BLS12-381 NTT (single + batched + graph, 5 modes)
 │   ├── ntt_goldilocks.cuh     # Goldilocks NTT (forward/inverse, single/batched)
 │   ├── ntt_babybear.cuh       # BabyBear NTT (forward/inverse, single/batched)
 │   ├── pipeline.cuh           # Async pipeline infrastructure
 │   └── twiddle_otf.cuh        # On-the-fly twiddle computation (disabled for BLS12-381)
 ├── src/
-│   ├── ff_mul.cu              # BLS12-381 Montgomery multiplication kernels
+│   ├── ff_mul.cu              # BLS12-381 Montgomery/Barrett/Plantard kernels
 │   ├── ff_multi_field.cu      # Goldilocks + BabyBear GPU throughput kernels
-│   ├── ntt_naive.cu           # Baseline radix-2 NTT (correctness reference)
+│   ├── ff_fq_kernels.cu       # Fq/Fq2 GPU throughput kernels
+│   ├── ec_kernels.cu          # G1/G2 GPU test kernels
+│   ├── msm.cu                 # Pippenger MSM (separate TU, no RDC)
+│   ├── poly_ops.cu            # Coset NTT, pointwise mul/sub/scale kernels
+│   ├── groth16.cu             # Groth16 prover: trusted setup + proof generation
+│   ├── ntt_naive.cu           # Baseline radix-2 NTT + API dispatch + twiddle caches
 │   ├── ntt_optimized.cu       # BLS12-381 NTT: K selection + cooperative outer fusion
 │   ├── ntt_fused_kernels.cu   # Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC)
 │   ├── ntt_4step.cu           # 4-Step NTT: transpose, twiddle multiply, Bailey's algorithm
@@ -204,28 +253,33 @@ cuda-zkp-ntt/
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   ├── test_correctness.cu    # Validation against CPU reference (458 tests)
-│   └── ff_reference.h         # CPU-only finite field + NTT reference oracle
+│   ├── test_correctness.cu    # Validation against CPU reference (621 tests)
+│   └── ff_reference.h         # CPU-only finite field + NTT + EC reference oracle
 ├── benchmarks/
 │   ├── bench_ntt.cu           # Google Benchmark: BLS12-381 NTT latency vs scale
 │   ├── bench_multifield.cu    # 3-way benchmark: BLS vs Goldilocks vs BabyBear
+│   ├── bench_msm.cu           # MSM (Pippenger) benchmark at various sizes
+│   ├── bench_groth16.cu       # Groth16 pipeline benchmark with phase breakdown
 │   └── ff_microbench.cu       # Isolated FF_add / FF_mul throughput
 ├── profiling/
 │   ├── scripts/               # Nsight Compute / Systems automation scripts
 │   └── README.md              # Profiling methodology
 ├── results/
 │   ├── screenshots/           # Nsight Compute roofline + warp analysis
-│   ├── charts/                # Generated benchmark comparison charts
-│   ├── data/                  # Raw benchmark CSV output
-│   └── analysis.md            # Annotated performance analysis
+│   ├── charts/                # Generated benchmark comparison charts (23 PNGs)
+│   ├── data/                  # Raw benchmark JSON/CSV output
+│   ├── analysis.md            # Annotated NTT performance analysis (v1.x)
+│   └── analysis_v200.md       # v2.0.0 MSM + Groth16 performance analysis
 ├── scripts/
-│   └── plot_benchmarks.py     # Generate charts from benchmark data
+│   ├── plot_benchmarks.py     # Generate v1.x benchmark charts
+│   └── plot_groth16.py        # Generate v2.0.0 charts (MSM, Groth16)
 ├── .github/
 │   └── workflows/
-│       └── build.yml            # CI: Linux (CUDA 12.8/12.6) + Windows (MSVC)
+│       └── build.yml          # CI: Linux (CUDA 12.8/12.6) + Windows (MSVC)
 ├── CMakeLists.txt
 ├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization
+├── NTT_OPTIMIZATION_ROADMAP.md # Full optimization roadmap (v1.0-v2.2)
 ├── LICENSE                    # MIT License
 └── README.md
 ```
@@ -312,7 +366,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields; viable only for word-size moduli). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover with GPU proof matching CPU bitwise. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
 
 ---
 
