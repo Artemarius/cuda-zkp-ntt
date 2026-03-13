@@ -1517,11 +1517,18 @@ Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
 ## v2.1.0 — Production MSM (PLANNED)
 
 **Goal:** Replace correctness-focused single-thread MSM with production-quality parallel Pippenger.
-Current: 261ms at 2^10, 42.6s at 2^18. Target: 50-100x speedup.
+Current: 261ms at 2^10, 42.6s at 2^18. Gap vs SOTA: ~20-85x in throughput.
+Target: >20x speedup (n=2^18 from 42.7s → <2s).
 
-**Key optimizations:** Signed-digit window recoding (halves bucket count), parallel bucket
-accumulation (one warp per bucket, CUB run-length encode), parallel bucket reduction
-(tree-reduce running sum), optimal window auto-tuning (c ≈ log2(n)).
+**Primary references:**
+- **cuZK** (Lu et al., TCHES 2023) — SpMV formulation: radix sort → sparse coordinate → parallel accumulation
+- **Load-Balanced MSM** (Chen et al., TCHES 2024) — halves bucket count, homogeneous-coordinate
+  accumulation, load-balanced parallel reduction. Nearly-linear speedup on RTX 4090/V100.
+- **DistMSM** (Ji et al., ASPLOS 2024) — register pressure optimization via "operand fusion"
+
+**Key optimizations:** cuZK-style SpMV bucket accumulation, signed-digit window recoding
+(halves bucket count), TCHES 2024 load-balanced parallel reduction, mixed affine/Jacobian
+arithmetic, optimal window auto-tuning (c ≈ log2(n)).
 
 ### Session 26 — Signed-Digit Recoding + Parallel Bucket Accumulation
 
@@ -1589,7 +1596,65 @@ accumulation (one warp per bucket, CUB run-length encode), parallel bucket reduc
 
 ---
 
-## v2.2.0 — Pairing Verification (PLANNED)
+## v2.2.0 — Fibonacci Circuit + Batch Pipeline (PLANNED)
+
+**Goal:** Demonstrate GPU advantage at real scale. v2.0.0 toy circuit (4 constraints, n=256)
+shows GPU/CPU ratio = 1.0. Need a meaningful circuit to prove GPU investment pays off.
+
+**Narrative**: This is the "GPU finally wins" release — showing ~12x GPU/CPU at n=2^18.
+
+**Primary reference:**
+- **BatchZK** (Lu et al., ASPLOS 2025, eprint:2024/1862) — 259.5x throughput via pipelined
+  batch proof generation. Overlaps NTT/MSM/assembly across proofs in multiple CUDA streams.
+
+**Prerequisite:** v2.1.0 production MSM (GPU advantage requires fast MSM at n=2^18).
+
+### Session 29 — Fibonacci 2^18 R1CS Circuit
+
+**Objective:** Build a real-scale circuit that exercises all GPU primitives at proof-relevant sizes.
+
+**Deliverables:**
+1. Fibonacci R1CS circuit generator:
+   - 2^18 constraints: each `a_{i+2} = a_i + a_{i+1}` (one multiplication constraint per step)
+   - Witness: `[1, a_0, a_1, a_2, ..., a_{2^18}]`
+   - Domain size = 2^18 (next power of 2 above constraint count)
+2. Extended trusted setup for domain_size=2^18:
+   - Reuse existing `groth16_setup()` infrastructure, just larger domain
+   - Proving key: G1/G2 points for 2^18+ variables
+3. Full GPU prove with existing Groth16 pipeline at n=2^18
+4. CPU prove at n=2^18 for comparison
+5. **Target chart**: GPU ~10s vs CPU ~120s = **~12x GPU advantage**
+
+**Tests (~15 new, cumulative ~681):**
+- Fibonacci witness: verify a_{i+2} = a_i + a_i+1 for all steps
+- R1CS satisfaction: A*w . B*w = C*w for all constraints
+- GPU proof at n=2^18: verify all proof elements on correct curves
+- GPU vs CPU proof: bitwise match (or verify both independently)
+- Edge cases: Fibonacci from (0,1), (1,1), large starting values
+
+### Session 30 — 2-Stream Batch Pipeline + Release v2.2.0
+
+**Objective:** Pipeline multiple proof generations for higher throughput (BatchZK pattern).
+
+**Deliverables:**
+1. Multi-stream pipeline architecture:
+   - Proof k's MSM overlaps Proof k+1's NTT (2 CUDA streams)
+   - Reuse existing batched NTT API (v1.2.0) as foundation
+   - Phase overlap: `[NTT_1][MSM_1+NTT_2][MSM_2+NTT_3]...`
+2. Prove 4 Fibonacci instances simultaneously with stream overlap
+3. Measure throughput (proofs/second) vs sequential single-stream
+4. **Target**: ~2x throughput for batch of 4+ proofs
+5. Benchmark + analysis + release
+
+**Tests (~10 new, cumulative ~691):**
+- Batch of 4 proofs: all verify correctly
+- Pipeline vs sequential: bitwise identical proofs
+- Throughput measurement: proofs/second at batch sizes 1, 2, 4, 8
+- Memory usage: fits in 6 GB VRAM at batch_size=4
+
+---
+
+## v3.0.0 — Pairing Verification (PLANNED)
 
 **Goal:** Implement BLS12-381 optimal Ate pairing for Groth16 proof verification.
 Complete the prove→verify loop. Mathematical capstone of the project.
@@ -1597,7 +1662,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 **Field tower:** Fq → Fq2 (done) → Fq6 (cubic over Fq2) → Fq12 (quadratic over Fq6)
 **BLS12-381 parameter:** u = -0xd201000000010000 (64-bit, Hamming weight 5)
 
-### Session 29 — Fq6 Arithmetic
+### Session 31 — Fq6 Arithmetic
 
 **Objective:** Implement Fq6 = Fq2[v] / (v^3 − β) where β = (1+u) is the Fq2 nonresidue.
 
@@ -1614,7 +1679,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 2. CPU reference `Fq6Ref` in `tests/ff_reference.h`
 3. GPU test kernels in `src/ff_fq_kernels.cu`
 
-**Tests (~25 new, cumulative ~691):**
+**Tests (~25 new, cumulative ~716):**
 - CPU self-test: add/sub/mul/sqr/inv round-trip, algebraic identities
 - GPU vs CPU: add, sub, mul, sqr at N=1024
 - Inverse: a · a^{-1} = 1 for random elements
@@ -1622,7 +1687,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 - Frobenius: f^q identity
 - Sparse mul: `mul_by_01` matches general mul with zeroed coefficients
 
-### Session 30 — Fq12 Arithmetic
+### Session 32 — Fq12 Arithmetic
 
 **Objective:** Implement Fq12 = Fq6[w] / (w² − v), completing the tower.
 
@@ -1639,7 +1704,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 **Note:** Fq12Element = 576 bytes. GPU pairing will spill to local memory (~216 registers
 for f + T alone). Acceptable for correctness; performance optimization is future work.
 
-**Tests (~20 new, cumulative ~711):**
+**Tests (~20 new, cumulative ~736):**
 - CPU self-test: add/sub/mul/sqr/inv
 - GPU vs CPU: add, sub, mul, sqr
 - Inverse: a · a^{-1} = 1
@@ -1647,7 +1712,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 - Frobenius: f^{q^k} identity for k=1,2,3,6,12
 - Sparse mul: `mul_by_034` matches general mul
 
-### Session 31 — Miller Loop
+### Session 33 — Miller Loop
 
 **Objective:** Implement the optimal Ate Miller loop for BLS12-381.
 
@@ -1664,7 +1729,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 3. `src/pairing.cu` — GPU kernel (single-thread for correctness)
 4. CPU reference Miller loop in `tests/ff_reference.h`
 
-**Tests (~15 new, cumulative ~726):**
+**Tests (~15 new, cumulative ~751):**
 - Line evaluation: doubling/addition lines match CPU reference
 - Trivial inputs: e(O, Q) = 1, e(P, O) = 1
 - e(G1, G2): compute reference, verify match
@@ -1672,7 +1737,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 - Linearity: e(P, Q+R) = e(P,Q) · e(P,R)
 - GPU vs CPU bitwise match
 
-### Session 32 — Final Exponentiation
+### Session 34 — Final Exponentiation
 
 **Objective:** Implement f^((q^12 − 1) / r), completing the pairing.
 
@@ -1687,7 +1752,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 3. Combined `pairing(P, Q)` = final_exp(miller_loop(P, Q))
 4. CPU reference final exponentiation
 
-**Tests (~15 new, cumulative ~741):**
+**Tests (~15 new, cumulative ~766):**
 - Easy part: f^(q^6−1) is unitary (norm = 1)
 - exp_by_u: matches direct computation
 - Full pairing: e(G1, G2) matches known test vector
@@ -1695,7 +1760,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 - Non-degeneracy: e(G1, G2) ≠ 1
 - GPU vs CPU bitwise match
 
-### Session 33 — Groth16 Verification + Release v2.2.0
+### Session 35 — Groth16 Verification + Release v3.0.0
 
 **Objective:** Implement Groth16 verification equation, complete prove→verify loop.
 
@@ -1708,7 +1773,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 4. End-to-end: prove → verify for toy circuit
 5. Benchmark + analysis + release
 
-**Tests (~20 new, cumulative ~761):**
+**Tests (~20 new, cumulative ~786):**
 - VK generation: all elements on correct curves
 - Valid proof: verify returns true
 - Corrupted π_A/π_B/π_C: verify returns false
@@ -1719,22 +1784,33 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 
 ---
 
-### Session Summary (v2.1.0 + v2.2.0)
+### Session Summary (v2.1.0 + v2.2.0 + v3.0.0)
 
 | Session | Release | Objective | New Tests | Cumulative |
 |---------|---------|-----------|-----------|------------|
-| 26 | v2.1.0 | Signed-digit + parallel bucket accumulation | ~20 | ~641 |
-| 27 | v2.1.0 | Parallel bucket reduction + window combination | ~15 | ~656 |
-| 28 | v2.1.0 | Tuning + benchmark + release | ~10 | ~666 |
-| 29 | v2.2.0 | Fq6 arithmetic | ~25 | ~691 |
-| 30 | v2.2.0 | Fq12 arithmetic | ~20 | ~711 |
-| 31 | v2.2.0 | Miller loop | ~15 | ~726 |
-| 32 | v2.2.0 | Final exponentiation | ~15 | ~741 |
-| 33 | v2.2.0 | Groth16 verification + release | ~20 | ~761 |
+| 26 | v2.1.0 | CUB radix sort + parallel bucket accumulation | ~20 | ~641 |
+| 27 | v2.1.0 | Parallel reduction + mixed affine/Jacobian | ~15 | ~656 |
+| 28 | v2.1.0 | Window auto-tuning + benchmark + release | ~10 | ~666 |
+| 29 | v2.2.0 | Fibonacci 2^18 R1CS circuit | ~15 | ~681 |
+| 30 | v2.2.0 | 2-stream batch pipeline + release | ~10 | ~691 |
+| 31 | v3.0.0 | Fq6 arithmetic | ~25 | ~716 |
+| 32 | v3.0.0 | Fq12 arithmetic | ~20 | ~736 |
+| 33 | v3.0.0 | Miller loop | ~15 | ~751 |
+| 34 | v3.0.0 | Final exponentiation | ~15 | ~766 |
+| 35 | v3.0.0 | Groth16 verification + release | ~20 | ~786 |
 
-**Dependencies:** Sessions 26→27→28 (linear). Sessions 29→30→31→32→33 (linear).
-v2.1.0 and v2.2.0 are independent tracks. Session 33 optionally benefits from v2.1.0
-production MSM in Groth16 proof generation, but can use v2.0.0 MSM.
+**Dependencies:**
+- Sessions 26→27→28 (linear, v2.1.0 MSM)
+- Sessions 29→30 (linear, v2.2.0 circuit + pipeline)
+- Sessions 31→32→33→34→35 (linear, v3.0.0 pairing)
+- v2.1.0 must complete before v2.2.0 (MSM perf needed for GPU advantage demo)
+- v3.0.0 pairing track is independent of v2.2.0
+
+**Narrative arc:**
+> v2.0.0: "MSM is now the bottleneck (GPU=CPU at n=256, 42s at n=2^18)"
+> v2.1.0: "cuZK-style parallel MSM closes the gap (>20x speedup)"
+> v2.2.0: "Fibonacci 2^18 shows GPU = 12x CPU — GPU finally wins"
+> v3.0.0: "Full prove→verify loop with pairing verification"
 
 ---
 
@@ -1744,7 +1820,21 @@ production MSM in Groth16 proof generation, but can use v2.0.0 MSM.
   Modular Arithmetic on GPU", CGO 2025. [arXiv:2501.07535](https://arxiv.org/html/2501.07535),
   [SPIRAL pub](https://spiral.ece.cmu.edu/pub-spiral/abstract.jsp?id=376)
 - **ZKProphet**: Verma et al., IEEE IISWC 2025 — §V-B: open optimization targets
-- **cuZK**: Lu et al., TCHES 2023 — async pipeline methodology
+- **cuZK**: Lu et al., TCHES 2023 — parallel MSM via SpMV + radix sort.
+  [eprint:2022/1321](https://eprint.iacr.org/2022/1321),
+  [github](https://github.com/speakspeak/cuZK)
+- **Load-Balanced MSM**: Chen, Peng, Dai et al., TCHES 2024 — improved cuZK: halved bucket
+  count, load-balanced parallel reduction.
+  [TCHES article](https://tches.iacr.org/index.php/TCHES/article/view/11438)
+- **BatchZK**: Lu, Chen, Wang et al., ASPLOS 2025 — 259.5x batch proof throughput via
+  pipelined multi-stream architecture. [eprint:2024/1862](https://eprint.iacr.org/2024/1862)
+- **DistMSM**: Ji, Zhang et al., ASPLOS 2024 — multi-GPU MSM, tensor core bigint,
+  register pressure optimization via operand fusion
+- **NTT Multi-GPU**: Ji, Zhao et al., ASPLOS 2025 — warp specialization, persistent kernels.
+  [doi:10.1145/3669940.3707241](https://dl.acm.org/doi/10.1145/3669940.3707241)
+- **zkSpeed/HyperPlonk**: Daftardar, Bunz et al., ISCA 2025 — ASIC 801x, SumCheck replaces
+  NTT. [arXiv:2504.06211](https://arxiv.org/abs/2504.06211)
+- **GZKP**: Ma et al., ASPLOS 2023 — end-to-end GPU ZKP baseline
 - **Bailey**: D.H. Bailey (1990) — "FFTs in External or Hierarchical Memory" (4-step FFT)
 - **ICICLE**: Ingonyama, GPU acceleration library for ZKP — [github](https://github.com/ingonyama-zk/icicle)
 - **Özcan, Javeed, Savaş**: "High-Performance NTT on GPU Through radix2-CT and 4-Step

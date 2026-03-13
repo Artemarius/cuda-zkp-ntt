@@ -202,7 +202,7 @@ GPU proof matches CPU proof bitwise (cross-validated).
 | 2^14 | 2,697 ms | 6.1 pts/ms |
 | 2^18 | 42,603 ms | 6.2 pts/ms |
 
-*Correctness-focused implementation (single-thread bucket reduction). Production MSM (v2.1.0 planned) will be orders of magnitude faster.*
+*Correctness-focused implementation (single-thread bucket reduction). v2.1.0 will add cuZK-style parallel bucket accumulation (>20x target). See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full v2.1.0-v3.0.0 roadmap.*
 
 <p align="center">
   <img src="results/charts/msm_scaling.png" width="48%" alt="MSM scaling">
