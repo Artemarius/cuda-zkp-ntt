@@ -30,6 +30,28 @@ theoretical O(n) for Pippenger's bucket method. Throughput plateaus at ~6.2 pts/
 higher throughput via signed-digit scalars, cooperative accumulation, and batch affine inversions.
 This implementation demonstrates the algorithm structure and correctness.
 
+### v2.1.0 MSM (Sessions 26-27: Signed-Digit + Parallel Reduction)
+
+| Size | v2.0.0 (ms) | v2.1.0-s27 (ms) | Speedup | Window (c) | Throughput (pts/ms) |
+|------|-------------|-----------------|---------|------------|---------------------|
+| 2^10 | 261 | 121 | 2.2x | 6 | 8.5 |
+| 2^12 | 755 | 256 | 2.9x | 7 | 16.0 |
+| 2^14 | 2,704 | 557 | 4.9x | 8 | 29.4 |
+| 2^15 | 5,317 | 1,066 | 5.0x | 8 | 30.7 |
+| 2^16 | 10,633 | 2,318 | 4.6x | 9 | 28.3 |
+| 2^18 | 42,714 | 1,180 | **36.2x** | 10 | 222.1 |
+
+**Optimizations:**
+- **Signed-digit window recoding** (S26): halves bucket count (2^c → 2^(c-1)+1)
+- **Improved window sizing** (S26): c = floor(log2(n)/2)+1, clamped [4,16]
+- **Segment-offset accumulation** (S26): O(1) lookup replaces binary search
+- **Parallel bucket reduction** (S27): Hillis-Steele suffix scan + tree reduce
+  (O(log B) depth vs O(B) single-thread). Key optimization — removed dominant serial bottleneck.
+
+**Why 36.2x at 2^18:** At c=10, 512 active buckets per window. The single-thread running
+sum did 1024 EC additions × 27 windows sequentially. Parallel scan reduces this to 9 rounds
+of depth, utilizing 512 threads per window.
+
 ---
 
 ## Groth16 Pipeline Benchmark

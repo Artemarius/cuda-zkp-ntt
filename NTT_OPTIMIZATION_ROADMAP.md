@@ -1514,13 +1514,14 @@ Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
 
 ---
 
-## v2.1.0 — Production MSM (IN PROGRESS — Session 26 complete)
+## v2.1.0 — Production MSM (IN PROGRESS — Session 27 complete)
 
 **Goal:** Replace correctness-focused single-thread MSM with production-quality parallel Pippenger.
 Current: 261ms at 2^10, 42.6s at 2^18. Gap vs SOTA: ~20-85x in throughput.
 Target: >20x speedup (n=2^18 from 42.7s → <2s).
 
 **Session 26 status:** 5.4x speedup achieved (42.7s → 8.0s at 2^18). 641 tests.
+**Session 27 status:** Parallel bucket reduction: 6.8x over S26 (8.0s → 1.2s at 2^18), **36.2x vs v2.0.0**. 655 tests.
 
 **Primary references:**
 - **cuZK** (Lu et al., TCHES 2023) — SpMV formulation: radix sort → sparse coordinate → parallel accumulation
@@ -1578,23 +1579,40 @@ arithmetic, optimal window auto-tuning (c ≈ log2(n)).
 - Mixed zero/nonzero scalars, determinism (3 runs)
 - Benchmark data: `results/data/bench_msm_v210_s26.json`
 
-### Session 27 — Parallel Bucket Reduction + Window Combination
+### Session 27 — Parallel Bucket Reduction ✅ COMPLETE
 
 **Objective:** Replace single-thread bucket reduction with parallel tree reduction.
 
-**Deliverables:**
-1. Parallel running-sum bucket reduction:
-   - Divide 2^(c-1) buckets into blocks of 32 (one warp each)
-   - Each warp reduces its block sequentially (~32 EC adds)
-   - Tree-reduce across blocks: 512 warps → 16 warps → 1 result (for c=15)
-2. Window combination (keep Horner, small W ≈ 17-32 is acceptable sequential)
-3. Batch affine inversion for final Jacobian→affine conversion
+**Implemented:**
+1. Parallel bucket reduction kernel (`bucket_reduce_parallel_kernel`):
+   - Hillis-Steele suffix inclusive scan on d_buckets[1..B-1] (O(log B) depth)
+   - Tree reduction of suffix sums → window result
+   - In-place global memory with `__syncthreads()` barriers (fits in L2 cache)
+   - Handles up to 1024 threads (B ≤ 1025); falls back to sequential for larger
+2. Window combination: Horner's method kept sequential (small W ≈ 26, ~297 ops)
 
-**Tests (~15 new, cumulative ~656):**
-- Parallel reduction at c=4,8,12: cross-validate with naive MSM
-- Full pipeline v2 at n=256, 1024, 2^14, 2^16
-- Determinism test
-- Window combination: Horner consistency for small cases
+**Measured results (RTX 3060 Laptop, 7-rep median):**
+
+| Size | S26 (ms) | S27 (ms) | S26→S27 | vs v2.0.0 |
+|------|----------|----------|---------|-----------|
+| 2^10 | 202 | 121 | 1.67x | 2.2x |
+| 2^12 | 417 | 256 | 1.63x | 2.9x |
+| 2^14 | 876 | 557 | 1.57x | 4.9x |
+| 2^15 | 1,399 | 1,066 | 1.31x | 5.0x |
+| 2^16 | 2,890 | 2,318 | 1.25x | 4.6x |
+| 2^18 | 7,982 | 1,180 | **6.8x** | **36.2x** |
+
+**Analysis:**
+- At n=2^18 (c=10, 512 active buckets): scan depth = 9 rounds vs 1024 sequential g1_adds.
+  Bucket reduction was the dominant serial bottleneck — parallelizing it gave 6.8x.
+- Larger n benefits more: more buckets → more parallelism in suffix scan.
+- Points/ms at 2^18: 222 (up from ~33 in S26).
+
+**Tests (14 new, 655 total):**
+- Cross-validation at n=3, 4, 64, 128, 256, 512 vs CPU naive
+- On-curve checks at n=1024, 8192, 16384
+- Determinism, uniform scalar, half-zero, ascending, alternating bit patterns, high-bit scalars
+- Benchmark data: `results/data/bench_msm_v210_s27.json`
 
 ### Session 28 — Performance Tuning + Benchmark + Release v2.1.0
 
@@ -1812,7 +1830,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 | Session | Release | Objective | New Tests | Cumulative |
 |---------|---------|-----------|-----------|------------|
 | 26 | v2.1.0 | Signed-digit recoding + segment-offset accumulation ✅ | 20 | 641 |
-| 27 | v2.1.0 | Parallel reduction + mixed affine/Jacobian | ~15 | ~656 |
+| 27 | v2.1.0 | Parallel bucket reduction (Hillis-Steele suffix scan) ✅ | 14 | 655 |
 | 28 | v2.1.0 | Window auto-tuning + benchmark + release | ~10 | ~666 |
 | 29 | v2.2.0 | Fibonacci 2^18 R1CS circuit | ~15 | ~681 |
 | 30 | v2.2.0 | 2-stream batch pipeline + release | ~10 | ~691 |

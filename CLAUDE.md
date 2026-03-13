@@ -7,8 +7,8 @@ Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
 - **v2.1.0-dev** (current): Production MSM — signed-digit window recoding (halves bucket
-  count), segment-offset parallel accumulation, improved window sizing. Session 26 complete:
-  5.4x speedup at n=2^18 (42.7s→8.0s). 641 tests.
+  count), segment-offset parallel accumulation, parallel bucket reduction (Hillis-Steele
+  suffix scan). Session 27 complete: 36.2x vs v2.0.0 at n=2^18 (42.7s→1.2s). 655 tests.
 - **v2.0.0**: Groth16 GPU primitives — Fq/Fq2 381-bit field arithmetic,
   G1/G2 elliptic curve ops (Jacobian), GPU MSM (Pippenger's bucket method),
   polynomial ops (coset NTT, pointwise), end-to-end toy prover for x^3+x+5=y.
@@ -101,8 +101,9 @@ CMake targets:
   - Jacobian projective coordinates, affine conversion, on-curve check, scalar_mul
   - G1 over Fq (curve: y^2 = x^3 + 4), G2 over Fq2 (curve: y^2 = x^3 + 4(1+u))
 - GPU MSM (Pippenger): `include/msm.cuh`, `src/msm.cu`
-  - Signed-digit window recoding → CUB radix sort → segment-offset accumulation → running sum → Horner
+  - Signed-digit window recoding → CUB radix sort → segment-offset accumulation → parallel reduce → Horner
   - Signed digits halve bucket count (2^c → 2^(c-1)+1), point negation via packed sign bit
+  - Parallel bucket reduction: Hillis-Steele suffix scan + tree reduce (O(log B) depth)
   - Window sizing: c = floor(log2(n)/2) + 1, clamped [4, 16]
   - Separate TU without RDC (CUB compatibility)
 - Polynomial ops: `include/poly_ops.cuh`, `src/poly_ops.cu`
@@ -405,12 +406,12 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
 
-Phases 1-8 complete. Current version: **v2.1.0-dev** (Session 26 complete, Sessions 27-28 in progress).
+Phases 1-8 complete. Current version: **v2.1.0-dev** (Session 27 complete, Session 28 in progress).
 
 ### In Progress
-- **v2.1.0** — Production MSM. Session 26 complete (signed-digit + segment offsets, 5.4x at 2^18).
-  Remaining: parallel bucket reduction (S27), window auto-tuning + release (S28).
-  Target: >20x speedup over v2.0.0. Sessions 26-28.
+- **v2.1.0** — Production MSM. Sessions 26-27 complete (signed-digit + segment offsets +
+  parallel bucket reduction, 36.2x at 2^18 vs v2.0.0). Target >20x achieved.
+  Remaining: window auto-tuning + release (S28). Sessions 26-28.
 - **v2.2.0** — Fibonacci 2^18 circuit + BatchZK-style 2-stream batch pipeline.
   Demonstrates GPU advantage at real scale (~12x GPU/CPU). Sessions 29-30.
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),

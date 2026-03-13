@@ -6,6 +6,10 @@
 //   - Segment-offset accumulation: replaces O(log n) binary search with O(1) lookup
 //   - Improved window sizing: c = floor(log2(n)/2) + 1
 //
+// v2.1.0 Session 27 improvements:
+//   - Parallel bucket reduction: Hillis-Steele suffix scan + tree reduce
+//     replaces single-thread running sum (O(B) → O(log B) depth)
+//
 // Algorithm:
 //   1. For each window w (sequentially):
 //      a. Extract signed window digits (with carry propagation)
@@ -181,15 +185,9 @@ __global__ void bucket_accumulate_kernel(
     d_buckets[bucket] = acc;
 }
 
-// ─── Kernel: Bucket reduction ──────────────────────────────────────────────
-// Running sum from top bucket down:
-//   S = bucket[num_buckets-1]
-//   R = S
-//   for b = num_buckets-2 down to 1:
-//     S = S + bucket[b]
-//     R = R + S
-// Result = R (the window contribution)
-// Single thread per window (num_buckets is small enough).
+// ─── Kernel: Bucket reduction (sequential fallback) ────────────────────────
+// Running sum from top bucket down. Single thread per window.
+// Used when num_buckets > 1025 (exceeds parallel kernel's thread limit).
 
 __global__ void bucket_reduce_kernel(
     const G1Jacobian* __restrict__ d_buckets,
@@ -207,6 +205,63 @@ __global__ void bucket_reduce_kernel(
     }
 
     d_window_result[0] = R;
+}
+
+// ─── Kernel: Parallel bucket reduction ────────────────────────────────────
+// Computes R = sum(b * bucket[b], b=1..B-1) using two parallel phases:
+//   Phase 1: Suffix inclusive scan (Hillis-Steele) on d_buckets[1..B-1]
+//            After scan, d_buckets[k] = sum(original_bucket[j], j=k..B-1)
+//   Phase 2: Tree reduction of suffix sums → window result
+//
+// Modifies d_buckets in place (OK since buckets are recomputed each window).
+// Requires num_buckets - 1 <= 1024 (one thread per active bucket).
+// Uses global memory with __syncthreads() barriers (72 KB fits in L2).
+
+__global__ void bucket_reduce_parallel_kernel(
+    G1Jacobian* __restrict__ d_buckets,     // [0..num_buckets-1]
+    G1Jacobian* __restrict__ d_window_result,
+    uint32_t num_buckets)
+{
+    uint32_t tid = threadIdx.x;
+    uint32_t N = num_buckets - 1;  // active buckets: d_buckets[1..N]
+
+    if (N == 0) {
+        if (tid == 0) d_window_result[0] = G1Jacobian::identity();
+        return;
+    }
+    if (N == 1) {
+        if (tid == 0) d_window_result[0] = d_buckets[1];
+        return;
+    }
+
+    // Phase 1: Suffix inclusive scan (Hillis-Steele, rightward)
+    // After scan: d_buckets[k] = sum(original[j], j=k..N) for k=1..N
+    for (uint32_t d = 1; d < N; d <<= 1) {
+        // Read old values before any thread writes
+        G1Jacobian val = (tid < N) ? d_buckets[tid + 1] : G1Jacobian::identity();
+        G1Jacobian right = (tid < N && tid + d < N)
+            ? d_buckets[tid + d + 1]
+            : G1Jacobian::identity();
+        __syncthreads();  // All reads complete before writes
+        if (tid < N) {
+            d_buckets[tid + 1] = g1_add(val, right);
+        }
+        __syncthreads();  // All writes complete before next round
+    }
+    // Now d_buckets[k] = suffix_sum[k] for k=1..N
+
+    // Phase 2: Tree reduction — sum all suffix sums
+    // R = d_buckets[1] + d_buckets[2] + ... + d_buckets[N]
+    for (uint32_t stride = 1; stride < N; stride <<= 1) {
+        if (tid < N && (tid % (2 * stride)) == 0 && tid + stride < N) {
+            d_buckets[tid + 1] = g1_add(d_buckets[tid + 1], d_buckets[tid + stride + 1]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        d_window_result[0] = d_buckets[1];
+    }
 }
 
 // ─── Kernel: Window combination (Horner's method) ──────────────────────────
@@ -388,9 +443,15 @@ void msm_g1(G1Affine* result,
             d_bases, d_sorted_packed_values, d_segment_offsets,
             d_buckets, num_buckets);
 
-        // Step 5: Bucket reduction (single thread)
-        bucket_reduce_kernel<<<1, 1, 0, stream>>>(
-            d_buckets, &d_window_results[w], num_buckets);
+        // Step 5: Bucket reduction (parallel or sequential)
+        if (num_buckets - 1 <= 1024) {
+            uint32_t reduce_threads = num_buckets - 1;
+            bucket_reduce_parallel_kernel<<<1, reduce_threads, 0, stream>>>(
+                d_buckets, &d_window_results[w], num_buckets);
+        } else {
+            bucket_reduce_kernel<<<1, 1, 0, stream>>>(
+                d_buckets, &d_window_results[w], num_buckets);
+        }
     }
 
     // ─── Carry overflow window ─────────────────────────────────────────────
@@ -426,7 +487,7 @@ void msm_g1(G1Affine* result,
 
         // For carry window: only bucket 1 matters.
         // Reduction with 2 buckets: result = bucket[1]
-        bucket_reduce_kernel<<<1, 1, 0, stream>>>(
+        bucket_reduce_parallel_kernel<<<1, 1, 0, stream>>>(
             d_buckets, &d_window_results[cw], carry_buckets);
     }
 

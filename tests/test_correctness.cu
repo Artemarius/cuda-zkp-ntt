@@ -5728,6 +5728,602 @@ void test_msm_scalar_one() {
     CUDA_CHECK(cudaFree(d_scalars));
 }
 
+// =============================================================================
+// v2.1.0 Session 27: Parallel Bucket Reduction Tests
+// =============================================================================
+
+// Test: MSM cross-validate at n=512 (parallel reduction exercises more buckets)
+void test_msm_cross_validate_512() {
+    using namespace ff_ref;
+    printf("test_msm_cross_validate_512...\n");
+
+    const int n = 512;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(n);
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8] = (uint32_t)((i * 17 + 5) % 128);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), n);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM n=512: GPU matches CPU (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM determinism with parallel reduction (run twice, bitwise match)
+void test_msm_determinism_parallel() {
+    using namespace ff_ref;
+    printf("test_msm_determinism_parallel...\n");
+
+    const int N = 256;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0x1234 + 0x5678);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0xABCD + 0xEF01);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine result1, result2;
+    msm_g1(&result1, d_bases, d_scalars, N);
+    msm_g1(&result2, d_bases, d_scalars, N);
+
+    bool match = (memcmp(&result1, &result2, sizeof(G1Affine)) == 0);
+    TEST_ASSERT(match, "MSM n=256: parallel reduce deterministic");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM on-curve at n=8192 (c=7, num_buckets=65, stresses parallel scan)
+void test_msm_on_curve_8k() {
+    using namespace ff_ref;
+    printf("test_msm_on_curve_8k...\n");
+
+    const int n = 8192;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0xDEAD + 0xBEEF);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0x1337 + 0x42);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    G1AffineRef result_ref;
+    result_ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    result_ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    result_ref.infinity = gpu_result.infinity;
+
+    TEST_ASSERT(gpu_result.infinity || g1_is_on_curve_ref(result_ref),
+                "MSM on-curve n=8192 (parallel reduce, c=7)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with all-ones scalars at n=1024 (stresses bucket accumulation + parallel reduce)
+void test_msm_all_ones_1k() {
+    using namespace ff_ref;
+    printf("test_msm_all_ones_1k...\n");
+
+    const int N = 1024;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // All scalars = 1, all bases = G. Result should be N*G.
+    std::vector<G1Affine> h_bases(N, make_g1_gen_affine_gpu());
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = 1;
+
+    uint32_t sN[8] = {(uint32_t)N, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_nG = g1_scalar_mul_ref(cpu_g, sN);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_nG), "MSM: 1024*1*G = 1024G (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with spread scalars to stress many non-empty buckets
+void test_msm_spread_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_spread_scalars...\n");
+
+    const int N = 64;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Scalars: i*7+3 — spread across bucket range, exercises parallel suffix scan
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        h_scalars[i * 8] = (uint32_t)(i * 7 + 3);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM: spread scalars (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with two points and large multi-limb scalars
+void test_msm_two_large_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_two_large_scalars...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // scalar1 = 0x00000000_00000000_00001234_DEADBEEF
+    uint32_t s1[8] = {0xDEADBEEFu, 0x1234u, 0, 0, 0, 0, 0, 0};
+    // scalar2 = 0x00000000_00000000_0000ABCD_42424242
+    uint32_t s2[8] = {0x42424242u, 0xABCDu, 0, 0, 0, 0, 0, 0};
+
+    G1AffineRef base1 = cpu_g;
+    uint32_t s_two[8] = {2, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef base2 = g1_scalar_mul_ref(cpu_g, s_two);
+
+    G1AffineRef cpu_bases[2] = {base1, base2};
+    uint32_t cpu_scalars[16];
+    memcpy(&cpu_scalars[0], s1, 32);
+    memcpy(&cpu_scalars[8], s2, 32);
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases, cpu_scalars, 2);
+
+    std::vector<G1Affine> h_bases(2);
+    base1.x.to_u32(h_bases[0].x.limbs);
+    base1.y.to_u32(h_bases[0].y.limbs);
+    h_bases[0].infinity = false;
+    base2.x.to_u32(h_bases[1].x.limbs);
+    base2.y.to_u32(h_bases[1].y.limbs);
+    h_bases[1].infinity = false;
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, 2 * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 16 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), 2 * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, cpu_scalars, 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 2);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM: 2-point large scalars (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with ascending scalars at n=128 (exercises variety of bucket occupancies)
+void test_msm_ascending_128() {
+    using namespace ff_ref;
+    printf("test_msm_ascending_128...\n");
+
+    const int n = 128;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(n);
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Ascending scalars: 1, 2, 3, ..., 128
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) h_scalars[i * 8] = (uint32_t)(i + 1);
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), n);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM ascending n=128 (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM half-zero scalars at n=256 (half scalars zero, stresses empty bucket handling)
+void test_msm_half_zero_256() {
+    using namespace ff_ref;
+    printf("test_msm_half_zero_256...\n");
+
+    const int n = 256;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(n);
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Even indices zero, odd indices non-zero
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        if (i & 1) h_scalars[i * 8] = (uint32_t)(i * 3 + 7);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), n);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM half-zero n=256 (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM on-curve at n=16384 (c=8, num_buckets=129, larger parallel reduce)
+void test_msm_on_curve_16k() {
+    using namespace ff_ref;
+    printf("test_msm_on_curve_16k...\n");
+
+    const int n = 16384;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0xCAFE + 0xBABE);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0xFACE + 0xD00D);
+        h_scalars[i * 8 + 2] = (uint32_t)(i * 0xBEAD);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    G1AffineRef result_ref;
+    result_ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    result_ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    result_ref.infinity = gpu_result.infinity;
+
+    TEST_ASSERT(gpu_result.infinity || g1_is_on_curve_ref(result_ref),
+                "MSM on-curve n=16384 (parallel reduce, c=8)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM small n=3 (minimum for Pippenger path, c=4, num_buckets=9)
+void test_msm_small_n3() {
+    using namespace ff_ref;
+    printf("test_msm_small_n3...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // 3 points: G, 2G, 3G with scalars 5, 7, 11
+    // Expected: 5G + 14G + 33G = 52G
+    std::vector<G1AffineRef> cpu_bases(3);
+    std::vector<G1Affine> h_bases(3);
+    for (int i = 0; i < 3; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    uint32_t scalars[24] = {0};
+    scalars[0] = 5;
+    scalars[8] = 7;
+    scalars[16] = 11;
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), scalars, 3);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, 3 * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 24 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), 3 * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars, 24 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 3);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM n=3: 5G+14G+33G (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM uniform scalar (every point has same scalar, exercises one hot bucket)
+void test_msm_uniform_scalar_256() {
+    using namespace ff_ref;
+    printf("test_msm_uniform_scalar_256...\n");
+
+    const int N = 256;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // All scalars = 99
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = 99;
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM uniform scalar=99 n=256 (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with high-bit scalars at n=64 (all windows active, stresses carry propagation)
+void test_msm_high_bits_64() {
+    using namespace ff_ref;
+    printf("test_msm_high_bits_64...\n");
+
+    const int N = 64;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Fill all 8 limbs with pattern — exercises all windows and carry chain
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        for (int l = 0; l < 8; ++l) {
+            h_scalars[i * 8 + l] = (uint32_t)((i + 1) * (l + 1) * 0x01010101u);
+        }
+        // Clamp top limb to stay below r
+        h_scalars[i * 8 + 7] &= 0x73u;
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM high-bit n=64 (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with alternating scalars (0xAAAA..., 0x5555...) at n=32
+void test_msm_alternating_pattern() {
+    using namespace ff_ref;
+    printf("test_msm_alternating_pattern...\n");
+
+    const int N = 32;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Alternating bit patterns
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        uint32_t pat = (i & 1) ? 0x55555555u : 0xAAAAAAAAu;
+        h_scalars[i * 8 + 0] = pat;
+        h_scalars[i * 8 + 1] = pat;
+        h_scalars[i * 8 + 7] &= 0x73u;  // clamp below r
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM alternating 0xAA/0x55 n=32 (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM n=4 (minimal Pippenger, c=4, only 9 buckets, tiny parallel scan)
+void test_msm_minimal_pippenger() {
+    using namespace ff_ref;
+    printf("test_msm_minimal_pippenger...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    const int N = 4;
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Scalars: 15, 14, 13, 12 — all within one window of c=4
+    uint32_t scalars[32] = {0};
+    scalars[0]  = 15;
+    scalars[8]  = 14;
+    scalars[16] = 13;
+    scalars[24] = 12;
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), scalars, N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 32 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars, 32 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM n=4 minimal Pippenger (parallel reduce)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
 // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────────
 
 // Helper: make standard-form FpElement from a small integer
@@ -7363,6 +7959,23 @@ int main() {
     test_msm_on_curve_2k(2048);
     test_msm_on_curve_2k(4096);
     test_msm_scalar_one();
+
+    // ─── v2.1.0 Session 27: Parallel Bucket Reduction Tests ─────────────────
+    printf("\n--- v2.1.0 Session 27: Parallel Bucket Reduction ---\n");
+    test_msm_cross_validate_512();
+    test_msm_determinism_parallel();
+    test_msm_on_curve_8k();
+    test_msm_all_ones_1k();
+    test_msm_spread_scalars();
+    test_msm_two_large_scalars();
+    test_msm_ascending_128();
+    test_msm_half_zero_256();
+    test_msm_on_curve_16k();
+    test_msm_small_n3();
+    test_msm_uniform_scalar_256();
+    test_msm_high_bits_64();
+    test_msm_alternating_pattern();
+    test_msm_minimal_pippenger();
 
     // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────
     printf("\n--- v2.0.0 Session 23: Polynomial Operations ---\n");
