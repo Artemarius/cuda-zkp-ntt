@@ -979,4 +979,551 @@ inline FpRef fp_to_plantard_twiddle(const FpRef& w_std) {
     return fp_mul_barrett(w_std, neg_r2);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// BLS12-381 Base Field Fq (381-bit prime, 6 x uint64_t Montgomery)
+// q = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab
+// R = 2^384, Montgomery form.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static constexpr std::array<uint64_t, 6> FQ_MOD = {{
+    0xb9feffffffffaaabULL,
+    0x1eabfffeb153ffffULL,
+    0x6730d2a0f6b0f624ULL,
+    0x64774b84f38512bfULL,
+    0x4b1ba7b6434bacd7ULL,
+    0x1a0111ea397fe69aULL
+}};
+
+static constexpr std::array<uint64_t, 6> FQ_R_MOD_6 = {{
+    0x760900000002fffdULL,
+    0xebf4000bc40c0002ULL,
+    0x5f48985753c758baULL,
+    0x77ce585370525745ULL,
+    0x5c071a97a256ec6dULL,
+    0x15f65ec3fa80e493ULL
+}};
+
+static constexpr std::array<uint64_t, 6> FQ_R2_MOD_6 = {{
+    0xf4df1f341c341746ULL,
+    0x0a76e6a609d104f1ULL,
+    0x8de5476c4c95b6d5ULL,
+    0x67eb88a9939d83c0ULL,
+    0x9a793e85b519952dULL,
+    0x11988fe592cae3aaULL
+}};
+
+// -q^{-1} mod 2^64
+static constexpr uint64_t FQ_P_INV64_VAL = 0x89f3fffcfffcfffdULL;
+
+// ─── FqRef: CPU-only base field element ─────────────────────────────────────
+
+struct FqRef {
+    std::array<uint64_t, 6> limbs;  // little-endian
+
+    static FqRef zero() { return FqRef{{0, 0, 0, 0, 0, 0}}; }
+
+    static FqRef from_u64(uint64_t v) { return FqRef{{v, 0, 0, 0, 0, 0}}; }
+
+    bool operator==(const FqRef& o) const { return limbs == o.limbs; }
+    bool operator!=(const FqRef& o) const { return limbs != o.limbs; }
+
+    // Convert from 12 x uint32_t (GPU format) to 6 x uint64_t
+    static FqRef from_u32(const uint32_t w[12]) {
+        FqRef r;
+        for (int i = 0; i < 6; ++i)
+            r.limbs[i] = (static_cast<uint64_t>(w[2*i+1]) << 32) | w[2*i];
+        return r;
+    }
+
+    // Convert to 12 x uint32_t (GPU format)
+    void to_u32(uint32_t w[12]) const {
+        for (int i = 0; i < 6; ++i) {
+            w[2*i]   = static_cast<uint32_t>(limbs[i]);
+            w[2*i+1] = static_cast<uint32_t>(limbs[i] >> 32);
+        }
+    }
+};
+
+// ─── Fq comparison ──────────────────────────────────────────────────────────
+
+inline bool fq_geq(const std::array<uint64_t, 6>& a, const std::array<uint64_t, 6>& b) {
+    for (int i = 5; i >= 0; --i) {
+        if (a[i] > b[i]) return true;
+        if (a[i] < b[i]) return false;
+    }
+    return true;  // equal
+}
+
+// ─── Fq Addition ────────────────────────────────────────────────────────────
+
+inline FqRef fq_add_ref(const FqRef& a, const FqRef& b) {
+    FqRef r;
+    uint128_t carry = 0;
+    for (int i = 0; i < 6; ++i) {
+        carry += uint128_t(a.limbs[i]) + b.limbs[i];
+        r.limbs[i] = static_cast<uint64_t>(carry);
+        carry >>= 64;
+    }
+    if (carry || fq_geq(r.limbs, FQ_MOD)) {
+        uint128_t borrow = 0;
+        for (int i = 0; i < 6; ++i) {
+            borrow = uint128_t(r.limbs[i]) - FQ_MOD[i] - borrow;
+            r.limbs[i] = static_cast<uint64_t>(borrow);
+            borrow = (borrow >> 64) & 1;
+        }
+    }
+    return r;
+}
+
+// ─── Fq Subtraction ────────────────────────────────────────────────────────
+
+inline FqRef fq_sub_ref(const FqRef& a, const FqRef& b) {
+    FqRef r;
+    uint128_t borrow = 0;
+    for (int i = 0; i < 6; ++i) {
+        borrow = uint128_t(a.limbs[i]) - b.limbs[i] - borrow;
+        r.limbs[i] = static_cast<uint64_t>(borrow);
+        borrow = (borrow >> 64) & 1;
+    }
+    if (borrow) {
+        uint128_t carry = 0;
+        for (int i = 0; i < 6; ++i) {
+            carry += uint128_t(r.limbs[i]) + FQ_MOD[i];
+            r.limbs[i] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+    }
+    return r;
+}
+
+// ─── Fq Negation ───────────────────────────────────────────────────────────
+
+inline FqRef fq_neg_ref(const FqRef& a) {
+    bool is_zero = true;
+    for (int i = 0; i < 6; ++i) if (a.limbs[i] != 0) { is_zero = false; break; }
+    if (is_zero) return FqRef::zero();
+    FqRef q;
+    q.limbs = FQ_MOD;
+    return fq_sub_ref(q, a);
+}
+
+// ─── Fq Montgomery Multiplication (CIOS, 6-limb 64-bit) ────────────────────
+
+inline FqRef fq_mul_ref(const FqRef& a, const FqRef& b) {
+    uint64_t T[7] = {0};
+
+    for (int i = 0; i < 6; ++i) {
+        uint128_t carry = 0;
+        for (int j = 0; j < 6; ++j) {
+            carry += uint128_t(a.limbs[j]) * b.limbs[i] + T[j];
+            T[j] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        T[6] += static_cast<uint64_t>(carry);
+
+        uint64_t m = T[0] * FQ_P_INV64_VAL;
+
+        carry = uint128_t(T[0]) + uint128_t(m) * FQ_MOD[0];
+        carry >>= 64;
+
+        for (int j = 1; j < 6; ++j) {
+            carry += uint128_t(T[j]) + uint128_t(m) * FQ_MOD[j];
+            T[j-1] = static_cast<uint64_t>(carry);
+            carry >>= 64;
+        }
+        carry += T[6];
+        T[5] = static_cast<uint64_t>(carry);
+        T[6] = static_cast<uint64_t>(carry >> 64);
+    }
+
+    FqRef r;
+    for (int i = 0; i < 6; ++i) r.limbs[i] = T[i];
+
+    if (T[6] || fq_geq(r.limbs, FQ_MOD)) {
+        uint128_t borrow = 0;
+        for (int i = 0; i < 6; ++i) {
+            borrow = uint128_t(r.limbs[i]) - FQ_MOD[i] - borrow;
+            r.limbs[i] = static_cast<uint64_t>(borrow);
+            borrow = (borrow >> 64) & 1;
+        }
+    }
+    return r;
+}
+
+inline FqRef fq_sqr_ref(const FqRef& a) { return fq_mul_ref(a, a); }
+
+// ─── Fq Conversions ────────────────────────────────────────────────────────
+
+inline FqRef fq_to_montgomery_ref(const FqRef& a) {
+    FqRef r2;
+    r2.limbs = FQ_R2_MOD_6;
+    return fq_mul_ref(a, r2);
+}
+
+inline FqRef fq_from_montgomery_ref(const FqRef& a) {
+    return fq_mul_ref(a, FqRef::from_u64(1));
+}
+
+// ─── Fq Exponentiation ────────────────────────────────────────────────────
+
+inline FqRef fq_pow_ref(const FqRef& base, const std::array<uint64_t, 6>& exp) {
+    FqRef result;
+    result.limbs = FQ_R_MOD_6;  // Montgomery(1)
+    FqRef b = base;
+    for (int i = 0; i < 6; ++i) {
+        uint64_t bits = exp[i];
+        for (int j = 0; j < 64; ++j) {
+            if (bits & 1) result = fq_mul_ref(result, b);
+            b = fq_sqr_ref(b);
+            bits >>= 1;
+        }
+    }
+    return result;
+}
+
+// ─── Fq Inverse (Fermat) ──────────────────────────────────────────────────
+
+inline FqRef fq_inv_ref(const FqRef& a) {
+    std::array<uint64_t, 6> q_minus_2 = {{
+        0xb9feffffffffaaa9ULL,
+        0x1eabfffeb153ffffULL,
+        0x6730d2a0f6b0f624ULL,
+        0x64774b84f38512bfULL,
+        0x4b1ba7b6434bacd7ULL,
+        0x1a0111ea397fe69aULL
+    }};
+    return fq_pow_ref(a, q_minus_2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fq2 = Fq[u] / (u^2 + 1) CPU Reference
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct Fq2Ref {
+    FqRef c0, c1;  // c0 + c1*u
+
+    static Fq2Ref zero() { return {FqRef::zero(), FqRef::zero()}; }
+    static Fq2Ref one_mont() {
+        FqRef one;
+        one.limbs = FQ_R_MOD_6;
+        return {one, FqRef::zero()};
+    }
+
+    bool operator==(const Fq2Ref& o) const { return c0 == o.c0 && c1 == o.c1; }
+    bool operator!=(const Fq2Ref& o) const { return !(*this == o); }
+};
+
+inline Fq2Ref fq2_add_ref(const Fq2Ref& a, const Fq2Ref& b) {
+    return {fq_add_ref(a.c0, b.c0), fq_add_ref(a.c1, b.c1)};
+}
+
+inline Fq2Ref fq2_sub_ref(const Fq2Ref& a, const Fq2Ref& b) {
+    return {fq_sub_ref(a.c0, b.c0), fq_sub_ref(a.c1, b.c1)};
+}
+
+inline Fq2Ref fq2_neg_ref(const Fq2Ref& a) {
+    return {fq_neg_ref(a.c0), fq_neg_ref(a.c1)};
+}
+
+inline Fq2Ref fq2_conjugate_ref(const Fq2Ref& a) {
+    return {a.c0, fq_neg_ref(a.c1)};
+}
+
+inline Fq2Ref fq2_mul_ref(const Fq2Ref& a, const Fq2Ref& b) {
+    FqRef v0 = fq_mul_ref(a.c0, b.c0);
+    FqRef v1 = fq_mul_ref(a.c1, b.c1);
+    FqRef c0 = fq_sub_ref(v0, v1);
+    FqRef a01 = fq_add_ref(a.c0, a.c1);
+    FqRef b01 = fq_add_ref(b.c0, b.c1);
+    FqRef c1 = fq_mul_ref(a01, b01);
+    c1 = fq_sub_ref(c1, v0);
+    c1 = fq_sub_ref(c1, v1);
+    return {c0, c1};
+}
+
+inline Fq2Ref fq2_sqr_ref(const Fq2Ref& a) {
+    FqRef apb = fq_add_ref(a.c0, a.c1);
+    FqRef amb = fq_sub_ref(a.c0, a.c1);
+    FqRef c0 = fq_mul_ref(apb, amb);
+    FqRef ab = fq_mul_ref(a.c0, a.c1);
+    FqRef c1 = fq_add_ref(ab, ab);
+    return {c0, c1};
+}
+
+inline Fq2Ref fq2_mul_by_nonresidue_ref(const Fq2Ref& a) {
+    return {fq_sub_ref(a.c0, a.c1), fq_add_ref(a.c0, a.c1)};
+}
+
+inline FqRef fq2_norm_ref(const Fq2Ref& a) {
+    return fq_add_ref(fq_sqr_ref(a.c0), fq_sqr_ref(a.c1));
+}
+
+inline Fq2Ref fq2_inv_ref(const Fq2Ref& a) {
+    FqRef n = fq2_norm_ref(a);
+    FqRef n_inv = fq_inv_ref(n);
+    return {fq_mul_ref(a.c0, n_inv), fq_mul_ref(fq_neg_ref(a.c1), n_inv)};
+}
+
+// =============================================================================
+// BLS12-381 G1 Elliptic Curve CPU Reference (Affine coordinates)
+// Curve: y^2 = x^3 + 4 over Fq
+// All field values in Montgomery form.
+// =============================================================================
+
+// G1 generator (standard form, for conversion to Montgomery)
+static constexpr std::array<uint64_t, 6> G1_GEN_X_STD = {{
+    0xfb3af00adb22c6bbULL, 0x6c55e83ff97a1aefULL,
+    0xa14e3a3f171bac58ULL, 0xc3688c4f9774b905ULL,
+    0x2695638c4fa9ac0fULL, 0x17f1d3a73197d794ULL
+}};
+static constexpr std::array<uint64_t, 6> G1_GEN_Y_STD = {{
+    0x0caa232946c5e7e1ULL, 0xd03cc744a2888ae4ULL,
+    0x00db18cb2c04b3edULL, 0xfcf5e095d5d00af6ULL,
+    0xa09e30ed741d8ae4ULL, 0x08b3f481e3aaa0f1ULL
+}};
+
+// G2 generator (standard form)
+static constexpr std::array<uint64_t, 6> G2_GEN_X_C0_STD = {{
+    0xd48056c8c121bdb8ULL, 0x0bac0326a805bbefULL,
+    0xb4510b647ae3d177ULL, 0xc6e47ad4fa403b02ULL,
+    0x260805272dc51051ULL, 0x024aa2b2f08f0a91ULL
+}};
+static constexpr std::array<uint64_t, 6> G2_GEN_X_C1_STD = {{
+    0xe5ac7d055d042b7eULL, 0x334cf11213945d57ULL,
+    0xb5da61bbdc7f5049ULL, 0x596bd0d09920b61aULL,
+    0x7dacd3a088274f65ULL, 0x13e02b6052719f60ULL
+}};
+static constexpr std::array<uint64_t, 6> G2_GEN_Y_C0_STD = {{
+    0xe193548608b82801ULL, 0x923ac9cc3baca289ULL,
+    0x6d429a695160d12cULL, 0xadfd9baa8cbdd3a7ULL,
+    0x8cc9cdc6da2e351aULL, 0x0ce5d527727d6e11ULL
+}};
+static constexpr std::array<uint64_t, 6> G2_GEN_Y_C1_STD = {{
+    0xaaa9075ff05f79beULL, 0x3f370d275cec1da1ULL,
+    0x267492ab572e99abULL, 0xcb3e287e85a763afULL,
+    0x32acd2b02bc28b99ULL, 0x0606c4a02ea734ccULL
+}};
+
+struct G1AffineRef {
+    FqRef x, y;
+    bool infinity;
+
+    static G1AffineRef point_at_infinity() {
+        return {FqRef::zero(), FqRef::zero(), true};
+    }
+
+    static G1AffineRef generator() {
+        FqRef gx, gy;
+        gx.limbs = G1_GEN_X_STD;
+        gy.limbs = G1_GEN_Y_STD;
+        return {fq_to_montgomery_ref(gx), fq_to_montgomery_ref(gy), false};
+    }
+
+    bool operator==(const G1AffineRef& o) const {
+        if (infinity && o.infinity) return true;
+        if (infinity != o.infinity) return false;
+        return x == o.x && y == o.y;
+    }
+};
+
+inline G1AffineRef g1_double_ref(const G1AffineRef& p) {
+    if (p.infinity) return p;
+    if (p.y == FqRef::zero()) return G1AffineRef::point_at_infinity();
+
+    FqRef x2 = fq_sqr_ref(p.x);
+    FqRef three_x2 = fq_add_ref(x2, fq_add_ref(x2, x2));
+    FqRef two_y = fq_add_ref(p.y, p.y);
+    FqRef lam = fq_mul_ref(three_x2, fq_inv_ref(two_y));
+
+    FqRef rx = fq_sub_ref(fq_sqr_ref(lam), fq_add_ref(p.x, p.x));
+    FqRef ry = fq_sub_ref(fq_mul_ref(lam, fq_sub_ref(p.x, rx)), p.y);
+    return {rx, ry, false};
+}
+
+inline G1AffineRef g1_add_ref(const G1AffineRef& p, const G1AffineRef& q) {
+    if (p.infinity) return q;
+    if (q.infinity) return p;
+    if (p.x == q.x) {
+        if (p.y == q.y) return g1_double_ref(p);
+        return G1AffineRef::point_at_infinity();
+    }
+
+    FqRef lam = fq_mul_ref(fq_sub_ref(q.y, p.y), fq_inv_ref(fq_sub_ref(q.x, p.x)));
+    FqRef rx = fq_sub_ref(fq_sub_ref(fq_sqr_ref(lam), p.x), q.x);
+    FqRef ry = fq_sub_ref(fq_mul_ref(lam, fq_sub_ref(p.x, rx)), p.y);
+    return {rx, ry, false};
+}
+
+inline G1AffineRef g1_negate_ref(const G1AffineRef& p) {
+    if (p.infinity) return p;
+    return {p.x, fq_neg_ref(p.y), false};
+}
+
+inline G1AffineRef g1_scalar_mul_ref(const G1AffineRef& p, const uint32_t scalar[8]) {
+    G1AffineRef result = G1AffineRef::point_at_infinity();
+    G1AffineRef base = p;
+    for (int i = 0; i < 8; ++i) {
+        uint32_t bits = scalar[i];
+        for (int j = 0; j < 32; ++j) {
+            if (bits & 1) result = g1_add_ref(result, base);
+            base = g1_double_ref(base);
+            bits >>= 1;
+        }
+    }
+    return result;
+}
+
+inline bool g1_is_on_curve_ref(const G1AffineRef& p) {
+    if (p.infinity) return true;
+    FqRef y2 = fq_sqr_ref(p.y);
+    FqRef x3 = fq_mul_ref(fq_sqr_ref(p.x), p.x);
+    FqRef b = fq_to_montgomery_ref(FqRef::from_u64(4));
+    return y2 == fq_add_ref(x3, b);
+}
+
+// =============================================================================
+// BLS12-381 G2 Elliptic Curve CPU Reference (Affine over Fq2)
+// Curve: y^2 = x^3 + 4(1+u) (sextic twist)
+// =============================================================================
+
+struct G2AffineRef {
+    Fq2Ref x, y;
+    bool infinity;
+
+    static G2AffineRef point_at_infinity() {
+        return {Fq2Ref::zero(), Fq2Ref::zero(), true};
+    }
+
+    static G2AffineRef generator() {
+        FqRef xc0, xc1, yc0, yc1;
+        xc0.limbs = G2_GEN_X_C0_STD;
+        xc1.limbs = G2_GEN_X_C1_STD;
+        yc0.limbs = G2_GEN_Y_C0_STD;
+        yc1.limbs = G2_GEN_Y_C1_STD;
+        Fq2Ref gx = {fq_to_montgomery_ref(xc0), fq_to_montgomery_ref(xc1)};
+        Fq2Ref gy = {fq_to_montgomery_ref(yc0), fq_to_montgomery_ref(yc1)};
+        return {gx, gy, false};
+    }
+
+    bool operator==(const G2AffineRef& o) const {
+        if (infinity && o.infinity) return true;
+        if (infinity != o.infinity) return false;
+        return x == o.x && y == o.y;
+    }
+};
+
+inline G2AffineRef g2_double_ref(const G2AffineRef& p) {
+    if (p.infinity) return p;
+    if (p.y == Fq2Ref::zero()) return G2AffineRef::point_at_infinity();
+
+    Fq2Ref x2 = fq2_sqr_ref(p.x);
+    Fq2Ref three_x2 = fq2_add_ref(x2, fq2_add_ref(x2, x2));
+    Fq2Ref two_y = fq2_add_ref(p.y, p.y);
+    Fq2Ref lam = fq2_mul_ref(three_x2, fq2_inv_ref(two_y));
+
+    Fq2Ref rx = fq2_sub_ref(fq2_sqr_ref(lam), fq2_add_ref(p.x, p.x));
+    Fq2Ref ry = fq2_sub_ref(fq2_mul_ref(lam, fq2_sub_ref(p.x, rx)), p.y);
+    return {rx, ry, false};
+}
+
+inline G2AffineRef g2_add_ref(const G2AffineRef& p, const G2AffineRef& q) {
+    if (p.infinity) return q;
+    if (q.infinity) return p;
+    if (p.x == q.x) {
+        if (p.y == q.y) return g2_double_ref(p);
+        return G2AffineRef::point_at_infinity();
+    }
+
+    Fq2Ref lam = fq2_mul_ref(fq2_sub_ref(q.y, p.y), fq2_inv_ref(fq2_sub_ref(q.x, p.x)));
+    Fq2Ref rx = fq2_sub_ref(fq2_sub_ref(fq2_sqr_ref(lam), p.x), q.x);
+    Fq2Ref ry = fq2_sub_ref(fq2_mul_ref(lam, fq2_sub_ref(p.x, rx)), p.y);
+    return {rx, ry, false};
+}
+
+inline G2AffineRef g2_negate_ref(const G2AffineRef& p) {
+    if (p.infinity) return p;
+    return {p.x, fq2_neg_ref(p.y), false};
+}
+
+inline G2AffineRef g2_scalar_mul_ref(const G2AffineRef& p, const uint32_t scalar[8]) {
+    G2AffineRef result = G2AffineRef::point_at_infinity();
+    G2AffineRef base = p;
+    for (int i = 0; i < 8; ++i) {
+        uint32_t bits = scalar[i];
+        for (int j = 0; j < 32; ++j) {
+            if (bits & 1) result = g2_add_ref(result, base);
+            base = g2_double_ref(base);
+            bits >>= 1;
+        }
+    }
+    return result;
+}
+
+inline bool g2_is_on_curve_ref(const G2AffineRef& p) {
+    if (p.infinity) return true;
+    Fq2Ref y2 = fq2_sqr_ref(p.y);
+    Fq2Ref x3 = fq2_mul_ref(fq2_sqr_ref(p.x), p.x);
+    FqRef b4 = fq_to_montgomery_ref(FqRef::from_u64(4));
+    Fq2Ref b_prime = {b4, b4};
+    return y2 == fq2_add_ref(x3, b_prime);
+}
+
+// ─── Polynomial Operations (CPU reference) ──────────────────────────────────
+
+// Coset scale: data[i] *= g^i (Montgomery form in/out)
+inline void coset_scale_ref(std::vector<FpRef>& data, size_t n, const FpRef& g_mont) {
+    FpRef one;
+    one.limbs = R_MOD;  // Montgomery(1)
+    FpRef g_pow = one;
+    for (size_t i = 0; i < n; ++i) {
+        data[i] = fp_mul(data[i], g_pow);
+        g_pow = fp_mul(g_pow, g_mont);
+    }
+}
+
+// Coset unscale: data[i] *= g^{-i} (Montgomery form in/out)
+inline void coset_unscale_ref(std::vector<FpRef>& data, size_t n, const FpRef& g_mont) {
+    FpRef g_inv = fp_inv(g_mont);
+    FpRef one;
+    one.limbs = R_MOD;
+    FpRef g_inv_pow = one;
+    for (size_t i = 0; i < n; ++i) {
+        data[i] = fp_mul(data[i], g_inv_pow);
+        g_inv_pow = fp_mul(g_inv_pow, g_inv);
+    }
+}
+
+// Coset NTT forward: scale by g^i then NTT
+inline void coset_ntt_forward_ref(std::vector<FpRef>& data, size_t n, const FpRef& g_mont) {
+    coset_scale_ref(data, n, g_mont);
+    ntt_forward_reference(data, n);
+}
+
+// Coset NTT inverse: INTT then unscale by g^{-i}
+inline void coset_ntt_inverse_ref(std::vector<FpRef>& data, size_t n, const FpRef& g_mont) {
+    ntt_inverse_reference(data, n);
+    coset_unscale_ref(data, n, g_mont);
+}
+
+// Pointwise multiply: c[i] = a[i] * b[i] (Montgomery form)
+inline void pointwise_mul_ref(std::vector<FpRef>& c,
+                              const std::vector<FpRef>& a,
+                              const std::vector<FpRef>& b, size_t n) {
+    c.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        c[i] = fp_mul(a[i], b[i]);
+    }
+}
+
+// Pointwise multiply-subtract: out[i] = a[i]*b[i] - c[i] (Montgomery form)
+inline void pointwise_mul_sub_ref(std::vector<FpRef>& out,
+                                  const std::vector<FpRef>& a,
+                                  const std::vector<FpRef>& b,
+                                  const std::vector<FpRef>& c, size_t n) {
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = fp_sub(fp_mul(a[i], b[i]), c[i]);
+    }
+}
+
 } // namespace ff_ref

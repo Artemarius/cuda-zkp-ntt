@@ -1,10 +1,11 @@
-# NTT Optimization Roadmap — Future Releases
+# NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v1.6.0)
+## Current State (v2.0.0)
 
 **BLS12-381 (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
 **Previous target:** ≤20 ms — **exceeded** (15.5 ms = −38% vs v1.1.0's 25.2 ms)
+**v2.0.0:** Groth16 GPU primitives (Fq/Fq2, G1/G2, MSM, poly ops, end-to-end prover). 621 tests.
 
 ### Where Time Goes (n=2^22, v1.5.0 — 3 kernel launches)
 
@@ -1453,6 +1454,63 @@ Session 12's L2 diagnostic determines whether outer stages are latency-bound (St
 helps) or bandwidth-bound (Stockham doesn't help). This is the most expensive optimization
 remaining (~2 weeks) and carries medium-high risk. The diagnostic costs 1 hour of profiling
 and saves potentially 2 weeks of wasted effort.
+
+---
+
+## v2.0.0 — Groth16 GPU Primitives Library (COMPLETE)
+
+**Goal:** Add all remaining GPU-accelerated building blocks for Groth16 proving,
+culminating in a toy end-to-end proof generation pipeline.
+
+**Sessions 20-25 (6 sessions), completed 2026-03-12.**
+
+### New Primitives
+
+| Session | Component | Files | Tests |
+|---------|-----------|-------|-------|
+| 20 | Fq (381-bit) + Fq2 field arithmetic | `ff_fq.cuh`, `ff_fq2.cuh`, `ff_fq_kernels.cu` | 85 |
+| 21 | G1 + G2 elliptic curve ops (Jacobian) | `ec_g1.cuh`, `ec_g2.cuh`, `ec_kernels.cu` | 38 |
+| 22 | MSM (Pippenger's bucket method, G1) | `msm.cuh`, `msm.cu` | 21 |
+| 23 | Polynomial ops (coset NTT, pointwise) | `poly_ops.cuh`, `poly_ops.cu` | 15 |
+| 24 | Groth16 pipeline (toy circuit) | `groth16.cuh`, `groth16.cu` | 29 |
+| 25 | Benchmark + profiling + release | `bench_msm.cu`, `bench_groth16.cu` | — |
+| **Total** | | **13 new files** | **150 new (621 total)** |
+
+### Toy Circuit: x^3 + x + 5 = y
+
+- 6 variables: [1, x, y, v1=x*x, v2=v1*x, v3=v2+x]
+- 4 R1CS constraints, padded to domain_size=256 for NTT
+- GPU pipeline: R1CS×witness → INTT → coset NTT → pointwise (A*B-C)/(g^n-1) → coset INTT → EC assembly
+- Proof: π_A ∈ G1, π_B ∈ G2, π_C ∈ G1
+- GPU proof matches CPU proof bitwise (cross-validated)
+
+### Benchmark Results (RTX 3060 Laptop, 7-rep median)
+
+**MSM (Pippenger):**
+
+| Size | Latency (ms) | Throughput (pts/ms) |
+|------|-------------|---------------------|
+| 2^10 | 261 | 3.9 |
+| 2^14 | 2,697 | 6.1 |
+| 2^18 | 42,603 | 6.2 |
+
+Implementation is correctness-focused (single-thread bucket reduction + window combination).
+Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
+
+**Groth16 Pipeline (n=256, x=3):**
+- Trusted setup: ~5.4 seconds (CPU EC scalar multiplications)
+- Proof generation: ~5.2 seconds (dominated by CPU EC assembly, not GPU compute)
+- GPU/CPU ratio ≈ 1.0 (toy circuit too small for GPU advantage — GPU NTT/coset ops < 1 ms)
+
+### Key Technical Decisions
+
+- **CUB + RDC workaround**: MSM compiled as separate `msm_lib` with `CUDA_SEPARABLE_COMPILATION OFF`
+  (same pattern as ntt_fused_lib) to avoid CUB `__fatbinwrap` unresolved externals
+- **CPU-side Montgomery**: Host functions in .cu files use `ff_reference.h` FpRef for field conversions
+  (avoids `__device__`-only ff_to_montgomery on host)
+- **Coset generator g=7**: Standard choice for BLS12-381 Fr
+- **Simplified π_C**: Omits r*B_g1 term (both GPU and CPU use same formula for cross-validation)
+- **No pairing verification**: Documented as future work
 
 ---
 

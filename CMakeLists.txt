@@ -57,23 +57,38 @@ set_target_properties(ntt_fused_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
+# ─── MSM Library (NO RDC) ───────────────────────────────────────────────────
+# CUB DeviceRadixSort templates create fatbin entries that conflict with RDC
+# device-link step. All EC device functions are __device__ __forceinline__
+# in headers — no cross-TU device linkage needed.
+add_library(msm_lib STATIC
+    src/msm.cu
+)
+set_target_properties(msm_lib PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
 # ─── Core Library ─────────────────────────────────────────────────────────────
 # Finite-field arithmetic and NTT kernels compiled as a static library
 add_library(zkp_ntt_core STATIC
     src/ff_mul.cu
     src/ff_multi_field.cu
+    src/ff_fq_kernels.cu
     src/ntt_naive.cu
     src/ntt_optimized.cu
     src/ntt_async.cu
     src/ntt_4step.cu
     src/ntt_goldilocks.cu
     src/ntt_babybear.cu
+    src/ec_kernels.cu
+    src/poly_ops.cu
+    src/groth16.cu
 )
 set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
-# Link fused kernel library (compiled without RDC)
-target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib)
+# Link fused kernel library and MSM library (both compiled without RDC)
+target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib msm_lib)
 # ntt_naive.cu uses ff_reference.h for CPU-side twiddle computation
 target_include_directories(zkp_ntt_core PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
@@ -113,6 +128,26 @@ set_target_properties(bench_multifield PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# ─── MSM Benchmark ───────────────────────────────────────────────────────────
+add_executable(bench_msm
+    benchmarks/bench_msm.cu
+)
+target_link_libraries(bench_msm PRIVATE zkp_ntt_core)
+set_target_properties(bench_msm PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ─── Groth16 Pipeline Benchmark ─────────────────────────────────────────────
+add_executable(bench_groth16
+    benchmarks/bench_groth16.cu
+)
+target_link_libraries(bench_groth16 PRIVATE zkp_ntt_core)
+set_target_properties(bench_groth16 PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+# groth16.cu uses ff_reference.h for CPU-side arithmetic
+target_include_directories(bench_groth16 PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # ─── Clean Profiling Binary ───────────────────────────────────────────────────
 # Minimal binary with command-line mode/size args for Nsight Compute
 add_executable(ntt_profile
@@ -136,6 +171,8 @@ message(STATUS "  Targets:")
 message(STATUS "    test_correctness  — NTT correctness validation")
 message(STATUS "    bench_ntt         — Google Benchmark harness")
 message(STATUS "    bench_multifield  — 3-field NTT benchmark (BLS/GL/BB)")
+message(STATUS "    bench_msm         — MSM (Pippenger) benchmark")
+message(STATUS "    bench_groth16     — Groth16 pipeline benchmark")
 message(STATUS "    ff_microbench     — Finite-field op throughput")
 message(STATUS "    ntt_profile       — Clean binary for Nsight Compute")
 message(STATUS "==========================================")

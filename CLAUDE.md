@@ -2,19 +2,18 @@
 
 ## Project Identity
 
-GPU-accelerated Number-Theoretic Transform for Zero-Knowledge Proofs.
-Targeting BLS12-381 ZKP proof generation on NVIDIA GPUs, with multi-field comparison planned.
+GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
+Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
+polynomial operations, and end-to-end Groth16 toy prover.
 
-- **Completed**: Fused radix-1024 inner kernel + radix-8 Montgomery / radix-4 Barrett
-  cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs
-- **OTF twiddles**: NEGATIVE RESULT for BLS12-381 (56.9ms vs 15.6ms precomputed at 2^22).
-  Infrastructure retained for future multi-field work (smaller fields where mul is cheap).
-- **v1.6.0**: Goldilocks (64-bit) + BabyBear (31-bit) full NTT + 3-way benchmark complete.
-  At n=2^22: BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x faster), BabyBear 2.4ms (6.2x faster).
-  458 tests. Speedup converges at large sizes (outer stages memory-bound, not arithmetic-bound).
-- **v1.7.0**: Plantard reduction — **NEGATIVE RESULT** (944 SASS, +79% vs Montgomery 528).
-  Plantard's advantage (eliminating one big-int multiply) only applies to word-size moduli.
-  For 256-bit BLS12-381, the z×μ step (512×512 schoolbook) costs 136 MADs alone. 471 tests.
+- **v2.0.0** (current): Groth16 GPU primitives — Fq/Fq2 381-bit field arithmetic,
+  G1/G2 elliptic curve ops (Jacobian), GPU MSM (Pippenger's bucket method),
+  polynomial ops (coset NTT, pointwise), end-to-end toy prover for x^3+x+5=y.
+  621 tests. GPU proof matches CPU proof bitwise.
+- **NTT (v1.x)**: Fused radix-1024 inner kernel + radix-8 Montgomery / radix-4 Barrett
+  cooperative outer stages + branchless arithmetic + batched NTT + async pipeline + CUDA Graphs.
+  At n=2^22: BLS12-381 15.1ms, Goldilocks 3.6ms (4.2x), BabyBear 2.4ms (6.2x).
+- **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%).
 
 ---
 
@@ -44,8 +43,11 @@ cmake --build build --target bench_ntt -j$(nproc)
 ```
 
 CMake targets:
-- `test_correctness` — validates NTT output against CPU reference
+- `test_correctness` — validates all primitives (NTT, EC, MSM, poly ops, Groth16)
 - `bench_ntt` — Google Benchmark harness, outputs CSV
+- `bench_multifield` — 3-field NTT benchmark (BLS/Goldilocks/BabyBear, JSON output)
+- `bench_msm` — MSM (Pippenger) benchmark at various sizes
+- `bench_groth16` — Groth16 pipeline benchmark with phase breakdown
 - `ff_microbench` — standalone finite-field operation microbenchmark
 - `ntt_profile` — minimal binary for clean Nsight Compute profiling
 
@@ -89,6 +91,22 @@ CMake targets:
   - BLS12-381: `FpRef` (4×uint64_t Montgomery), Barrett reduction
   - Goldilocks: `GlRef` (uint64_t), NTT reference
   - BabyBear: `BbRef` (uint32_t), NTT reference
+- BLS12-381 base field Fq (381-bit, 12×uint32 Montgomery): `include/ff_fq.cuh`
+  - CIOS multiplication (12 limbs, 144 MADs), add/sub/mul/sqr/inv/neg
+  - Fq2 quadratic extension: `include/ff_fq2.cuh` (Karatsuba, 3 Fq muls per Fq2 mul)
+- Elliptic curve G1/G2: `include/ec_g1.cuh`, `include/ec_g2.cuh`
+  - Jacobian projective coordinates, affine conversion, on-curve check, scalar_mul
+  - G1 over Fq (curve: y^2 = x^3 + 4), G2 over Fq2 (curve: y^2 = x^3 + 4(1+u))
+- GPU MSM (Pippenger): `include/msm.cuh`, `src/msm.cu`
+  - Window decomposition → CUB radix sort → bucket accumulation → running sum → Horner combination
+  - Separate TU without RDC (CUB compatibility)
+- Polynomial ops: `include/poly_ops.cuh`, `src/poly_ops.cu`
+  - Coset NTT: scale by g^i → regular NTT (coset generator g=7)
+  - Pointwise mul, mul_sub, scale kernels
+- Groth16 prover: `include/groth16.cuh`, `src/groth16.cu`
+  - Toy circuit x^3+x+5=y (4 R1CS constraints, 6 variables, domain_size=256)
+  - Pipeline: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
+  - GPU proof matches CPU proof bitwise (cross-validated)
 
 ### NTT
 - BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -122,12 +140,20 @@ include/
   ntt.cuh             — NTT public interface (single + batched + graph, NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
   ntt_goldilocks.cuh  — Goldilocks NTT public interface (forward/inverse, single/batched)
   ntt_babybear.cuh    — BabyBear NTT public interface (forward/inverse, single/batched)
+  ff_fq.cuh           — BLS12-381 base field Fq (381-bit, 12×uint32 Montgomery)
+  ff_fq2.cuh          — Fq2 quadratic extension (Karatsuba, 3 Fq muls)
+  ec_g1.cuh           — G1 elliptic curve ops (Jacobian, affine, scalar_mul)
+  ec_g2.cuh           — G2 elliptic curve ops (over Fq2)
+  msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
+  poly_ops.cuh        — Polynomial ops (coset NTT, pointwise mul/sub, scale)
+  groth16.cuh         — Groth16 prover API (R1CS, ProvingKey, Proof)
   pipeline.cuh        — AsyncNTTPipeline class interface
   twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
 src/
   ff_mul.cu           — FF kernels: baseline AoS, v2 branchless (PTX), SoA variants
   ff_multi_field.cu   — Goldilocks + BabyBear GPU throughput kernels (add/sub/mul/sqr)
+  ff_fq_kernels.cu    — Fq/Fq2 GPU throughput kernels
   ntt_naive.cu        — Radix-2 NTT baseline + public API dispatch + twiddle caches + CUDA Graph cache
   ntt_optimized.cu    — NTT host dispatch: K selection, cooperative outer (Montgomery + Barrett)
   ntt_fused_kernels.cu — Fused warp-shuffle + shmem kernel (K=8/9/10, Montgomery + Barrett, no-RDC TU)
@@ -135,15 +161,21 @@ src/
   ntt_async.cu        — Double-buffered async pipeline NTT
   ntt_goldilocks.cu   — Goldilocks NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
   ntt_babybear.cu     — BabyBear NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
+  ec_kernels.cu       — G1/G2 GPU test kernels
+  msm.cu              — Pippenger MSM (separate TU, no RDC — CUB compatibility)
+  poly_ops.cu         — Coset NTT, pointwise mul/sub/scale kernels
+  groth16.cu          — Groth16 prover: trusted setup + GPU/CPU proof generation
   benchmark.cu        — Main benchmark entry point
 
 tests/
   test_correctness.cu — Validates all NTT variants agree with CPU DFT reference
-  ff_reference.h      — CPU-only finite field + NTT reference (test oracle)
+  ff_reference.h      — CPU-only finite field + NTT + EC reference (test oracle)
 
 benchmarks/
   bench_ntt.cu        — Google Benchmark: latency vs scale for all variants
   bench_multifield.cu — 3-way NTT benchmark: BLS12-381 vs Goldilocks vs BabyBear (JSON output)
+  bench_msm.cu        — MSM (Pippenger) benchmark at various sizes
+  bench_groth16.cu    — Groth16 pipeline benchmark with phase breakdown
   ff_microbench.cu    — Instruction throughput: FF_add, FF_mul, FF_sqr isolated
 
 profiling/
@@ -156,11 +188,13 @@ profiling/
 results/
   screenshots/        — Nsight Compute roofline, warp stall charts (PNG)
   charts/             — Generated benchmark comparison charts (matplotlib)
-  data/               — Benchmark CSV files
-  analysis.md         — Annotated interpretation of profiling results
+  data/               — Benchmark CSV/JSON files
+  analysis.md         — Annotated interpretation of profiling results (v1.x)
+  analysis_v200.md    — v2.0.0 performance analysis (MSM, Groth16)
 
 scripts/
-  plot_benchmarks.py  — Generate benchmark bar charts from measured data
+  plot_benchmarks.py  — Generate v1.x benchmark bar charts from measured data
+  plot_groth16.py     — Generate v2.0.0 charts (MSM scaling, Groth16 pipeline)
 
 .github/
   workflows/
@@ -364,9 +398,9 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 negative result, v1.8.0 Stockham cancelled).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.2.0-v1.6.0 complete, v1.7.0 negative result, v1.8.0 Stockham cancelled, v2.0.0 Groth16 complete).
 
-Phases 1-8 complete. Current version: **v1.6.0** released.
+Phases 1-8 complete. Current version: **v2.0.0** released.
 
 ### Completed Releases
 - **v1.0.0** — [Released on GitHub](https://github.com/Artemarius/cuda-zkp-ntt/releases/tag/v1.0.0). Fused radix-1024 + cooperative outer + async pipeline.
@@ -381,6 +415,10 @@ Phases 1-8 complete. Current version: **v1.6.0** released.
 - **v1.7.0** — Plantard reduction: **negative result**. 944 SASS (+79% vs Montgomery 528) for BLS12-381.
   Plantard's advantage (eliminating one multiply) only applies to word-size moduli (32/64-bit).
   NTT integration cancelled. 471 tests.
+- **v2.0.0** — Groth16 GPU primitives library. End-to-end toy prover for x^3+x+5=y connecting
+  NTT, coset NTT, MSM (Pippenger), and EC arithmetic. New primitives: Fq (381-bit) + Fq2 field
+  arithmetic, G1/G2 elliptic curve ops (Jacobian), GPU MSM, polynomial operations (coset NTT,
+  pointwise mul/sub), Groth16 pipeline. 621 tests (150 new). GPU proof matches CPU proof bitwise.
 
 ---
 

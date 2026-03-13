@@ -5,6 +5,13 @@
 #include "ff_arithmetic.cuh"
 #include "ff_goldilocks.cuh"
 #include "ff_babybear.cuh"
+#include "ff_fq.cuh"
+#include "ff_fq2.cuh"
+#include "ec_g1.cuh"
+#include "ec_g2.cuh"
+#include "msm.cuh"
+#include "poly_ops.cuh"
+#include "groth16.cuh"
 #include "ntt.cuh"
 #include "ntt_goldilocks.cuh"
 #include "ntt_babybear.cuh"
@@ -37,6 +44,32 @@ extern __global__ void ff_mul_v2_kernel(const FpElement* __restrict__ a, const F
 extern __global__ void ff_add_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sub_v2_kernel(const FpElement* __restrict__ a, const FpElement* __restrict__ b, FpElement* __restrict__ out, uint32_t n);
 extern __global__ void ff_sqr_v2_kernel(const FpElement* __restrict__ a, FpElement* __restrict__ out, uint32_t n);
+
+// Fq (base field) kernel declarations
+extern __global__ void fq_add_kernel(const FqElement* __restrict__ a, const FqElement* __restrict__ b, FqElement* __restrict__ out, uint32_t n);
+extern __global__ void fq_sub_kernel(const FqElement* __restrict__ a, const FqElement* __restrict__ b, FqElement* __restrict__ out, uint32_t n);
+extern __global__ void fq_mul_kernel(const FqElement* __restrict__ a, const FqElement* __restrict__ b, FqElement* __restrict__ out, uint32_t n);
+extern __global__ void fq_sqr_kernel(const FqElement* __restrict__ a, FqElement* __restrict__ out, uint32_t n);
+
+// Fq2 (extension field) kernel declarations
+extern __global__ void fq2_add_kernel(const Fq2Element* __restrict__ a, const Fq2Element* __restrict__ b, Fq2Element* __restrict__ out, uint32_t n);
+extern __global__ void fq2_sub_kernel(const Fq2Element* __restrict__ a, const Fq2Element* __restrict__ b, Fq2Element* __restrict__ out, uint32_t n);
+extern __global__ void fq2_mul_kernel(const Fq2Element* __restrict__ a, const Fq2Element* __restrict__ b, Fq2Element* __restrict__ out, uint32_t n);
+extern __global__ void fq2_sqr_kernel(const Fq2Element* __restrict__ a, Fq2Element* __restrict__ out, uint32_t n);
+
+// EC kernel declarations (defined in src/ec_kernels.cu)
+extern __global__ void g1_double_kernel(const G1Jacobian* __restrict__ in, G1Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g1_add_kernel(const G1Jacobian* __restrict__ a, const G1Jacobian* __restrict__ b, G1Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g1_add_mixed_kernel(const G1Jacobian* __restrict__ a, const G1Affine* __restrict__ b, G1Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g1_scalar_mul_kernel(const G1Jacobian* __restrict__ bases, const uint32_t* __restrict__ scalars, G1Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g1_to_affine_kernel(const G1Jacobian* __restrict__ in, G1Affine* __restrict__ out, uint32_t n);
+extern __global__ void g1_is_on_curve_kernel(const G1Affine* __restrict__ pts, bool* __restrict__ results, uint32_t n);
+extern __global__ void g2_double_kernel(const G2Jacobian* __restrict__ in, G2Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g2_add_kernel(const G2Jacobian* __restrict__ a, const G2Jacobian* __restrict__ b, G2Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g2_add_mixed_kernel(const G2Jacobian* __restrict__ a, const G2Affine* __restrict__ b, G2Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g2_scalar_mul_kernel(const G2Jacobian* __restrict__ bases, const uint32_t* __restrict__ scalars, G2Jacobian* __restrict__ out, uint32_t n);
+extern __global__ void g2_to_affine_kernel(const G2Jacobian* __restrict__ in, G2Affine* __restrict__ out, uint32_t n);
+extern __global__ void g2_is_on_curve_kernel(const G2Affine* __restrict__ pts, bool* __restrict__ results, uint32_t n);
 
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
@@ -3689,6 +3722,2447 @@ void test_plantard_algebraic() {
     printf("  Associativity: %d/%d\n", pass_assoc, N);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v2.0.0 Session 20: Fq (Base Field) + Fq2 (Extension Field) Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Helper: generate deterministic pseudo-random FqRef in Montgomery form ──
+static ff_ref::FqRef make_fq_test_val(uint64_t seed) {
+    using namespace ff_ref;
+    // Generate a simple value mod q, then convert to Montgomery
+    FqRef v = FqRef::from_u64(seed);
+    return fq_to_montgomery_ref(v);
+}
+
+// ─── Helper: convert FqRef <-> FqElement (GPU format) ───────────────────────
+static FqElement fq_ref_to_gpu(const ff_ref::FqRef& r) {
+    FqElement e;
+    r.to_u32(e.limbs);
+    return e;
+}
+
+static ff_ref::FqRef fq_gpu_to_ref(const FqElement& e) {
+    return ff_ref::FqRef::from_u32(e.limbs);
+}
+
+// ─── Fq CPU Self-Test ──────────────────────────────────────────────────────
+
+void test_fq_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_fq_cpu_self_test...\n");
+
+    FqRef z = FqRef::zero();
+    FqRef one_std = FqRef::from_u64(1);
+    FqRef one = fq_to_montgomery_ref(one_std);
+
+    // Basic identities
+    TEST_ASSERT(fq_add_ref(z, z) == z, "Fq: 0 + 0 = 0");
+    TEST_ASSERT(fq_mul_ref(one, one) == one, "Fq: 1 * 1 = 1");
+
+    FqRef a = fq_to_montgomery_ref(FqRef::from_u64(12345));
+    TEST_ASSERT(fq_add_ref(a, z) == a, "Fq: a + 0 = a");
+    TEST_ASSERT(fq_sub_ref(a, a) == z, "Fq: a - a = 0");
+    TEST_ASSERT(fq_mul_ref(a, one) == a, "Fq: a * 1 = a");
+
+    // Commutativity
+    FqRef b = fq_to_montgomery_ref(FqRef::from_u64(67890));
+    TEST_ASSERT(fq_mul_ref(a, b) == fq_mul_ref(b, a), "Fq: a*b = b*a");
+    TEST_ASSERT(fq_add_ref(a, b) == fq_add_ref(b, a), "Fq: a+b = b+a");
+
+    // Inverse
+    FqRef a_inv = fq_inv_ref(a);
+    TEST_ASSERT(fq_mul_ref(a, a_inv) == one, "Fq: a * a^{-1} = 1");
+
+    // Negation
+    FqRef neg_a = fq_neg_ref(a);
+    TEST_ASSERT(fq_add_ref(a, neg_a) == z, "Fq: a + (-a) = 0");
+    TEST_ASSERT(fq_neg_ref(z) == z, "Fq: -0 = 0");
+
+    // Distributivity: a*(b+c) = a*b + a*c
+    FqRef c = fq_to_montgomery_ref(FqRef::from_u64(99999));
+    FqRef lhs = fq_mul_ref(a, fq_add_ref(b, c));
+    FqRef rhs = fq_add_ref(fq_mul_ref(a, b), fq_mul_ref(a, c));
+    TEST_ASSERT(lhs == rhs, "Fq: a*(b+c) = a*b + a*c");
+
+    // Montgomery roundtrip
+    FqRef val = FqRef::from_u64(42);
+    FqRef mont_val = fq_to_montgomery_ref(val);
+    FqRef back = fq_from_montgomery_ref(mont_val);
+    TEST_ASSERT(back == val, "Fq: from_mont(to_mont(x)) = x");
+
+    // u32 <-> u64 roundtrip
+    uint32_t w[12];
+    a.to_u32(w);
+    FqRef a2 = FqRef::from_u32(w);
+    TEST_ASSERT(a == a2, "Fq: u32/u64 roundtrip");
+}
+
+// ─── Fq GPU Add Test ────────────────────────────────────────────────────────
+
+void test_fq_gpu_add() {
+    using namespace ff_ref;
+    printf("test_fq_gpu_add...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FqElement> h_a(N), h_b(N), h_out(N);
+
+    // Generate test data in Montgomery form
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq_ref_to_gpu(make_fq_test_val(i * 7 + 13));
+        h_b[i] = fq_ref_to_gpu(make_fq_test_val(i * 11 + 37));
+    }
+    // Edge cases: 0+0, (q-like)+1
+    h_a[0] = FqElement::zero(); h_b[0] = FqElement::zero();
+
+    FqElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+
+    fq_add_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FqElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef ra = fq_gpu_to_ref(h_a[i]);
+        FqRef rb = fq_gpu_to_ref(h_b[i]);
+        FqRef expected = fq_add_ref(ra, rb);
+        FqRef got = fq_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq GPU add: all elements match CPU reference");
+    printf("  Fq add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq GPU Sub Test ────────────────────────────────────────────────────────
+
+void test_fq_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_fq_gpu_sub...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FqElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq_ref_to_gpu(make_fq_test_val(i * 7 + 13));
+        h_b[i] = fq_ref_to_gpu(make_fq_test_val(i * 11 + 37));
+    }
+    h_a[0] = FqElement::zero(); h_b[0] = fq_ref_to_gpu(make_fq_test_val(1));
+
+    FqElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+
+    fq_sub_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FqElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef ra = fq_gpu_to_ref(h_a[i]);
+        FqRef rb = fq_gpu_to_ref(h_b[i]);
+        FqRef expected = fq_sub_ref(ra, rb);
+        FqRef got = fq_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq GPU sub: all elements match CPU reference");
+    printf("  Fq sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq GPU Mul Test ────────────────────────────────────────────────────────
+
+void test_fq_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_fq_gpu_mul...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FqElement> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq_ref_to_gpu(make_fq_test_val(i * 123457 + 13));
+        h_b[i] = fq_ref_to_gpu(make_fq_test_val(i * 654321 + 37));
+    }
+    // Edge: 0 * x, 1 * x
+    h_a[0] = FqElement::zero();
+    FqRef one_mont;
+    one_mont.limbs = FQ_R_MOD_6;
+    h_a[1] = fq_ref_to_gpu(one_mont);
+
+    FqElement *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+
+    fq_mul_kernel<<<(N + 255) / 256, 256>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FqElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef ra = fq_gpu_to_ref(h_a[i]);
+        FqRef rb = fq_gpu_to_ref(h_b[i]);
+        FqRef expected = fq_mul_ref(ra, rb);
+        FqRef got = fq_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq GPU mul: all elements match CPU reference");
+    printf("  Fq mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq GPU Sqr Test ────────────────────────────────────────────────────────
+
+void test_fq_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_fq_gpu_sqr...\n");
+
+    const uint32_t N = 1024;
+    std::vector<FqElement> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i)
+        h_a[i] = fq_ref_to_gpu(make_fq_test_val(i * 654321 + 7));
+    h_a[0] = FqElement::zero();
+
+    FqElement *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FqElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FqElement), cudaMemcpyHostToDevice));
+
+    fq_sqr_kernel<<<(N + 255) / 256, 256>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FqElement), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef ra = fq_gpu_to_ref(h_a[i]);
+        FqRef expected = fq_sqr_ref(ra);
+        FqRef got = fq_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq GPU sqr: all elements match CPU reference");
+    printf("  Fq sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq Algebraic Properties Test ──────────────────────────────────────────
+
+void test_fq_algebraic() {
+    using namespace ff_ref;
+    printf("test_fq_algebraic...\n");
+
+    const int N = 256;
+    int pass_comm = 0, pass_assoc = 0, pass_dist = 0;
+
+    for (int i = 0; i < N; ++i) {
+        FqRef a = make_fq_test_val(i * 5 + 1);
+        FqRef b = make_fq_test_val(i * 5 + 2);
+        FqRef c = make_fq_test_val(i * 5 + 3);
+
+        // Commutativity: a*b == b*a
+        if (fq_mul_ref(a, b) == fq_mul_ref(b, a)) ++pass_comm;
+
+        // Associativity: (a*b)*c == a*(b*c)
+        if (fq_mul_ref(fq_mul_ref(a, b), c) == fq_mul_ref(a, fq_mul_ref(b, c))) ++pass_assoc;
+
+        // Distributivity: a*(b+c) == a*b + a*c
+        FqRef lhs = fq_mul_ref(a, fq_add_ref(b, c));
+        FqRef rhs = fq_add_ref(fq_mul_ref(a, b), fq_mul_ref(a, c));
+        if (lhs == rhs) ++pass_dist;
+    }
+    TEST_ASSERT(pass_comm == N, "Fq commutativity failure");
+    TEST_ASSERT(pass_assoc == N, "Fq associativity failure");
+    TEST_ASSERT(pass_dist == N, "Fq distributivity failure");
+    printf("  Comm: %d/%d, Assoc: %d/%d, Dist: %d/%d\n",
+           pass_comm, N, pass_assoc, N, pass_dist, N);
+}
+
+// ─── Fq Montgomery Round-Trip Test ─────────────────────────────────────────
+
+void test_fq_montgomery_roundtrip() {
+    using namespace ff_ref;
+    printf("test_fq_montgomery_roundtrip...\n");
+
+    int pass = 0;
+    const int N = 256;
+    for (int i = 0; i < N; ++i) {
+        FqRef v = FqRef::from_u64(static_cast<uint64_t>(i) * 12345 + 1);
+        FqRef mont = fq_to_montgomery_ref(v);
+        FqRef back = fq_from_montgomery_ref(mont);
+        if (back == v) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Fq Montgomery roundtrip failures");
+    printf("  %d/%d roundtrips passed\n", pass, N);
+}
+
+// ─── Fq2 CPU Self-Test ─────────────────────────────────────────────────────
+
+void test_fq2_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_fq2_cpu_self_test...\n");
+
+    Fq2Ref z = Fq2Ref::zero();
+    Fq2Ref one = Fq2Ref::one_mont();
+
+    // Basic
+    TEST_ASSERT(fq2_add_ref(z, z) == z, "Fq2: 0 + 0 = 0");
+    TEST_ASSERT(fq2_mul_ref(one, one) == one, "Fq2: 1 * 1 = 1");
+
+    // Element with both components
+    FqRef a0 = fq_to_montgomery_ref(FqRef::from_u64(12345));
+    FqRef a1 = fq_to_montgomery_ref(FqRef::from_u64(67890));
+    Fq2Ref a = {a0, a1};
+
+    TEST_ASSERT(fq2_add_ref(a, z) == a, "Fq2: a + 0 = a");
+    TEST_ASSERT(fq2_sub_ref(a, a) == z, "Fq2: a - a = 0");
+    TEST_ASSERT(fq2_mul_ref(a, one) == a, "Fq2: a * 1 = a");
+
+    // Negation
+    Fq2Ref neg_a = fq2_neg_ref(a);
+    TEST_ASSERT(fq2_add_ref(a, neg_a) == z, "Fq2: a + (-a) = 0");
+
+    // Conjugation: a * conj(a) = norm(a) (real)
+    Fq2Ref conj_a = fq2_conjugate_ref(a);
+    Fq2Ref prod = fq2_mul_ref(a, conj_a);
+    FqRef norm = fq2_norm_ref(a);
+    TEST_ASSERT(prod.c0 == norm, "Fq2: a*conj(a) c0 = norm");
+    TEST_ASSERT(prod.c1 == FqRef::zero(), "Fq2: a*conj(a) c1 = 0");
+
+    // Inverse: a * a^{-1} = 1
+    Fq2Ref a_inv = fq2_inv_ref(a);
+    Fq2Ref should_one = fq2_mul_ref(a, a_inv);
+    TEST_ASSERT(should_one == one, "Fq2: a * a^{-1} = 1");
+
+    // Commutativity
+    FqRef b0 = fq_to_montgomery_ref(FqRef::from_u64(11111));
+    FqRef b1 = fq_to_montgomery_ref(FqRef::from_u64(22222));
+    Fq2Ref b = {b0, b1};
+    TEST_ASSERT(fq2_mul_ref(a, b) == fq2_mul_ref(b, a), "Fq2: a*b = b*a");
+
+    // Squaring consistency: sqr(a) == mul(a, a)
+    Fq2Ref sq1 = fq2_sqr_ref(a);
+    Fq2Ref sq2 = fq2_mul_ref(a, a);
+    TEST_ASSERT(sq1 == sq2, "Fq2: sqr(a) == mul(a,a)");
+
+    // mul_by_nonresidue: (a+bu)*(1+u) = (a-b) + (a+b)u
+    Fq2Ref nr = fq2_mul_by_nonresidue_ref(a);
+    FqRef exp_c0 = fq_sub_ref(a.c0, a.c1);
+    FqRef exp_c1 = fq_add_ref(a.c0, a.c1);
+    TEST_ASSERT(nr.c0 == exp_c0, "Fq2: mul_by_nonresidue c0");
+    TEST_ASSERT(nr.c1 == exp_c1, "Fq2: mul_by_nonresidue c1");
+}
+
+// ─── Fq2 GPU Mul Test ──────────────────────────────────────────────────────
+
+void test_fq2_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_fq2_gpu_mul...\n");
+
+    const uint32_t N = 512;
+    std::vector<Fq2Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef a0 = make_fq_test_val(i * 4 + 1);
+        FqRef a1 = make_fq_test_val(i * 4 + 2);
+        FqRef b0 = make_fq_test_val(i * 4 + 3);
+        FqRef b1 = make_fq_test_val(i * 4 + 4);
+        h_a[i].c0 = fq_ref_to_gpu(a0);
+        h_a[i].c1 = fq_ref_to_gpu(a1);
+        h_b[i].c0 = fq_ref_to_gpu(b0);
+        h_b[i].c1 = fq_ref_to_gpu(b1);
+    }
+
+    Fq2Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+
+    fq2_mul_kernel<<<(N + 127) / 128, 128>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq2Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq2Ref ra = {fq_gpu_to_ref(h_a[i].c0), fq_gpu_to_ref(h_a[i].c1)};
+        Fq2Ref rb = {fq_gpu_to_ref(h_b[i].c0), fq_gpu_to_ref(h_b[i].c1)};
+        Fq2Ref expected = fq2_mul_ref(ra, rb);
+        Fq2Ref got = {fq_gpu_to_ref(h_out[i].c0), fq_gpu_to_ref(h_out[i].c1)};
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq2 GPU mul: all elements match CPU reference");
+    printf("  Fq2 mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq2 GPU Add Test ──────────────────────────────────────────────────────
+
+void test_fq2_gpu_add() {
+    using namespace ff_ref;
+    printf("test_fq2_gpu_add...\n");
+
+    const uint32_t N = 512;
+    std::vector<Fq2Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef a0 = make_fq_test_val(i * 4 + 1);
+        FqRef a1 = make_fq_test_val(i * 4 + 2);
+        FqRef b0 = make_fq_test_val(i * 4 + 3);
+        FqRef b1 = make_fq_test_val(i * 4 + 4);
+        h_a[i].c0 = fq_ref_to_gpu(a0);
+        h_a[i].c1 = fq_ref_to_gpu(a1);
+        h_b[i].c0 = fq_ref_to_gpu(b0);
+        h_b[i].c1 = fq_ref_to_gpu(b1);
+    }
+
+    Fq2Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+
+    fq2_add_kernel<<<(N + 127) / 128, 128>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq2Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq2Ref ra = {fq_gpu_to_ref(h_a[i].c0), fq_gpu_to_ref(h_a[i].c1)};
+        Fq2Ref rb = {fq_gpu_to_ref(h_b[i].c0), fq_gpu_to_ref(h_b[i].c1)};
+        Fq2Ref expected = fq2_add_ref(ra, rb);
+        Fq2Ref got = {fq_gpu_to_ref(h_out[i].c0), fq_gpu_to_ref(h_out[i].c1)};
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq2 GPU add: all elements match CPU reference");
+    printf("  Fq2 add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq2 GPU Sub Test ──────────────────────────────────────────────────────
+
+void test_fq2_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_fq2_gpu_sub...\n");
+
+    const uint32_t N = 512;
+    std::vector<Fq2Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef a0 = make_fq_test_val(i * 4 + 1);
+        FqRef a1 = make_fq_test_val(i * 4 + 2);
+        FqRef b0 = make_fq_test_val(i * 4 + 3);
+        FqRef b1 = make_fq_test_val(i * 4 + 4);
+        h_a[i].c0 = fq_ref_to_gpu(a0);
+        h_a[i].c1 = fq_ref_to_gpu(a1);
+        h_b[i].c0 = fq_ref_to_gpu(b0);
+        h_b[i].c1 = fq_ref_to_gpu(b1);
+    }
+
+    Fq2Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+
+    fq2_sub_kernel<<<(N + 127) / 128, 128>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq2Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq2Ref ra = {fq_gpu_to_ref(h_a[i].c0), fq_gpu_to_ref(h_a[i].c1)};
+        Fq2Ref rb = {fq_gpu_to_ref(h_b[i].c0), fq_gpu_to_ref(h_b[i].c1)};
+        Fq2Ref expected = fq2_sub_ref(ra, rb);
+        Fq2Ref got = {fq_gpu_to_ref(h_out[i].c0), fq_gpu_to_ref(h_out[i].c1)};
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq2 GPU sub: all elements match CPU reference");
+    printf("  Fq2 sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq2 GPU Sqr Test ──────────────────────────────────────────────────────
+
+void test_fq2_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_fq2_gpu_sqr...\n");
+
+    const uint32_t N = 512;
+    std::vector<Fq2Element> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        FqRef a0 = make_fq_test_val(i * 3 + 1);
+        FqRef a1 = make_fq_test_val(i * 3 + 2);
+        h_a[i].c0 = fq_ref_to_gpu(a0);
+        h_a[i].c1 = fq_ref_to_gpu(a1);
+    }
+
+    Fq2Element *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq2Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq2Element), cudaMemcpyHostToDevice));
+
+    fq2_sqr_kernel<<<(N + 127) / 128, 128>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq2Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq2Ref ra = {fq_gpu_to_ref(h_a[i].c0), fq_gpu_to_ref(h_a[i].c1)};
+        Fq2Ref expected = fq2_sqr_ref(ra);
+        Fq2Ref got = {fq_gpu_to_ref(h_out[i].c0), fq_gpu_to_ref(h_out[i].c1)};
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq2 GPU sqr: all elements match CPU reference");
+    printf("  Fq2 sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq2 Algebraic Properties Test ─────────────────────────────────────────
+
+void test_fq2_algebraic() {
+    using namespace ff_ref;
+    printf("test_fq2_algebraic...\n");
+
+    const int N = 128;
+    int pass_comm = 0, pass_assoc = 0, pass_dist = 0, pass_sqr = 0;
+
+    for (int i = 0; i < N; ++i) {
+        Fq2Ref a = {make_fq_test_val(i * 6 + 1), make_fq_test_val(i * 6 + 2)};
+        Fq2Ref b = {make_fq_test_val(i * 6 + 3), make_fq_test_val(i * 6 + 4)};
+        Fq2Ref c = {make_fq_test_val(i * 6 + 5), make_fq_test_val(i * 6 + 6)};
+
+        if (fq2_mul_ref(a, b) == fq2_mul_ref(b, a)) ++pass_comm;
+        if (fq2_mul_ref(fq2_mul_ref(a, b), c) == fq2_mul_ref(a, fq2_mul_ref(b, c))) ++pass_assoc;
+
+        Fq2Ref lhs = fq2_mul_ref(a, fq2_add_ref(b, c));
+        Fq2Ref rhs = fq2_add_ref(fq2_mul_ref(a, b), fq2_mul_ref(a, c));
+        if (lhs == rhs) ++pass_dist;
+
+        if (fq2_sqr_ref(a) == fq2_mul_ref(a, a)) ++pass_sqr;
+    }
+    TEST_ASSERT(pass_comm == N, "Fq2 commutativity failure");
+    TEST_ASSERT(pass_assoc == N, "Fq2 associativity failure");
+    TEST_ASSERT(pass_dist == N, "Fq2 distributivity failure");
+    TEST_ASSERT(pass_sqr == N, "Fq2 sqr consistency failure");
+    printf("  Comm: %d/%d, Assoc: %d/%d, Dist: %d/%d, Sqr: %d/%d\n",
+           pass_comm, N, pass_assoc, N, pass_dist, N, pass_sqr, N);
+}
+
+// =============================================================================
+// v2.0.0 Session 21: Elliptic Curve Point Arithmetic Tests
+// =============================================================================
+
+// Helper: make a G1 generator point in Jacobian form on GPU
+static G1Jacobian make_g1_gen_gpu() {
+    G1Jacobian p;
+    for (int i = 0; i < 12; ++i) {
+        p.x.limbs[i] = G1_GEN_X[i];
+        p.y.limbs[i] = G1_GEN_Y[i];
+    }
+    p.z = FqElement::one_mont();
+    return p;
+}
+
+// Helper: make a G1 affine generator on GPU
+static G1Affine make_g1_gen_affine_gpu() {
+    G1Affine p;
+    for (int i = 0; i < 12; ++i) {
+        p.x.limbs[i] = G1_GEN_X[i];
+        p.y.limbs[i] = G1_GEN_Y[i];
+    }
+    p.infinity = false;
+    return p;
+}
+
+// Helper: make a G2 generator point in Jacobian form on GPU
+static G2Jacobian make_g2_gen_gpu() {
+    G2Jacobian p;
+    for (int i = 0; i < 12; ++i) {
+        p.x.c0.limbs[i] = G2_GEN_X_C0[i];
+        p.x.c1.limbs[i] = G2_GEN_X_C1[i];
+        p.y.c0.limbs[i] = G2_GEN_Y_C0[i];
+        p.y.c1.limbs[i] = G2_GEN_Y_C1[i];
+    }
+    p.z = Fq2Element::one_mont();
+    return p;
+}
+
+static G2Affine make_g2_gen_affine_gpu() {
+    G2Affine p;
+    for (int i = 0; i < 12; ++i) {
+        p.x.c0.limbs[i] = G2_GEN_X_C0[i];
+        p.x.c1.limbs[i] = G2_GEN_X_C1[i];
+        p.y.c0.limbs[i] = G2_GEN_Y_C0[i];
+        p.y.c1.limbs[i] = G2_GEN_Y_C1[i];
+    }
+    p.infinity = false;
+    return p;
+}
+
+// Helper: compare G1Affine from GPU with G1AffineRef from CPU
+static bool g1_affine_eq(const G1Affine& gpu, const ff_ref::G1AffineRef& cpu) {
+    if (gpu.infinity && cpu.infinity) return true;
+    if (gpu.infinity != cpu.infinity) return false;
+    ff_ref::FqRef gx = ff_ref::FqRef::from_u32(gpu.x.limbs);
+    ff_ref::FqRef gy = ff_ref::FqRef::from_u32(gpu.y.limbs);
+    return gx == cpu.x && gy == cpu.y;
+}
+
+static bool g2_affine_eq(const G2Affine& gpu, const ff_ref::G2AffineRef& cpu) {
+    if (gpu.infinity && cpu.infinity) return true;
+    if (gpu.infinity != cpu.infinity) return false;
+    ff_ref::FqRef gxc0 = ff_ref::FqRef::from_u32(gpu.x.c0.limbs);
+    ff_ref::FqRef gxc1 = ff_ref::FqRef::from_u32(gpu.x.c1.limbs);
+    ff_ref::FqRef gyc0 = ff_ref::FqRef::from_u32(gpu.y.c0.limbs);
+    ff_ref::FqRef gyc1 = ff_ref::FqRef::from_u32(gpu.y.c1.limbs);
+    return gxc0 == cpu.x.c0 && gxc1 == cpu.x.c1 &&
+           gyc0 == cpu.y.c0 && gyc1 == cpu.y.c1;
+}
+
+// --- G1 CPU self-test ---
+void test_g1_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_g1_cpu_self_test...\n");
+
+    G1AffineRef g = G1AffineRef::generator();
+    TEST_ASSERT(g1_is_on_curve_ref(g), "G1: generator on curve");
+    TEST_ASSERT(G1AffineRef::point_at_infinity().infinity, "G1: infinity flag");
+
+    // 2*G
+    G1AffineRef g2 = g1_double_ref(g);
+    TEST_ASSERT(g1_is_on_curve_ref(g2), "G1: 2G on curve");
+    TEST_ASSERT(!g2.infinity, "G1: 2G not infinity");
+
+    // 3*G = G + 2G
+    G1AffineRef g3 = g1_add_ref(g, g2);
+    TEST_ASSERT(g1_is_on_curve_ref(g3), "G1: 3G on curve");
+
+    // G + (-G) = O
+    G1AffineRef neg_g = g1_negate_ref(g);
+    G1AffineRef should_be_inf = g1_add_ref(g, neg_g);
+    TEST_ASSERT(should_be_inf.infinity, "G1: G + (-G) = O");
+
+    // Scalar mul: 2*G via scalar_mul == double
+    uint32_t scalar_2[8] = {2, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef g2_sm = g1_scalar_mul_ref(g, scalar_2);
+    TEST_ASSERT(g2_sm == g2, "G1: scalar_mul(G, 2) == 2G");
+
+    // Scalar mul: 3*G via scalar_mul == G + 2G
+    uint32_t scalar_3[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef g3_sm = g1_scalar_mul_ref(g, scalar_3);
+    TEST_ASSERT(g3_sm == g3, "G1: scalar_mul(G, 3) == 3G");
+}
+
+// --- G1 GPU double test ---
+void test_g1_gpu_double() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_double...\n");
+
+    const uint32_t N = 1;
+    G1Jacobian h_in = make_g1_gen_gpu();
+
+    G1Jacobian *d_in, *d_out;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_in, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_in, &h_in, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+
+    g1_double_kernel<<<1, 1>>>(d_in, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_aff;
+    CUDA_CHECK(cudaMemcpy(&h_aff, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+
+    G1AffineRef cpu_2g = g1_double_ref(G1AffineRef::generator());
+    TEST_ASSERT(g1_affine_eq(h_aff, cpu_2g), "G1 GPU: 2G matches CPU");
+    TEST_ASSERT(!h_aff.infinity, "G1 GPU: 2G not infinity");
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G1 GPU add test ---
+void test_g1_gpu_add() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_add...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    G1AffineRef cpu_2g = g1_double_ref(cpu_g);
+    G1AffineRef cpu_3g = g1_add_ref(cpu_g, cpu_2g);
+
+    // GPU: 2G + G = 3G (both in Jacobian)
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+
+    // First, get 2G in Jacobian on GPU via double kernel
+    G1Jacobian *d_gen, *d_2g, *d_3g;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_gen, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_2g, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_3g, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_gen, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+
+    g1_double_kernel<<<1, 1>>>(d_gen, d_2g, 1);
+    g1_add_kernel<<<1, 1>>>(d_2g, d_gen, d_3g, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_3g, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_3g_aff;
+    CUDA_CHECK(cudaMemcpy(&h_3g_aff, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(g1_affine_eq(h_3g_aff, cpu_3g), "G1 GPU: 2G + G = 3G matches CPU");
+
+    CUDA_CHECK(cudaFree(d_gen));
+    CUDA_CHECK(cudaFree(d_2g));
+    CUDA_CHECK(cudaFree(d_3g));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G1 GPU mixed add test ---
+void test_g1_gpu_add_mixed() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_add_mixed...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    G1AffineRef cpu_2g = g1_double_ref(cpu_g);
+    G1AffineRef cpu_3g = g1_add_ref(cpu_2g, cpu_g);
+
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+    G1Affine gen_aff = make_g1_gen_affine_gpu();
+
+    G1Jacobian *d_jac, *d_2g, *d_3g;
+    G1Affine *d_aff_in, *d_aff_out;
+    CUDA_CHECK(cudaMalloc(&d_jac, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_2g, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_3g, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff_in, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_aff_out, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_jac, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_aff_in, &gen_aff, sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+    // 2G = double(G)
+    g1_double_kernel<<<1, 1>>>(d_jac, d_2g, 1);
+    // 3G = 2G + G_affine (mixed add)
+    g1_add_mixed_kernel<<<1, 1>>>(d_2g, d_aff_in, d_3g, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_3g, d_aff_out, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_3g;
+    CUDA_CHECK(cudaMemcpy(&h_3g, d_aff_out, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(g1_affine_eq(h_3g, cpu_3g), "G1 GPU: 2G + G_aff = 3G (mixed add)");
+
+    CUDA_CHECK(cudaFree(d_jac));
+    CUDA_CHECK(cudaFree(d_2g));
+    CUDA_CHECK(cudaFree(d_3g));
+    CUDA_CHECK(cudaFree(d_aff_in));
+    CUDA_CHECK(cudaFree(d_aff_out));
+}
+
+// --- G1 GPU scalar_mul test ---
+void test_g1_gpu_scalar_mul() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_scalar_mul...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    uint32_t scalar_5[8] = {5, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_5g = g1_scalar_mul_ref(cpu_g, scalar_5);
+
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+
+    G1Jacobian *d_base, *d_out;
+    uint32_t *d_scalar;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_base, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_scalar, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_base, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_5, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    g1_scalar_mul_kernel<<<1, 1>>>(d_base, d_scalar, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_5g;
+    CUDA_CHECK(cudaMemcpy(&h_5g, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(g1_affine_eq(h_5g, cpu_5g), "G1 GPU: scalar_mul(G, 5) = 5G");
+    TEST_ASSERT(g1_is_on_curve_ref(cpu_5g), "G1: 5G on curve");
+
+    CUDA_CHECK(cudaFree(d_base));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_scalar));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G1 GPU on-curve check ---
+void test_g1_gpu_on_curve() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_on_curve...\n");
+
+    G1Affine gen_aff = make_g1_gen_affine_gpu();
+    G1Affine inf = {FqElement::zero(), FqElement::zero(), true};
+
+    // Off-curve point: generator with y tweaked
+    G1Affine bad = gen_aff;
+    bad.y.limbs[0] ^= 1;
+
+    const uint32_t N = 3;
+    G1Affine h_pts[3] = {gen_aff, inf, bad};
+    bool h_results[3] = {false, false, false};
+
+    G1Affine *d_pts;
+    bool *d_results;
+    CUDA_CHECK(cudaMalloc(&d_pts, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_results, N * sizeof(bool)));
+    CUDA_CHECK(cudaMemcpy(d_pts, h_pts, N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+    g1_is_on_curve_kernel<<<1, N>>>(d_pts, d_results, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_results, d_results, N * sizeof(bool), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(h_results[0] == true, "G1 GPU: generator on curve");
+    TEST_ASSERT(h_results[1] == true, "G1 GPU: infinity on curve");
+    TEST_ASSERT(h_results[2] == false, "G1 GPU: tweaked point NOT on curve");
+
+    CUDA_CHECK(cudaFree(d_pts));
+    CUDA_CHECK(cudaFree(d_results));
+}
+
+// --- G1 GPU negate test ---
+void test_g1_gpu_negate() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_negate...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    G1AffineRef cpu_neg_g = g1_negate_ref(cpu_g);
+
+    // G + (-G) = O on GPU
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+    // Negate: flip y
+    G1Jacobian neg_gen = gen_jac;
+    // Use CPU to compute -y in Montgomery form
+    FqRef gy_ref = FqRef::from_u32(gen_jac.y.limbs);
+    FqRef neg_gy = fq_neg_ref(gy_ref);
+    neg_gy.to_u32(neg_gen.y.limbs);
+
+    G1Jacobian *d_a, *d_b, *d_out;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_a, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_b, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_a, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, &neg_gen, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+
+    g1_add_kernel<<<1, 1>>>(d_a, d_b, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_result;
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(h_result.infinity, "G1 GPU: G + (-G) = O");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G1 identity tests ---
+void test_g1_identity() {
+    using namespace ff_ref;
+    printf("test_g1_identity...\n");
+
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+    G1Jacobian identity = G1Jacobian::identity();
+
+    G1Jacobian *d_a, *d_b, *d_out;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_a, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_b, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+
+    // G + O = G
+    CUDA_CHECK(cudaMemcpy(d_a, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, &identity, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    g1_add_kernel<<<1, 1>>>(d_a, d_b, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_result;
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g1_affine_eq(h_result, G1AffineRef::generator()), "G1 GPU: G + O = G");
+
+    // O + G = G
+    CUDA_CHECK(cudaMemcpy(d_a, &identity, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    g1_add_kernel<<<1, 1>>>(d_a, d_b, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g1_affine_eq(h_result, G1AffineRef::generator()), "G1 GPU: O + G = G");
+
+    // double(O) = O
+    CUDA_CHECK(cudaMemcpy(d_a, &identity, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    g1_double_kernel<<<1, 1>>>(d_a, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(h_result.infinity, "G1 GPU: double(O) = O");
+
+    // scalar_mul(G, 0) = O
+    uint32_t scalar_0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t *d_scalar;
+    CUDA_CHECK(cudaMalloc(&d_scalar, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_a, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_0, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    g1_scalar_mul_kernel<<<1, 1>>>(d_a, d_scalar, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(h_result.infinity, "G1 GPU: scalar_mul(G, 0) = O");
+
+    // scalar_mul(G, 1) = G
+    uint32_t scalar_1[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_1, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    g1_scalar_mul_kernel<<<1, 1>>>(d_a, d_scalar, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g1_affine_eq(h_result, G1AffineRef::generator()), "G1 GPU: scalar_mul(G, 1) = G");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_aff));
+    CUDA_CHECK(cudaFree(d_scalar));
+}
+
+// --- G1 GPU scalar_mul larger scalars ---
+void test_g1_gpu_scalar_mul_larger() {
+    using namespace ff_ref;
+    printf("test_g1_gpu_scalar_mul_larger...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // scalar = 100
+    uint32_t scalar_100[8] = {100, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_100g = g1_scalar_mul_ref(cpu_g, scalar_100);
+    TEST_ASSERT(g1_is_on_curve_ref(cpu_100g), "G1: 100G on curve");
+
+    G1Jacobian gen_jac = make_g1_gen_gpu();
+    G1Jacobian *d_base, *d_out;
+    uint32_t *d_scalar;
+    G1Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_base, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G1Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_scalar, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMemcpy(d_base, &gen_jac, sizeof(G1Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_100, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    g1_scalar_mul_kernel<<<1, 1>>>(d_base, d_scalar, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_100g;
+    CUDA_CHECK(cudaMemcpy(&h_100g, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g1_affine_eq(h_100g, cpu_100g), "G1 GPU: scalar_mul(G, 100) matches CPU");
+
+    // scalar = 0xDEADBEEF (multi-bit test)
+    uint32_t scalar_beef[8] = {0xDEADBEEFu, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_beef = g1_scalar_mul_ref(cpu_g, scalar_beef);
+    TEST_ASSERT(g1_is_on_curve_ref(cpu_beef), "G1: 0xDEADBEEF*G on curve");
+
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_beef, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    g1_scalar_mul_kernel<<<1, 1>>>(d_base, d_scalar, d_out, 1);
+    g1_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G1Affine h_beef;
+    CUDA_CHECK(cudaMemcpy(&h_beef, d_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g1_affine_eq(h_beef, cpu_beef), "G1 GPU: scalar_mul(G, 0xDEADBEEF) matches CPU");
+
+    CUDA_CHECK(cudaFree(d_base));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_scalar));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G2 CPU self-test ---
+void test_g2_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_g2_cpu_self_test...\n");
+
+    G2AffineRef g = G2AffineRef::generator();
+    TEST_ASSERT(g2_is_on_curve_ref(g), "G2: generator on curve");
+
+    G2AffineRef g2 = g2_double_ref(g);
+    TEST_ASSERT(g2_is_on_curve_ref(g2), "G2: 2G on curve");
+
+    G2AffineRef g3 = g2_add_ref(g, g2);
+    TEST_ASSERT(g2_is_on_curve_ref(g3), "G2: 3G on curve");
+
+    G2AffineRef neg_g = g2_negate_ref(g);
+    G2AffineRef should_be_inf = g2_add_ref(g, neg_g);
+    TEST_ASSERT(should_be_inf.infinity, "G2: G + (-G) = O");
+
+    uint32_t scalar_2[8] = {2, 0, 0, 0, 0, 0, 0, 0};
+    G2AffineRef g2_sm = g2_scalar_mul_ref(g, scalar_2);
+    TEST_ASSERT(g2_sm == g2, "G2: scalar_mul(G, 2) == 2G");
+
+    uint32_t scalar_3[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+    G2AffineRef g3_sm = g2_scalar_mul_ref(g, scalar_3);
+    TEST_ASSERT(g3_sm == g3, "G2: scalar_mul(G, 3) == 3G");
+}
+
+// --- G2 GPU double test ---
+void test_g2_gpu_double() {
+    using namespace ff_ref;
+    printf("test_g2_gpu_double...\n");
+
+    G2Jacobian h_in = make_g2_gen_gpu();
+    G2Jacobian *d_in, *d_out;
+    G2Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_in, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G2Affine)));
+    CUDA_CHECK(cudaMemcpy(d_in, &h_in, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+
+    g2_double_kernel<<<1, 1>>>(d_in, d_out, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G2Affine h_aff;
+    CUDA_CHECK(cudaMemcpy(&h_aff, d_aff, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+
+    G2AffineRef cpu_2g = g2_double_ref(G2AffineRef::generator());
+    TEST_ASSERT(g2_affine_eq(h_aff, cpu_2g), "G2 GPU: 2G matches CPU");
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G2 GPU add test ---
+void test_g2_gpu_add() {
+    using namespace ff_ref;
+    printf("test_g2_gpu_add...\n");
+
+    G2AffineRef cpu_g = G2AffineRef::generator();
+    G2AffineRef cpu_2g = g2_double_ref(cpu_g);
+    G2AffineRef cpu_3g = g2_add_ref(cpu_g, cpu_2g);
+
+    G2Jacobian gen_jac = make_g2_gen_gpu();
+    G2Jacobian *d_gen, *d_2g, *d_3g;
+    G2Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_gen, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_2g, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_3g, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G2Affine)));
+    CUDA_CHECK(cudaMemcpy(d_gen, &gen_jac, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+
+    g2_double_kernel<<<1, 1>>>(d_gen, d_2g, 1);
+    g2_add_kernel<<<1, 1>>>(d_2g, d_gen, d_3g, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_3g, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G2Affine h_3g;
+    CUDA_CHECK(cudaMemcpy(&h_3g, d_aff, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g2_affine_eq(h_3g, cpu_3g), "G2 GPU: 2G + G = 3G matches CPU");
+
+    CUDA_CHECK(cudaFree(d_gen));
+    CUDA_CHECK(cudaFree(d_2g));
+    CUDA_CHECK(cudaFree(d_3g));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G2 GPU mixed add test ---
+void test_g2_gpu_add_mixed() {
+    using namespace ff_ref;
+    printf("test_g2_gpu_add_mixed...\n");
+
+    G2AffineRef cpu_g = G2AffineRef::generator();
+    G2AffineRef cpu_2g = g2_double_ref(cpu_g);
+    G2AffineRef cpu_3g = g2_add_ref(cpu_2g, cpu_g);
+
+    G2Jacobian gen_jac = make_g2_gen_gpu();
+    G2Affine gen_aff = make_g2_gen_affine_gpu();
+
+    G2Jacobian *d_jac, *d_2g, *d_3g;
+    G2Affine *d_aff_in, *d_aff_out;
+    CUDA_CHECK(cudaMalloc(&d_jac, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_2g, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_3g, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff_in, sizeof(G2Affine)));
+    CUDA_CHECK(cudaMalloc(&d_aff_out, sizeof(G2Affine)));
+    CUDA_CHECK(cudaMemcpy(d_jac, &gen_jac, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_aff_in, &gen_aff, sizeof(G2Affine), cudaMemcpyHostToDevice));
+
+    g2_double_kernel<<<1, 1>>>(d_jac, d_2g, 1);
+    g2_add_mixed_kernel<<<1, 1>>>(d_2g, d_aff_in, d_3g, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_3g, d_aff_out, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G2Affine h_3g;
+    CUDA_CHECK(cudaMemcpy(&h_3g, d_aff_out, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g2_affine_eq(h_3g, cpu_3g), "G2 GPU: 2G + G_aff = 3G (mixed add)");
+
+    CUDA_CHECK(cudaFree(d_jac));
+    CUDA_CHECK(cudaFree(d_2g));
+    CUDA_CHECK(cudaFree(d_3g));
+    CUDA_CHECK(cudaFree(d_aff_in));
+    CUDA_CHECK(cudaFree(d_aff_out));
+}
+
+// --- G2 GPU scalar_mul test ---
+void test_g2_gpu_scalar_mul() {
+    using namespace ff_ref;
+    printf("test_g2_gpu_scalar_mul...\n");
+
+    G2AffineRef cpu_g = G2AffineRef::generator();
+    uint32_t scalar_5[8] = {5, 0, 0, 0, 0, 0, 0, 0};
+    G2AffineRef cpu_5g = g2_scalar_mul_ref(cpu_g, scalar_5);
+    TEST_ASSERT(g2_is_on_curve_ref(cpu_5g), "G2: 5G on curve");
+
+    G2Jacobian gen_jac = make_g2_gen_gpu();
+    G2Jacobian *d_base, *d_out;
+    uint32_t *d_scalar;
+    G2Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_base, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_scalar, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G2Affine)));
+    CUDA_CHECK(cudaMemcpy(d_base, &gen_jac, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalar, scalar_5, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    g2_scalar_mul_kernel<<<1, 1>>>(d_base, d_scalar, d_out, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G2Affine h_5g;
+    CUDA_CHECK(cudaMemcpy(&h_5g, d_aff, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g2_affine_eq(h_5g, cpu_5g), "G2 GPU: scalar_mul(G, 5) = 5G matches CPU");
+
+    CUDA_CHECK(cudaFree(d_base));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_scalar));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// --- G2 GPU on-curve check ---
+void test_g2_gpu_on_curve() {
+    using namespace ff_ref;
+    printf("test_g2_gpu_on_curve...\n");
+
+    G2Affine gen_aff = make_g2_gen_affine_gpu();
+    G2Affine inf;
+    inf.x = Fq2Element::zero();
+    inf.y = Fq2Element::zero();
+    inf.infinity = true;
+
+    G2Affine bad = gen_aff;
+    bad.y.c0.limbs[0] ^= 1;
+
+    const uint32_t N = 3;
+    G2Affine h_pts[3] = {gen_aff, inf, bad};
+    bool h_results[3] = {false, false, false};
+
+    G2Affine *d_pts;
+    bool *d_results;
+    CUDA_CHECK(cudaMalloc(&d_pts, N * sizeof(G2Affine)));
+    CUDA_CHECK(cudaMalloc(&d_results, N * sizeof(bool)));
+    CUDA_CHECK(cudaMemcpy(d_pts, h_pts, N * sizeof(G2Affine), cudaMemcpyHostToDevice));
+
+    g2_is_on_curve_kernel<<<1, N>>>(d_pts, d_results, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_results, d_results, N * sizeof(bool), cudaMemcpyDeviceToHost));
+
+    TEST_ASSERT(h_results[0] == true, "G2 GPU: generator on curve");
+    TEST_ASSERT(h_results[1] == true, "G2 GPU: infinity on curve");
+    TEST_ASSERT(h_results[2] == false, "G2 GPU: tweaked point NOT on curve");
+
+    CUDA_CHECK(cudaFree(d_pts));
+    CUDA_CHECK(cudaFree(d_results));
+}
+
+// --- G2 identity tests ---
+void test_g2_identity() {
+    using namespace ff_ref;
+    printf("test_g2_identity...\n");
+
+    G2Jacobian gen_jac = make_g2_gen_gpu();
+    G2Jacobian identity = G2Jacobian::identity();
+
+    G2Jacobian *d_a, *d_b, *d_out;
+    G2Affine *d_aff;
+    CUDA_CHECK(cudaMalloc(&d_a, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_b, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(G2Jacobian)));
+    CUDA_CHECK(cudaMalloc(&d_aff, sizeof(G2Affine)));
+
+    // G + O = G
+    CUDA_CHECK(cudaMemcpy(d_a, &gen_jac, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, &identity, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+    g2_add_kernel<<<1, 1>>>(d_a, d_b, d_out, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    G2Affine h_result;
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(g2_affine_eq(h_result, G2AffineRef::generator()), "G2 GPU: G + O = G");
+
+    // double(O) = O
+    CUDA_CHECK(cudaMemcpy(d_a, &identity, sizeof(G2Jacobian), cudaMemcpyHostToDevice));
+    g2_double_kernel<<<1, 1>>>(d_a, d_out, 1);
+    g2_to_affine_kernel<<<1, 1>>>(d_out, d_aff, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(&h_result, d_aff, sizeof(G2Affine), cudaMemcpyDeviceToHost));
+    TEST_ASSERT(h_result.infinity, "G2 GPU: double(O) = O");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_aff));
+}
+
+// =============================================================================
+// v2.0.0 Session 22: Multi-Scalar Multiplication Tests
+// =============================================================================
+
+// CPU naive MSM reference: sum(scalar[i] * base[i])
+static ff_ref::G1AffineRef msm_naive_ref(
+    const ff_ref::G1AffineRef* bases,
+    const uint32_t* scalars,  // n * 8
+    size_t n)
+{
+    using namespace ff_ref;
+    G1AffineRef result = G1AffineRef::point_at_infinity();
+    for (size_t i = 0; i < n; ++i) {
+        G1AffineRef term = g1_scalar_mul_ref(bases[i], &scalars[i * 8]);
+        result = g1_add_ref(result, term);
+    }
+    return result;
+}
+
+// Test: single-point MSM = scalar_mul
+void test_msm_single_point() {
+    using namespace ff_ref;
+    printf("test_msm_single_point...\n");
+
+    G1Affine h_base = make_g1_gen_affine_gpu();
+    uint32_t h_scalar[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+
+    // CPU reference
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    G1AffineRef cpu_7g = g1_scalar_mul_ref(cpu_g, h_scalar);
+
+    // GPU MSM
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, &h_base, sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalar, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 1);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_7g), "MSM: single point = scalar_mul");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: two-point MSM
+void test_msm_two_points() {
+    using namespace ff_ref;
+    printf("test_msm_two_points...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    G1AffineRef cpu_2g = g1_double_ref(cpu_g);
+
+    // MSM: 3*G + 5*(2G) = 3G + 10G = 13G
+    uint32_t scalars[16] = {3, 0, 0, 0, 0, 0, 0, 0,   // scalar[0] = 3
+                            5, 0, 0, 0, 0, 0, 0, 0};   // scalar[1] = 5
+
+    G1AffineRef bases_ref[2] = {cpu_g, cpu_2g};
+    G1AffineRef cpu_result = msm_naive_ref(bases_ref, scalars, 2);
+
+    // Verify: should be 13G
+    uint32_t s13[8] = {13, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_13g = g1_scalar_mul_ref(cpu_g, s13);
+    TEST_ASSERT(cpu_result == cpu_13g, "MSM ref: 3*G + 5*(2G) = 13G");
+
+    // GPU
+    G1Affine h_bases[2];
+    h_bases[0] = make_g1_gen_affine_gpu();
+    // 2G: need to compute on CPU and convert
+    FqRef ref_2gx = cpu_2g.x, ref_2gy = cpu_2g.y;
+    ref_2gx.to_u32(h_bases[1].x.limbs);
+    ref_2gy.to_u32(h_bases[1].y.limbs);
+    h_bases[1].infinity = false;
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, 2 * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 16 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases, 2 * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars, 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 2);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM GPU: 2-point matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with identity (zero scalar)
+void test_msm_with_identity() {
+    using namespace ff_ref;
+    printf("test_msm_with_identity...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    // MSM: 0*G + 5*G = 5G
+    uint32_t scalars[16] = {0, 0, 0, 0, 0, 0, 0, 0,   // scalar[0] = 0
+                            5, 0, 0, 0, 0, 0, 0, 0};   // scalar[1] = 5
+
+    uint32_t s5[8] = {5, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_5g = g1_scalar_mul_ref(cpu_g, s5);
+
+    G1Affine h_bases[2];
+    h_bases[0] = make_g1_gen_affine_gpu();
+    h_bases[1] = make_g1_gen_affine_gpu();
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, 2 * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 16 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases, 2 * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalars, 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 2);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_5g), "MSM GPU: 0*G + 5*G = 5G");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with all-ones scalars
+void test_msm_all_ones() {
+    using namespace ff_ref;
+    printf("test_msm_all_ones...\n");
+
+    // n copies of G, all with scalar=1 -> result = n*G
+    const int N = 16;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    uint32_t s_n[8] = {(uint32_t)N, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef cpu_nG = g1_scalar_mul_ref(cpu_g, s_n);
+
+    std::vector<G1Affine> h_bases(N, make_g1_gen_affine_gpu());
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = 1;
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_nG), "MSM GPU: N*1*G = N*G");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM correctness at n=64 (GPU vs CPU naive)
+void test_msm_medium(int n) {
+    using namespace ff_ref;
+    printf("test_msm_medium (n=%d)...\n", n);
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Generate n different bases: i*G for i=1..n
+    std::vector<G1AffineRef> cpu_bases(n);
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Generate random-ish scalars (small for speed)
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8] = (uint32_t)((i * 7 + 3) % 256);
+    }
+
+    // CPU reference
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), n);
+
+    // GPU MSM
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    // Verify on-curve
+    TEST_ASSERT(g1_is_on_curve_ref(cpu_result), "MSM: CPU result on curve");
+
+    bool match = g1_affine_eq(gpu_result, cpu_result);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "MSM GPU n=%d: matches CPU naive", n);
+    TEST_ASSERT(match, msg);
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM on-curve check for larger n (GPU result only, no CPU cross-validation)
+void test_msm_on_curve(int n) {
+    using namespace ff_ref;
+    printf("test_msm_on_curve (n=%d)...\n", n);
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Generate bases: i*G
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8] = (uint32_t)((i * 13 + 7) % 1024);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    // Convert to ref and check on-curve
+    G1AffineRef result_ref;
+    result_ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    result_ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    result_ref.infinity = gpu_result.infinity;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "MSM GPU n=%d: result on curve", n);
+    TEST_ASSERT(gpu_result.infinity || g1_is_on_curve_ref(result_ref), msg);
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM determinism (same input -> same output)
+void test_msm_determinism() {
+    using namespace ff_ref;
+    printf("test_msm_determinism...\n");
+
+    const int N = 32;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = (uint32_t)(i * 3 + 1);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine result1, result2;
+    msm_g1(&result1, d_bases, d_scalars, N);
+    msm_g1(&result2, d_bases, d_scalars, N);
+
+    bool match = (memcmp(&result1, &result2, sizeof(G1Affine)) == 0);
+    TEST_ASSERT(match, "MSM: deterministic (same input -> same output)");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM window size selection
+void test_msm_window_size() {
+    printf("test_msm_window_size...\n");
+
+    TEST_ASSERT(msm_optimal_window(1) >= 1, "MSM window: n=1");
+    TEST_ASSERT(msm_optimal_window(1024) >= 4, "MSM window: n=1024");
+    TEST_ASSERT(msm_optimal_window(1 << 15) >= 4, "MSM window: n=2^15");
+    TEST_ASSERT(msm_optimal_window(1 << 20) >= 4, "MSM window: n=2^20");
+    TEST_ASSERT(msm_optimal_window(1 << 20) <= 16, "MSM window: n=2^20 <= 16");
+}
+
+// ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────────
+
+// Helper: make standard-form FpElement from a small integer
+static FpElement make_fp_from_u64(uint64_t v) {
+    FpElement e;
+    for (int i = 0; i < 8; ++i) e.limbs[i] = 0;
+    e.limbs[0] = (uint32_t)(v & 0xFFFFFFFF);
+    e.limbs[1] = (uint32_t)(v >> 32);
+    return e;
+}
+
+// Helper: convert FpElement (standard form) to FpRef (Montgomery form)
+static ff_ref::FpRef fp_to_ref_mont(const FpElement& e) {
+    return ff_ref::to_montgomery(ff_ref::FpRef::from_u32(e.limbs));
+}
+
+// Helper: convert FpRef (Montgomery form) to FpElement (standard form)
+static FpElement ref_mont_to_fp(const ff_ref::FpRef& r) {
+    ff_ref::FpRef std_form = ff_ref::from_montgomery(r);
+    FpElement e;
+    std_form.to_u32(e.limbs);
+    return e;
+}
+
+// Helper: compare two FpElements
+static bool fp_eq(const FpElement& a, const FpElement& b) {
+    for (int i = 0; i < 8; ++i)
+        if (a.limbs[i] != b.limbs[i]) return false;
+    return true;
+}
+
+void test_poly_pointwise_mul() {
+    using namespace ff_ref;
+    printf("test_poly_pointwise_mul...\n");
+
+    const size_t N = 256;
+    std::vector<FpElement> h_a(N), h_b(N), h_c(N);
+
+    // Generate test data: a[i] = i+1, b[i] = i+100 (standard form)
+    for (size_t i = 0; i < N; ++i) {
+        h_a[i] = make_fp_from_u64(i + 1);
+        h_b[i] = make_fp_from_u64(i + 100);
+    }
+
+    FpElement *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_c, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_pointwise_mul(d_c, d_a, d_b, N);
+
+    CUDA_CHECK(cudaMemcpy(h_c.data(), d_c, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Verify against CPU reference
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpRef a_mont = to_montgomery(FpRef::from_u64(i + 1));
+        FpRef b_mont = to_montgomery(FpRef::from_u64(i + 100));
+        FpRef c_mont = fp_mul(a_mont, b_mont);
+        FpElement expected = ref_mont_to_fp(c_mont);
+        if (fp_eq(h_c[i], expected)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "pointwise mul: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d matched\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+
+void test_poly_pointwise_mul_sub() {
+    using namespace ff_ref;
+    printf("test_poly_pointwise_mul_sub...\n");
+
+    const size_t N = 256;
+    std::vector<FpElement> h_a(N), h_b(N), h_c(N), h_out(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        h_a[i] = make_fp_from_u64(i + 10);
+        h_b[i] = make_fp_from_u64(i + 20);
+        h_c[i] = make_fp_from_u64(i + 5);
+    }
+
+    FpElement *d_a, *d_b, *d_c, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_c, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, h_c.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_pointwise_mul_sub(d_out, d_a, d_b, d_c, N);
+
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpRef a_m = to_montgomery(FpRef::from_u64(i + 10));
+        FpRef b_m = to_montgomery(FpRef::from_u64(i + 20));
+        FpRef c_m = to_montgomery(FpRef::from_u64(i + 5));
+        FpRef expected_m = fp_sub(fp_mul(a_m, b_m), c_m);
+        FpElement expected = ref_mont_to_fp(expected_m);
+        if (fp_eq(h_out[i], expected)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "pointwise mul-sub: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d matched\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void test_poly_scale() {
+    using namespace ff_ref;
+    printf("test_poly_scale...\n");
+
+    const size_t N = 256;
+    std::vector<FpElement> h_data(N), h_result(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64(i + 1);
+    }
+    FpElement scalar = make_fp_from_u64(42);
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_scale(d_data, scalar, N);
+
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    FpRef scalar_m = to_montgomery(FpRef::from_u64(42));
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpRef val_m = to_montgomery(FpRef::from_u64(i + 1));
+        FpRef expected_m = fp_mul(val_m, scalar_m);
+        FpElement expected = ref_mont_to_fp(expected_m);
+        if (fp_eq(h_result[i], expected)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "poly scale: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d matched\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_roundtrip() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_roundtrip (n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    // Original data
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64(i + 1);
+    }
+    std::vector<FpElement> h_original = h_data;
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    // Forward coset NTT then inverse -> should recover original
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    poly_coset_ntt_inverse(d_data, N, coset_gen);
+
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_data[i], h_original[i])) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT roundtrip: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d recovered\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_roundtrip_512() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_roundtrip (n=512)...\n");
+
+    const size_t N = 512;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64((i * 17 + 3) % 10000);
+    }
+    std::vector<FpElement> h_original = h_data;
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    poly_coset_ntt_inverse(d_data, N, coset_gen);
+
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_data[i], h_original[i])) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT 512 roundtrip: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d recovered\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_vs_cpu() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_vs_cpu (n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    // GPU data (standard form)
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64(i + 1);
+    }
+
+    // CPU reference (Montgomery form)
+    FpRef g_mont = to_montgomery(FpRef::from_u64(7));
+    std::vector<FpRef> cpu_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        cpu_data[i] = to_montgomery(FpRef::from_u64(i + 1));
+    }
+    coset_ntt_forward_ref(cpu_data, N, g_mont);
+
+    // GPU coset NTT
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Compare GPU (standard form) vs CPU (Montgomery form)
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpElement cpu_std = ref_mont_to_fp(cpu_data[i]);
+        if (fp_eq(h_data[i], cpu_std)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT GPU vs CPU: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d matched\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_zeros() {
+    printf("test_poly_coset_ntt_zeros (n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+    FpElement zero = make_fp_from_u64(0);
+
+    std::vector<FpElement> h_data(N, zero);
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // NTT of all zeros should be all zeros
+    int all_zero = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_data[i], zero)) ++all_zero;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT zeros: %d/%d zero", all_zero, (int)N);
+    TEST_ASSERT(all_zero == (int)N, msg);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_ones() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_ones (n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+    FpElement one = make_fp_from_u64(1);
+
+    std::vector<FpElement> h_data(N, one);
+
+    // CPU reference
+    FpRef g_mont = to_montgomery(FpRef::from_u64(7));
+    std::vector<FpRef> cpu_data(N, to_montgomery(FpRef::from_u64(1)));
+    coset_ntt_forward_ref(cpu_data, N, g_mont);
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpElement cpu_std = ref_mont_to_fp(cpu_data[i]);
+        if (fp_eq(h_data[i], cpu_std)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT ones: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_different_gen() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_different_gen (g=5, n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(5);
+
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64(i * 3 + 2);
+    }
+    std::vector<FpElement> h_original = h_data;
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    poly_coset_ntt_inverse(d_data, N, coset_gen);
+
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_data[i], h_original[i])) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT g=5 roundtrip: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d recovered\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_coset_ntt_1024() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_roundtrip (n=1024)...\n");
+
+    const size_t N = 1024;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64((i * 31 + 7) % 100000);
+    }
+    std::vector<FpElement> h_original = h_data;
+
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+    poly_coset_ntt_inverse(d_data, N, coset_gen);
+
+    CUDA_CHECK(cudaMemcpy(h_data.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_data[i], h_original[i])) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset NTT 1024 roundtrip: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d recovered\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+// Test: quotient polynomial H(x) = (A*B - C) / Z_H on coset
+// Use known polynomials where A(x)*B(x) - C(x) = H(x)*(x^n - 1)
+// A(x) = 1 + x, B(x) = 1 + x, C(x) = 1 + 2x + x^2
+// A*B = (1+x)^2 = 1 + 2x + x^2 = C, so H(x) = 0
+void test_poly_quotient_zero() {
+    using namespace ff_ref;
+    printf("test_poly_quotient_zero...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    // A(x) = 1 + x: coeffs [1, 1, 0, 0, ...]
+    std::vector<FpElement> h_a(N, make_fp_from_u64(0));
+    h_a[0] = make_fp_from_u64(1);
+    h_a[1] = make_fp_from_u64(1);
+
+    // B(x) = 1 + x
+    std::vector<FpElement> h_b = h_a;
+
+    // C(x) = 1 + 2x + x^2
+    std::vector<FpElement> h_c(N, make_fp_from_u64(0));
+    h_c[0] = make_fp_from_u64(1);
+    h_c[1] = make_fp_from_u64(2);
+    h_c[2] = make_fp_from_u64(1);
+
+    FpElement *d_a, *d_b, *d_c, *d_h;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_c, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_h, N * sizeof(FpElement)));
+
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, h_c.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    // Evaluate on coset
+    poly_coset_ntt_forward(d_a, N, coset_gen);
+    poly_coset_ntt_forward(d_b, N, coset_gen);
+    poly_coset_ntt_forward(d_c, N, coset_gen);
+
+    // H_coset = (A_coset * B_coset - C_coset) / (g^n - 1)
+    poly_pointwise_mul_sub(d_h, d_a, d_b, d_c, N);
+
+    // Compute Z_H inverse = 1/(g^n - 1) on CPU
+    FpRef g_mont = to_montgomery(FpRef::from_u64(7));
+    // g^n mod p
+    std::array<uint64_t, 4> n_exp = {{N, 0, 0, 0}};
+    FpRef g_n = fp_pow(g_mont, n_exp);
+    FpRef one_mont;
+    one_mont.limbs = R_MOD;
+    FpRef zh_val = fp_sub(g_n, one_mont);  // g^n - 1 (Montgomery)
+    FpRef zh_inv = fp_inv(zh_val);
+    FpElement zh_inv_std = ref_mont_to_fp(zh_inv);
+
+    poly_scale(d_h, zh_inv_std, N);
+
+    // Inverse coset NTT to get H(x) coefficients
+    poly_coset_ntt_inverse(d_h, N, coset_gen);
+
+    std::vector<FpElement> h_result(N);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_h, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // H(x) should be all zeros (since A*B = C)
+    FpElement zero = make_fp_from_u64(0);
+    int all_zero = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (fp_eq(h_result[i], zero)) ++all_zero;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "quotient zero: %d/%d zero coeffs", all_zero, (int)N);
+    TEST_ASSERT(all_zero == (int)N, msg);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+    CUDA_CHECK(cudaFree(d_h));
+}
+
+// Test: verify A*B - C = H*Z_H identity at a random evaluation point
+// Construct C such that C(omega^i) = A(omega^i)*B(omega^i) for all roots of unity.
+// This ensures Z_H | (A*B - C), making H well-defined.
+void test_poly_quotient_identity() {
+    using namespace ff_ref;
+    printf("test_poly_quotient_identity...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    // A(x) = 2 + 3x (coefficients, standard form)
+    std::vector<FpElement> h_a(N, make_fp_from_u64(0));
+    h_a[0] = make_fp_from_u64(2);
+    h_a[1] = make_fp_from_u64(3);
+
+    // B(x) = 1 + x
+    std::vector<FpElement> h_b(N, make_fp_from_u64(0));
+    h_b[0] = make_fp_from_u64(1);
+    h_b[1] = make_fp_from_u64(1);
+
+    // Construct C: NTT A and B, pointwise multiply, INTT -> C coefficients
+    // This guarantees C(omega^i) = A(omega^i)*B(omega^i) for all i
+    FpElement *d_a, *d_b, *d_c, *d_h;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_c, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_h, N * sizeof(FpElement)));
+
+    // Compute C = A*B mod Z_H via standard NTT
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    ntt_forward(d_a, N);
+    ntt_forward(d_b, N);
+    poly_pointwise_mul(d_c, d_a, d_b, N);
+    ntt_inverse(d_c, N);
+
+    // Read back C coefficients for CPU verification
+    std::vector<FpElement> h_c(N);
+    CUDA_CHECK(cudaMemcpy(h_c.data(), d_c, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Now compute H(x) = (A*B - C) / Z_H via coset NTT
+    // Re-upload original A, B coefficients (NTT modified them in-place)
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_a, N, coset_gen);
+    poly_coset_ntt_forward(d_b, N, coset_gen);
+    poly_coset_ntt_forward(d_c, N, coset_gen);
+
+    poly_pointwise_mul_sub(d_h, d_a, d_b, d_c, N);
+
+    // Divide by Z_H(coset) = g^n - 1
+    FpRef g_mont = to_montgomery(FpRef::from_u64(7));
+    std::array<uint64_t, 4> n_exp = {{N, 0, 0, 0}};
+    FpRef g_n = fp_pow(g_mont, n_exp);
+    FpRef one_mont;
+    one_mont.limbs = R_MOD;
+    FpRef zh_val = fp_sub(g_n, one_mont);
+    FpRef zh_inv = fp_inv(zh_val);
+    FpElement zh_inv_std = ref_mont_to_fp(zh_inv);
+    poly_scale(d_h, zh_inv_std, N);
+
+    poly_coset_ntt_inverse(d_h, N, coset_gen);
+
+    std::vector<FpElement> h_result(N);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_h, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // Verify identity: A(z)*B(z) - C(z) = H(z)*Z_H(z) at z = 13
+    FpRef z = to_montgomery(FpRef::from_u64(13));
+
+    // Evaluate A(z) = 2 + 3z, B(z) = 1 + z
+    FpRef az = fp_add(to_montgomery(FpRef::from_u64(2)),
+                      fp_mul(to_montgomery(FpRef::from_u64(3)), z));
+    FpRef bz = fp_add(one_mont, z);
+
+    // Evaluate C(z) from its coefficients
+    FpRef cz = to_montgomery(FpRef::from_u32(h_c[0].limbs));
+    FpRef z_pow = one_mont;
+    for (size_t i = 1; i < N; ++i) {
+        z_pow = fp_mul(z_pow, z);
+        FpRef coeff = to_montgomery(FpRef::from_u32(h_c[i].limbs));
+        cz = fp_add(cz, fp_mul(coeff, z_pow));
+    }
+
+    // LHS = A(z)*B(z) - C(z)
+    FpRef lhs = fp_sub(fp_mul(az, bz), cz);
+
+    // Evaluate H(z) from its coefficients
+    FpRef hz = to_montgomery(FpRef::from_u32(h_result[0].limbs));
+    z_pow = one_mont;
+    for (size_t i = 1; i < N; ++i) {
+        z_pow = fp_mul(z_pow, z);
+        FpRef coeff = to_montgomery(FpRef::from_u32(h_result[i].limbs));
+        hz = fp_add(hz, fp_mul(coeff, z_pow));
+    }
+
+    // Z_H(z) = z^n - 1
+    std::array<uint64_t, 4> n_exp2 = {{N, 0, 0, 0}};
+    FpRef z_n = fp_pow(z, n_exp2);
+    FpRef zh_z = fp_sub(z_n, one_mont);
+
+    // RHS = H(z) * Z_H(z)
+    FpRef rhs = fp_mul(hz, zh_z);
+
+    TEST_ASSERT(lhs == rhs, "quotient identity: A(z)*B(z) - C(z) = H(z)*Z_H(z)");
+    printf("  Identity verified at z=13\n");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+    CUDA_CHECK(cudaFree(d_h));
+}
+
+void test_poly_coset_ntt_inverse_vs_cpu() {
+    using namespace ff_ref;
+    printf("test_poly_coset_ntt_inverse_vs_cpu (n=256)...\n");
+
+    const size_t N = 256;
+    FpElement coset_gen = make_fp_from_u64(7);
+
+    // Start with coset evaluations (forward NTT output)
+    std::vector<FpElement> h_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_data[i] = make_fp_from_u64(i + 1);
+    }
+
+    // GPU: forward then inverse
+    FpElement *d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_coset_ntt_forward(d_data, N, coset_gen);
+
+    // Read GPU forward result
+    std::vector<FpElement> h_gpu_fwd(N);
+    CUDA_CHECK(cudaMemcpy(h_gpu_fwd.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // CPU forward for comparison
+    FpRef g_mont = to_montgomery(FpRef::from_u64(7));
+    std::vector<FpRef> cpu_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        cpu_data[i] = to_montgomery(FpRef::from_u64(i + 1));
+    }
+    coset_ntt_forward_ref(cpu_data, N, g_mont);
+
+    // Now do GPU inverse
+    poly_coset_ntt_inverse(d_data, N, coset_gen);
+
+    std::vector<FpElement> h_result(N);
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    // CPU inverse
+    coset_ntt_inverse_ref(cpu_data, N, g_mont);
+
+    // Compare GPU inverse vs CPU inverse
+    int matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+        FpElement cpu_std = ref_mont_to_fp(cpu_data[i]);
+        if (fp_eq(h_result[i], cpu_std)) ++matched;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coset INTT GPU vs CPU: %d/%d matched", matched, (int)N);
+    TEST_ASSERT(matched == (int)N, msg);
+    printf("  %d/%d matched\n", matched, (int)N);
+
+    CUDA_CHECK(cudaFree(d_data));
+}
+
+void test_poly_pointwise_edge_cases() {
+    printf("test_poly_pointwise_edge_cases...\n");
+
+    // Multiply by zero
+    const size_t N = 8;
+    std::vector<FpElement> h_a(N), h_b(N), h_c(N);
+    for (size_t i = 0; i < N; ++i) {
+        h_a[i] = make_fp_from_u64(i + 1);
+        h_b[i] = make_fp_from_u64(0);
+    }
+
+    FpElement *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMalloc(&d_c, N * sizeof(FpElement)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+    poly_pointwise_mul(d_c, d_a, d_b, N);
+
+    CUDA_CHECK(cudaMemcpy(h_c.data(), d_c, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    FpElement zero = make_fp_from_u64(0);
+    bool all_zero = true;
+    for (size_t i = 0; i < N; ++i) {
+        if (!fp_eq(h_c[i], zero)) { all_zero = false; break; }
+    }
+    TEST_ASSERT(all_zero, "pointwise mul by zero = zero");
+
+    // Multiply by one
+    for (size_t i = 0; i < N; ++i) {
+        h_b[i] = make_fp_from_u64(1);
+    }
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(FpElement), cudaMemcpyHostToDevice));
+    poly_pointwise_mul(d_c, d_a, d_b, N);
+    CUDA_CHECK(cudaMemcpy(h_c.data(), d_c, N * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+    bool all_match = true;
+    for (size_t i = 0; i < N; ++i) {
+        if (!fp_eq(h_c[i], h_a[i])) { all_match = false; break; }
+    }
+    TEST_ASSERT(all_match, "pointwise mul by one = identity");
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+
+// ─── v2.0.0 Session 24: Groth16 Tests ──────────────────────────────────────
+
+void test_groth16_witness() {
+    printf("test_groth16_witness...\n");
+
+    // x=3: 3^3 + 3 + 5 = 35
+    auto w = compute_witness(3);
+    TEST_ASSERT(w[0].limbs[0] == 1, "witness[0] = 1");
+    TEST_ASSERT(w[1].limbs[0] == 3, "witness[1] = x = 3");
+    TEST_ASSERT(w[2].limbs[0] == 35, "witness[2] = y = 35");
+    TEST_ASSERT(w[3].limbs[0] == 9, "witness[3] = v1 = 9");
+    TEST_ASSERT(w[4].limbs[0] == 27, "witness[4] = v2 = 27");
+    TEST_ASSERT(w[5].limbs[0] == 30, "witness[5] = v3 = 30");
+
+    // x=10: 10^3 + 10 + 5 = 1015
+    w = compute_witness(10);
+    TEST_ASSERT(w[2].limbs[0] == 1015, "witness x=10: y = 1015");
+}
+
+void test_groth16_r1cs_satisfied() {
+    using namespace ff_ref;
+    printf("test_groth16_r1cs_satisfied...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    auto witness = compute_witness(3);
+
+    // Check: A_row · w * B_row · w = C_row · w for each constraint
+    for (size_t k = 0; k < r1cs.num_constraints; ++k) {
+        FpRef a_dot = FpRef::zero(), b_dot = FpRef::zero(), c_dot = FpRef::zero();
+        for (size_t i = 0; i < r1cs.num_variables; ++i) {
+            FpRef w_m = to_montgomery(FpRef::from_u32(witness[i].limbs));
+            a_dot = fp_add(a_dot, fp_mul(to_montgomery(FpRef::from_u64(r1cs.A[k][i])), w_m));
+            b_dot = fp_add(b_dot, fp_mul(to_montgomery(FpRef::from_u64(r1cs.B[k][i])), w_m));
+            c_dot = fp_add(c_dot, fp_mul(to_montgomery(FpRef::from_u64(r1cs.C[k][i])), w_m));
+        }
+        FpRef product = fp_mul(a_dot, b_dot);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "R1CS constraint %d satisfied", (int)k);
+        TEST_ASSERT(product == c_dot, msg);
+    }
+}
+
+void test_groth16_srs_on_curve() {
+    using namespace ff_ref;
+    printf("test_groth16_srs_on_curve...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+
+    // Check SRS G1 points on curve
+    G1AffineRef a_ref = {FqRef::from_u32(pk.alpha_g1.x.limbs),
+                          FqRef::from_u32(pk.alpha_g1.y.limbs),
+                          pk.alpha_g1.infinity};
+    TEST_ASSERT(g1_is_on_curve_ref(a_ref), "SRS: alpha_g1 on curve");
+
+    G1AffineRef b_ref = {FqRef::from_u32(pk.beta_g1.x.limbs),
+                          FqRef::from_u32(pk.beta_g1.y.limbs),
+                          pk.beta_g1.infinity};
+    TEST_ASSERT(g1_is_on_curve_ref(b_ref), "SRS: beta_g1 on curve");
+
+    G1AffineRef d_ref = {FqRef::from_u32(pk.delta_g1.x.limbs),
+                          FqRef::from_u32(pk.delta_g1.y.limbs),
+                          pk.delta_g1.infinity};
+    TEST_ASSERT(g1_is_on_curve_ref(d_ref), "SRS: delta_g1 on curve");
+
+    // Check h_query points on curve (sample a few)
+    for (size_t j = 0; j < 5 && j < pk.h_query.size(); ++j) {
+        G1AffineRef h_ref = {FqRef::from_u32(pk.h_query[j].x.limbs),
+                              FqRef::from_u32(pk.h_query[j].y.limbs),
+                              pk.h_query[j].infinity};
+        char msg[128];
+        snprintf(msg, sizeof(msg), "SRS: h_query[%d] on curve", (int)j);
+        TEST_ASSERT(h_ref.infinity || g1_is_on_curve_ref(h_ref), msg);
+    }
+
+    // Check G2 points on curve
+    G2AffineRef beta_g2_ref = {
+        {FqRef::from_u32(pk.beta_g2.x.c0.limbs), FqRef::from_u32(pk.beta_g2.x.c1.limbs)},
+        {FqRef::from_u32(pk.beta_g2.y.c0.limbs), FqRef::from_u32(pk.beta_g2.y.c1.limbs)},
+        pk.beta_g2.infinity};
+    TEST_ASSERT(g2_is_on_curve_ref(beta_g2_ref), "SRS: beta_g2 on curve");
+}
+
+void test_groth16_gpu_proof() {
+    using namespace ff_ref;
+    printf("test_groth16_gpu_proof...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+    auto witness = compute_witness(3);
+
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    // Check proof elements on curve
+    G1AffineRef pa = {FqRef::from_u32(proof.pi_a.x.limbs),
+                       FqRef::from_u32(proof.pi_a.y.limbs),
+                       proof.pi_a.infinity};
+    TEST_ASSERT(proof.pi_a.infinity || g1_is_on_curve_ref(pa), "GPU proof: pi_a on G1");
+
+    G2AffineRef pb = {
+        {FqRef::from_u32(proof.pi_b.x.c0.limbs), FqRef::from_u32(proof.pi_b.x.c1.limbs)},
+        {FqRef::from_u32(proof.pi_b.y.c0.limbs), FqRef::from_u32(proof.pi_b.y.c1.limbs)},
+        proof.pi_b.infinity};
+    TEST_ASSERT(proof.pi_b.infinity || g2_is_on_curve_ref(pb), "GPU proof: pi_b on G2");
+
+    G1AffineRef pc = {FqRef::from_u32(proof.pi_c.x.limbs),
+                       FqRef::from_u32(proof.pi_c.y.limbs),
+                       proof.pi_c.infinity};
+    TEST_ASSERT(proof.pi_c.infinity || g1_is_on_curve_ref(pc), "GPU proof: pi_c on G1");
+}
+
+void test_groth16_gpu_vs_cpu() {
+    using namespace ff_ref;
+    printf("test_groth16_gpu_vs_cpu...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+    auto witness = compute_witness(3);
+
+    Groth16Proof gpu_proof = groth16_prove(r1cs, pk, witness, 17, 23);
+    Groth16Proof cpu_proof = groth16_prove_cpu(r1cs, pk, witness, 17, 23);
+
+    // Compare π_A
+    bool a_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_a.x.limbs[i] != cpu_proof.pi_a.x.limbs[i]) a_match = false;
+        if (gpu_proof.pi_a.y.limbs[i] != cpu_proof.pi_a.y.limbs[i]) a_match = false;
+    }
+    TEST_ASSERT(a_match, "GPU vs CPU: pi_a match");
+
+    // Compare π_B
+    bool b_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_b.x.c0.limbs[i] != cpu_proof.pi_b.x.c0.limbs[i]) b_match = false;
+        if (gpu_proof.pi_b.x.c1.limbs[i] != cpu_proof.pi_b.x.c1.limbs[i]) b_match = false;
+        if (gpu_proof.pi_b.y.c0.limbs[i] != cpu_proof.pi_b.y.c0.limbs[i]) b_match = false;
+        if (gpu_proof.pi_b.y.c1.limbs[i] != cpu_proof.pi_b.y.c1.limbs[i]) b_match = false;
+    }
+    TEST_ASSERT(b_match, "GPU vs CPU: pi_b match");
+
+    // Compare π_C
+    bool c_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_c.x.limbs[i] != cpu_proof.pi_c.x.limbs[i]) c_match = false;
+        if (gpu_proof.pi_c.y.limbs[i] != cpu_proof.pi_c.y.limbs[i]) c_match = false;
+    }
+    TEST_ASSERT(c_match, "GPU vs CPU: pi_c match");
+}
+
+void test_groth16_determinism() {
+    printf("test_groth16_determinism...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+    auto witness = compute_witness(3);
+
+    Groth16Proof p1 = groth16_prove(r1cs, pk, witness, 17, 23);
+    Groth16Proof p2 = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    bool match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (p1.pi_a.x.limbs[i] != p2.pi_a.x.limbs[i]) match = false;
+        if (p1.pi_a.y.limbs[i] != p2.pi_a.y.limbs[i]) match = false;
+    }
+    TEST_ASSERT(match, "determinism: same input → same proof");
+}
+
+void test_groth16_different_witness() {
+    printf("test_groth16_different_witness...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+
+    Groth16Proof p1 = groth16_prove(r1cs, pk, compute_witness(3), 17, 23);
+    Groth16Proof p2 = groth16_prove(r1cs, pk, compute_witness(5), 17, 23);
+
+    // Different witness should produce different proof
+    bool different = false;
+    for (int i = 0; i < 12; ++i) {
+        if (p1.pi_a.x.limbs[i] != p2.pi_a.x.limbs[i]) { different = true; break; }
+    }
+    TEST_ASSERT(different, "different witness → different proof");
+}
+
+void test_groth16_different_randomness() {
+    printf("test_groth16_different_randomness...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    ProvingKey pk = generate_proving_key(r1cs, 42);
+    auto witness = compute_witness(3);
+
+    Groth16Proof p1 = groth16_prove(r1cs, pk, witness, 17, 23);
+    Groth16Proof p2 = groth16_prove(r1cs, pk, witness, 31, 37);
+
+    bool different = false;
+    for (int i = 0; i < 12; ++i) {
+        if (p1.pi_a.x.limbs[i] != p2.pi_a.x.limbs[i]) { different = true; break; }
+    }
+    TEST_ASSERT(different, "different randomness → different proof");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -4359,6 +6833,88 @@ int main() {
     test_plantard_gpu_vs_barrett_gpu();
     test_plantard_twiddle_precomputation();
     test_plantard_algebraic();
+
+    // ─── v2.0.0 Session 20: Fq + Fq2 Field Arithmetic Tests ──────────────────
+    printf("\n--- v2.0.0 Session 20: Fq (base field) arithmetic ---\n");
+    test_fq_cpu_self_test();
+    test_fq_montgomery_roundtrip();
+    test_fq_gpu_add();
+    test_fq_gpu_sub();
+    test_fq_gpu_mul();
+    test_fq_gpu_sqr();
+    test_fq_algebraic();
+
+    printf("\n--- v2.0.0 Session 20: Fq2 (extension field) arithmetic ---\n");
+    test_fq2_cpu_self_test();
+    test_fq2_gpu_add();
+    test_fq2_gpu_sub();
+    test_fq2_gpu_mul();
+    test_fq2_gpu_sqr();
+    test_fq2_algebraic();
+
+    // ─── v2.0.0 Session 21: Elliptic Curve Arithmetic Tests ──────────────────
+    printf("\n--- v2.0.0 Session 21: G1 Elliptic Curve Arithmetic ---\n");
+    test_g1_cpu_self_test();
+    test_g1_gpu_double();
+    test_g1_gpu_add();
+    test_g1_gpu_add_mixed();
+    test_g1_gpu_scalar_mul();
+    test_g1_gpu_scalar_mul_larger();
+    test_g1_gpu_on_curve();
+    test_g1_gpu_negate();
+    test_g1_identity();
+
+    printf("\n--- v2.0.0 Session 21: G2 Elliptic Curve Arithmetic ---\n");
+    test_g2_cpu_self_test();
+    test_g2_gpu_double();
+    test_g2_gpu_add();
+    test_g2_gpu_add_mixed();
+    test_g2_gpu_scalar_mul();
+    test_g2_gpu_on_curve();
+    test_g2_identity();
+
+    // ─── v2.0.0 Session 22: Multi-Scalar Multiplication Tests ────────────────
+    printf("\n--- v2.0.0 Session 22: MSM (Pippenger) ---\n");
+    test_msm_window_size();
+    test_msm_single_point();
+    test_msm_two_points();
+    test_msm_with_identity();
+    test_msm_all_ones();
+    test_msm_medium(8);
+    test_msm_medium(16);
+    test_msm_medium(32);
+    test_msm_medium(64);
+    test_msm_on_curve(128);
+    test_msm_on_curve(256);
+    test_msm_determinism();
+
+    // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────
+    printf("\n--- v2.0.0 Session 23: Polynomial Operations ---\n");
+    test_poly_pointwise_mul();
+    test_poly_pointwise_mul_sub();
+    test_poly_scale();
+    test_poly_pointwise_edge_cases();
+    test_poly_coset_ntt_roundtrip();
+    test_poly_coset_ntt_roundtrip_512();
+    test_poly_coset_ntt_1024();
+    test_poly_coset_ntt_vs_cpu();
+    test_poly_coset_ntt_inverse_vs_cpu();
+    test_poly_coset_ntt_zeros();
+    test_poly_coset_ntt_ones();
+    test_poly_coset_ntt_different_gen();
+    test_poly_quotient_zero();
+    test_poly_quotient_identity();
+
+    // ─── v2.0.0 Session 24: Groth16 Pipeline Tests ──────────────────────────
+    printf("\n--- v2.0.0 Session 24: Groth16 Pipeline ---\n");
+    test_groth16_witness();
+    test_groth16_r1cs_satisfied();
+    test_groth16_srs_on_curve();
+    test_groth16_gpu_proof();
+    test_groth16_gpu_vs_cpu();
+    test_groth16_determinism();
+    test_groth16_different_witness();
+    test_groth16_different_randomness();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
