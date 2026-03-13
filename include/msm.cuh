@@ -19,17 +19,16 @@ void msm_g1(G1Affine* result,
             size_t n,
             cudaStream_t stream = 0);
 
-// Optimal window size for Pippenger's method.
-// c ~ sqrt(log2(n)) for n points with 255-bit scalars.
+// Optimal window size for Pippenger's method with signed-digit recoding.
+// Heuristic: c = floor(log2(n)/2) + 1, clamped to [4, 16].
+// With signed digits, bucket count = 2^(c-1), so optimal c shifts up by ~1
+// compared to unsigned. Fine-tuning deferred to Session 28.
 inline int msm_optimal_window(size_t n) {
     if (n <= 1) return 1;
     int log_n = 0;
     size_t tmp = n;
     while (tmp > 1) { tmp >>= 1; ++log_n; }
-    // c = max(1, sqrt(log_n))
-    int c = 1;
-    while ((c + 1) * (c + 1) <= log_n) ++c;
-    // Clamp to reasonable range
+    int c = log_n / 2 + 1;
     if (c < 4) c = 4;
     if (c > 16) c = 16;
     return c;

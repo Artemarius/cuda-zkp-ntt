@@ -1514,11 +1514,13 @@ Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
 
 ---
 
-## v2.1.0 — Production MSM (PLANNED)
+## v2.1.0 — Production MSM (IN PROGRESS — Session 26 complete)
 
 **Goal:** Replace correctness-focused single-thread MSM with production-quality parallel Pippenger.
 Current: 261ms at 2^10, 42.6s at 2^18. Gap vs SOTA: ~20-85x in throughput.
 Target: >20x speedup (n=2^18 from 42.7s → <2s).
+
+**Session 26 status:** 5.4x speedup achieved (42.7s → 8.0s at 2^18). 641 tests.
 
 **Primary references:**
 - **cuZK** (Lu et al., TCHES 2023) — SpMV formulation: radix sort → sparse coordinate → parallel accumulation
@@ -1530,30 +1532,51 @@ Target: >20x speedup (n=2^18 from 42.7s → <2s).
 (halves bucket count), TCHES 2024 load-balanced parallel reduction, mixed affine/Jacobian
 arithmetic, optimal window auto-tuning (c ≈ log2(n)).
 
-### Session 26 — Signed-Digit Recoding + Parallel Bucket Accumulation
+### Session 26 — Signed-Digit Recoding + Segment-Offset Accumulation ✅ COMPLETE
 
-**Objective:** Replace naive bucket accumulation with signed-digit recoding and truly parallel accumulation.
+**Objective:** Replace naive bucket accumulation with signed-digit recoding and segment-offset lookup.
 
-**Deliverables:**
+**Implemented:**
 1. Signed-digit scalar recoding kernel:
-   - Extract signed digits in range `[-(2^(c-1)-1), 2^(c-1)]` per (scalar, window)
-   - Halves bucket count from `2^c` to `2^(c-1)`; negative digits negate the point
-   - Output: `(abs_bucket_id, sign_flag, point_index)` tuples
+   - Extract signed digits with carry propagation via per-scalar `uint8_t` carry buffer
+   - Halves bucket count from `2^c` to `2^(c-1)+1`; negative digits negate the point
+   - Final carry overflow window handles carry out of last regular window
+   - Output: `d_bucket_ids[i] = |digit|`, `d_packed_values[i] = point_idx | (sign << 31)`
 2. Revised window size selection:
-   - Remove `c >= 4` clamp; use `c = max(1, round(log2(n)))` tuned for RTX 3060
-   - For n=2^18: c=15 → W=17 windows, 2^14=16384 buckets per window
-3. Parallel bucket accumulation:
-   - CUB sort by bucket_id → CUB `DeviceRunLengthEncode` for bucket boundaries
-   - One warp per bucket; sequential mixed addition within warp
-   - Large buckets: multiple warps with tree reduction
-4. Point negation for signed digits (fused into accumulation)
+   - `c = floor(log2(n)/2) + 1`, clamped [4, 16]
+   - For n=2^18: c=10, W=26 windows, 513 buckets per window
+3. Segment-offset accumulation:
+   - After CUB sort: `atomicMin` to find segment starts, backward-fill for empty buckets
+   - Replaces O(log n) binary search with O(1) offset lookup per bucket
+   - Point negation fused into accumulation (read sign bit from packed value)
 
-**Tests (~20 new, cumulative ~641):**
-- Signed-digit extraction preserves scalar value (reconstruct from digits)
-- Edge cases: scalar=0, 1, p-1, all-ones
-- Parallel vs sequential accumulation: bitwise match at n=8..64
-- msm_g1_v2 vs msm_g1 cross-validation at n=1..64
-- On-curve checks at n=128, 256
+**Measured results (RTX 3060 Laptop, 7-rep median):**
+
+| Size | v2.0.0 (ms) | v2.1.0-s26 (ms) | Speedup |
+|------|-------------|-----------------|---------|
+| 2^10 | 261 | 202 | 1.3x |
+| 2^12 | 755 | 417 | 1.8x |
+| 2^14 | 2,704 | 876 | 3.1x |
+| 2^15 | 5,317 | 1,399 | 3.8x |
+| 2^16 | 10,633 | 2,890 | 3.7x |
+| 2^18 | 42,714 | 7,982 | **5.4x** |
+
+**Analysis:**
+- Signed-digit recoding halves bucket count → halves bucket reduction work.
+- Segment offsets eliminate binary search → cleaner memory access pattern.
+- Improved window sizing (c=10 at 2^18 vs c=4) gives many fewer windows (26 vs 64)
+  with more effective bucket distribution.
+- **Remaining bottleneck**: bucket reduction and window combination still single-thread.
+  At c=10 with 513 buckets, the running sum does 512 EC additions sequentially.
+  Parallelizing this is Session 27's target.
+
+**Tests (20 new, 641 total):**
+- Window size function: c=6/8/10/11 for n=2^10/14/18/20
+- Cross-validation at n=128, 256 vs CPU naive MSM
+- On-curve checks at n=512, 1024, 2048, 4096
+- Multi-limb scalars, high-bit scalars (r-1), all-zeros, single-bucket, power-of-2
+- Mixed zero/nonzero scalars, determinism (3 runs)
+- Benchmark data: `results/data/bench_msm_v210_s26.json`
 
 ### Session 27 — Parallel Bucket Reduction + Window Combination
 
@@ -1788,7 +1811,7 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 
 | Session | Release | Objective | New Tests | Cumulative |
 |---------|---------|-----------|-----------|------------|
-| 26 | v2.1.0 | CUB radix sort + parallel bucket accumulation | ~20 | ~641 |
+| 26 | v2.1.0 | Signed-digit recoding + segment-offset accumulation ✅ | 20 | 641 |
 | 27 | v2.1.0 | Parallel reduction + mixed affine/Jacobian | ~15 | ~656 |
 | 28 | v2.1.0 | Window auto-tuning + benchmark + release | ~10 | ~666 |
 | 29 | v2.2.0 | Fibonacci 2^18 R1CS circuit | ~15 | ~681 |

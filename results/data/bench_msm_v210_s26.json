@@ -1,0 +1,51 @@
+{
+  "benchmark": "msm",
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "sm": "8.6",
+  "sms": 30,
+  "reps": 7,
+  "results": [
+    {
+      "log_n": 10,
+      "n": 1024,
+      "window_bits": 6,
+      "msm_ms": 202.0493,
+      "points_per_ms": 5.1
+    },
+    {
+      "log_n": 12,
+      "n": 4096,
+      "window_bits": 7,
+      "msm_ms": 416.9632,
+      "points_per_ms": 9.8
+    },
+    {
+      "log_n": 14,
+      "n": 16384,
+      "window_bits": 8,
+      "msm_ms": 875.6201,
+      "points_per_ms": 18.7
+    },
+    {
+      "log_n": 15,
+      "n": 32768,
+      "window_bits": 8,
+      "msm_ms": 1398.9194,
+      "points_per_ms": 23.4
+    },
+    {
+      "log_n": 16,
+      "n": 65536,
+      "window_bits": 9,
+      "msm_ms": 2890.3848,
+      "points_per_ms": 22.7
+    },
+    {
+      "log_n": 18,
+      "n": 262144,
+      "window_bits": 10,
+      "msm_ms": 7982.2388,
+      "points_per_ms": 32.8
+    }
+  ]
+}

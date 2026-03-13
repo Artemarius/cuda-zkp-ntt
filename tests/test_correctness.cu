@@ -5270,6 +5270,464 @@ void test_msm_window_size() {
     TEST_ASSERT(msm_optimal_window(1 << 20) <= 16, "MSM window: n=2^20 <= 16");
 }
 
+// =============================================================================
+// v2.1.0 Session 26: Production MSM — Signed-Digit + Segment Offsets Tests
+// =============================================================================
+
+// Test: updated window size function gives reasonable values
+void test_msm_window_size_v2() {
+    printf("test_msm_window_size_v2...\n");
+
+    // c = floor(log2(n)/2) + 1, clamped [4, 16]
+    TEST_ASSERT(msm_optimal_window(1 << 10) == 6, "MSM window v2: n=2^10 -> c=6");
+    TEST_ASSERT(msm_optimal_window(1 << 14) == 8, "MSM window v2: n=2^14 -> c=8");
+    TEST_ASSERT(msm_optimal_window(1 << 18) == 10, "MSM window v2: n=2^18 -> c=10");
+    TEST_ASSERT(msm_optimal_window(1 << 20) == 11, "MSM window v2: n=2^20 -> c=11");
+}
+
+// Test: MSM with high-bit scalars (near r-1)
+void test_msm_high_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_high_scalars...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+    // Use scalar = r-1 (max valid scalar for BLS12-381 Fr)
+    // r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
+    uint32_t scalar_r_minus_1[8] = {
+        0x00000000u, 0xffffffffu, 0xfffe5bfeu, 0x53bda402u,
+        0x09a1d805u, 0x3339d808u, 0x299d7d48u, 0x73eda753u
+    };
+
+    G1AffineRef cpu_result = g1_scalar_mul_ref(cpu_g, scalar_r_minus_1);
+
+    G1Affine h_base = make_g1_gen_affine_gpu();
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, &h_base, sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, scalar_r_minus_1, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 1);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM: scalar=r-1 matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with mixed zero/nonzero scalars (stress signed-digit zero handling)
+void test_msm_mixed_zero_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_mixed_zero_scalars...\n");
+
+    const int N = 8;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Alternating: 0, 3, 0, 7, 0, 11, 0, 13
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    h_scalars[1 * 8] = 3;
+    h_scalars[3 * 8] = 7;
+    h_scalars[5 * 8] = 11;
+    h_scalars[7 * 8] = 13;
+
+    // All bases = G
+    std::vector<G1Affine> h_bases(N, make_g1_gen_affine_gpu());
+
+    // CPU: 0*G + 3*G + 0*G + 7*G + 0*G + 11*G + 0*G + 13*G = 34*G
+    G1AffineRef cpu_bases_ref[8];
+    for (int i = 0; i < N; ++i) cpu_bases_ref[i] = cpu_g;
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases_ref, h_scalars.data(), N);
+
+    uint32_t s34[8] = {34, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef expected = g1_scalar_mul_ref(cpu_g, s34);
+    TEST_ASSERT(cpu_result == expected, "MSM mixed zero: CPU ref = 34G");
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM mixed zero: GPU matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with all identical scalars (single bucket stress test)
+void test_msm_single_bucket() {
+    using namespace ff_ref;
+    printf("test_msm_single_bucket...\n");
+
+    const int N = 16;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // All scalars = 42 (all points go to same bucket per window)
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = 42;
+
+    // bases: i*G for i=1..N
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM single bucket: GPU matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with power-of-2 scalars (stress different window decompositions)
+void test_msm_power_of_2_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_power_of_2_scalars...\n");
+
+    const int N = 8;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Scalars: 1, 2, 4, 8, 16, 32, 64, 128
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) h_scalars[i * 8] = 1u << i;
+
+    // All bases = G -> result = (1+2+4+8+16+32+64+128)*G = 255*G
+    std::vector<G1Affine> h_bases(N, make_g1_gen_affine_gpu());
+
+    G1AffineRef cpu_bases_ref[8];
+    for (int i = 0; i < N; ++i) cpu_bases_ref[i] = cpu_g;
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases_ref, h_scalars.data(), N);
+
+    uint32_t s255[8] = {255, 0, 0, 0, 0, 0, 0, 0};
+    G1AffineRef expected = g1_scalar_mul_ref(cpu_g, s255);
+    TEST_ASSERT(cpu_result == expected, "MSM pow2: CPU ref = 255G");
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM pow2: GPU matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM cross-validation at larger sizes (n=128, 256) vs CPU
+void test_msm_cross_validate(int n) {
+    using namespace ff_ref;
+    printf("test_msm_cross_validate (n=%d)...\n", n);
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1AffineRef> cpu_bases(n);
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Use small scalars for CPU feasibility
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8] = (uint32_t)((i * 17 + 5) % 128);
+    }
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), n);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "MSM cross-validate n=%d: GPU matches CPU", n);
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), msg);
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM on-curve at larger sizes (n=512, 1024)
+void test_msm_on_curve_large(int n) {
+    using namespace ff_ref;
+    printf("test_msm_on_curve_large (n=%d)...\n", n);
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Larger scalars (multi-limb) to stress signed-digit recoding
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0xDEAD + 0xBEEF);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0x1337 + 0x42);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    G1AffineRef result_ref;
+    result_ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    result_ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    result_ref.infinity = gpu_result.infinity;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "MSM on-curve n=%d: result on curve", n);
+    TEST_ASSERT(gpu_result.infinity || g1_is_on_curve_ref(result_ref), msg);
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM with multi-limb scalars (cross-validate, exercises signed-digit carries)
+void test_msm_multi_limb_scalars() {
+    using namespace ff_ref;
+    printf("test_msm_multi_limb_scalars...\n");
+
+    const int N = 8;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    // Bases: i*G
+    std::vector<G1AffineRef> cpu_bases(N);
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        cpu_bases[i] = g1_scalar_mul_ref(cpu_g, si);
+        cpu_bases[i].x.to_u32(h_bases[i].x.limbs);
+        cpu_bases[i].y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    // Multi-limb scalars: large values that exercise carry propagation
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    // scalar[0] = 0xFFFFFFFF (all-ones in limb 0 -> forces carries)
+    h_scalars[0 * 8 + 0] = 0xFFFFFFFFu;
+    // scalar[1] = 0x100000000 (one in limb 1)
+    h_scalars[1 * 8 + 1] = 1;
+    // scalar[2] = 0xDEADBEEF12345678
+    h_scalars[2 * 8 + 0] = 0x12345678u;
+    h_scalars[2 * 8 + 1] = 0xDEADBEEFu;
+    // scalar[3] = small
+    h_scalars[3 * 8 + 0] = 7;
+    // scalar[4] = 0xFFFFFFFFFFFFFFFF (two all-ones limbs)
+    h_scalars[4 * 8 + 0] = 0xFFFFFFFFu;
+    h_scalars[4 * 8 + 1] = 0xFFFFFFFFu;
+    // scalar[5] = 1
+    h_scalars[5 * 8 + 0] = 1;
+    // scalar[6] = value spanning 3 limbs
+    h_scalars[6 * 8 + 0] = 0xAAAAAAAAu;
+    h_scalars[6 * 8 + 1] = 0xBBBBBBBBu;
+    h_scalars[6 * 8 + 2] = 0xCCCCCCCCu;
+    // scalar[7] = 0
+    // (already zero)
+
+    G1AffineRef cpu_result = msm_naive_ref(cpu_bases.data(), h_scalars.data(), N);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_result), "MSM multi-limb: GPU matches CPU");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM all-zeros scalars -> identity
+void test_msm_all_zeros() {
+    printf("test_msm_all_zeros...\n");
+
+    const int N = 8;
+    std::vector<G1Affine> h_bases(N, make_g1_gen_affine_gpu());
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, N);
+
+    TEST_ASSERT(gpu_result.infinity, "MSM all-zeros: result is identity");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM determinism with new implementation (run 3 times)
+void test_msm_determinism_v2() {
+    using namespace ff_ref;
+    printf("test_msm_determinism_v2...\n");
+
+    const int N = 64;
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(N * 8, 0);
+    for (int i = 0; i < N; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0xABCD + 0x1234);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0x5678);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, N * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, N * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), N * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), N * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine r1, r2, r3;
+    msm_g1(&r1, d_bases, d_scalars, N);
+    msm_g1(&r2, d_bases, d_scalars, N);
+    msm_g1(&r3, d_bases, d_scalars, N);
+
+    bool m12 = (memcmp(&r1, &r2, sizeof(G1Affine)) == 0);
+    bool m23 = (memcmp(&r2, &r3, sizeof(G1Affine)) == 0);
+    TEST_ASSERT(m12 && m23, "MSM determinism v2: 3 runs identical");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM on-curve at n=2048 and n=4096 (exercises larger window sizes)
+void test_msm_on_curve_2k(int n) {
+    using namespace ff_ref;
+    printf("test_msm_on_curve_2k (n=%d)...\n", n);
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    std::vector<G1Affine> h_bases(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t si[8] = {(uint32_t)(i + 1), 0, 0, 0, 0, 0, 0, 0};
+        G1AffineRef pt = g1_scalar_mul_ref(cpu_g, si);
+        pt.x.to_u32(h_bases[i].x.limbs);
+        pt.y.to_u32(h_bases[i].y.limbs);
+        h_bases[i].infinity = false;
+    }
+
+    std::vector<uint32_t> h_scalars(n * 8, 0);
+    for (int i = 0; i < n; ++i) {
+        h_scalars[i * 8 + 0] = (uint32_t)(i * 0xBEEF + 0xCAFE);
+        h_scalars[i * 8 + 1] = (uint32_t)(i * 0xFACE);
+        h_scalars[i * 8 + 2] = (uint32_t)(i * 0xD00D + 1);
+    }
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, n * sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, n * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, h_bases.data(), n * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalars.data(), n * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, n);
+
+    G1AffineRef result_ref;
+    result_ref.x = FqRef::from_u32(gpu_result.x.limbs);
+    result_ref.y = FqRef::from_u32(gpu_result.y.limbs);
+    result_ref.infinity = gpu_result.infinity;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "MSM on-curve n=%d: result on curve", n);
+    TEST_ASSERT(gpu_result.infinity || g1_is_on_curve_ref(result_ref), msg);
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
+// Test: MSM scalar=1 for single point (simplest signed-digit case)
+void test_msm_scalar_one() {
+    using namespace ff_ref;
+    printf("test_msm_scalar_one...\n");
+
+    G1AffineRef cpu_g = G1AffineRef::generator();
+
+    G1Affine h_base = make_g1_gen_affine_gpu();
+    uint32_t h_scalar[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+
+    G1Affine *d_bases;
+    uint32_t *d_scalars;
+    CUDA_CHECK(cudaMalloc(&d_bases, sizeof(G1Affine)));
+    CUDA_CHECK(cudaMalloc(&d_scalars, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_bases, &h_base, sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scalars, h_scalar, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    G1Affine gpu_result;
+    msm_g1(&gpu_result, d_bases, d_scalars, 1);
+
+    TEST_ASSERT(g1_affine_eq(gpu_result, cpu_g), "MSM: 1*G = G");
+
+    CUDA_CHECK(cudaFree(d_bases));
+    CUDA_CHECK(cudaFree(d_scalars));
+}
+
 // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────────
 
 // Helper: make standard-form FpElement from a small integer
@@ -6887,6 +7345,24 @@ int main() {
     test_msm_on_curve(128);
     test_msm_on_curve(256);
     test_msm_determinism();
+
+    // ─── v2.1.0 Session 26: Production MSM Tests ────────────────────────────
+    printf("\n--- v2.1.0 Session 26: Production MSM (Signed-Digit + Segments) ---\n");
+    test_msm_window_size_v2();
+    test_msm_high_scalars();
+    test_msm_mixed_zero_scalars();
+    test_msm_single_bucket();
+    test_msm_power_of_2_scalars();
+    test_msm_cross_validate(128);
+    test_msm_cross_validate(256);
+    test_msm_on_curve_large(512);
+    test_msm_on_curve_large(1024);
+    test_msm_multi_limb_scalars();
+    test_msm_all_zeros();
+    test_msm_determinism_v2();
+    test_msm_on_curve_2k(2048);
+    test_msm_on_curve_2k(4096);
+    test_msm_scalar_one();
 
     // ─── v2.0.0 Session 23: Polynomial Operations Tests ─────────────────────
     printf("\n--- v2.0.0 Session 23: Polynomial Operations ---\n");
