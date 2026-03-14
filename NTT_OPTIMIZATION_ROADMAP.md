@@ -1738,7 +1738,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 **Field tower:** Fq → Fq2 (done) → Fq6 (cubic over Fq2) → Fq12 (quadratic over Fq6)
 **BLS12-381 parameter:** u = -0xd201000000010000 (64-bit, Hamming weight 5)
 
-### Session 31 — Fq6 Arithmetic
+### Session 31 — Fq6 Arithmetic ✅ COMPLETE
 
 **Objective:** Implement Fq6 = Fq2[v] / (v^3 − β) where β = (1+u) is the Fq2 nonresidue.
 
@@ -1747,21 +1747,25 @@ Complete the prove→verify loop. Mathematical capstone of the project.
    - `Fq6Element = {Fq2Element c0, c1, c2}` (element = c0 + c1·v + c2·v²)
    - `fq6_add/sub/neg` (component-wise, 3 Fq2 ops each)
    - `fq6_mul` (Karatsuba-like cubic: 6 Fq2 muls = 18 Fq muls)
-   - `fq6_sqr` (specialized, cheaper than mul)
+   - `fq6_sqr` (Chung-Hasan SQR2: 2 Fq2 muls + 3 Fq2 sqrs = 12 Fq muls)
    - `fq6_inv` (via norm to Fq2)
    - `fq6_mul_by_nonresidue` (multiply by v: shift + `fq2_mul_by_nonresidue`)
    - `fq6_mul_by_01`, `fq6_mul_by_1` (sparse mul for Miller loop)
-   - `fq6_frobenius_map` (precomputed Frobenius coefficients)
+   - `fq6_frobenius_map` (coefficients computed via `fq2_pow_ref`, passed as device pointers)
+   - `fq6_scale` (multiply by Fq2 scalar)
 2. CPU reference `Fq6Ref` in `tests/ff_reference.h`
-3. GPU test kernels in `src/ff_fq_kernels.cu`
+   - Also added: `fq2_scale_ref`, `fq2_pow_ref`, `div_6limb_by_3`, Frobenius coefficient computation
+3. GPU test kernels in `src/ff_fq_kernels.cu` (add, sub, mul, sqr)
 
-**Tests (~25 new, cumulative ~716):**
-- CPU self-test: add/sub/mul/sqr/inv round-trip, algebraic identities
-- GPU vs CPU: add, sub, mul, sqr at N=1024
-- Inverse: a · a^{-1} = 1 for random elements
-- Distributivity: (a+b)·c = a·c + b·c
-- Frobenius: f^q identity
-- Sparse mul: `mul_by_01` matches general mul with zeroed coefficients
+**Tests (31 new, cumulative 901):**
+- CPU self-test: add/sub/mul/sqr/inv, negation, commutativity, squaring consistency,
+  mul_by_nonresidue, mul_by_01 vs general, mul_by_1 vs general, distributivity (15 assertions)
+- GPU vs CPU: add (256), sub (256), mul (256), sqr (256)
+- Algebraic: commutativity (64), associativity (64), distributivity (64), sqr consistency (64)
+- Inverse: a · a^{-1} = 1 for 32 random elements
+- Sparse mul: mul_by_01 (32) + mul_by_1 (32) match general mul
+- Frobenius: φ^6(a)=a period (16), multiplicativity φ(ab)=φ(a)φ(b) (16), fixes Fq2 elements
+- Nonresidue chain: v^3 = β algebraic identity
 
 ### Session 32 — Fq12 Arithmetic
 
@@ -1868,8 +1872,8 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 | 27 | v2.1.0 | Parallel bucket reduction (Hillis-Steele suffix scan) ✅ | 14 | 655 |
 | 28 | v2.1.0 | Window auto-tuning + benchmark + release ✅ | 46 | 701 |
 | 29 | v2.2.0 | Fibonacci R1CS circuit + sparse setup + GPU MSM proof ✅ | 119 | 820 |
-| 30 | v2.2.0 | 2-stream batch pipeline + release | ~10 | ~830 |
-| 31 | v3.0.0 | Fq6 arithmetic | ~25 | ~855 |
+| 30 | v2.2.0 | 2-stream batch pipeline + release ✅ | 50 | 870 |
+| 31 | v3.0.0 | Fq6 arithmetic ✅ | 31 | 901 |
 | 32 | v3.0.0 | Fq12 arithmetic | ~20 | ~875 |
 | 33 | v3.0.0 | Miller loop | ~15 | ~890 |
 | 34 | v3.0.0 | Final exponentiation | ~15 | ~905 |

@@ -7,6 +7,7 @@
 #include "ff_babybear.cuh"
 #include "ff_fq.cuh"
 #include "ff_fq2.cuh"
+#include "ff_fq6.cuh"
 #include "ec_g1.cuh"
 #include "ec_g2.cuh"
 #include "msm.cuh"
@@ -56,6 +57,12 @@ extern __global__ void fq2_add_kernel(const Fq2Element* __restrict__ a, const Fq
 extern __global__ void fq2_sub_kernel(const Fq2Element* __restrict__ a, const Fq2Element* __restrict__ b, Fq2Element* __restrict__ out, uint32_t n);
 extern __global__ void fq2_mul_kernel(const Fq2Element* __restrict__ a, const Fq2Element* __restrict__ b, Fq2Element* __restrict__ out, uint32_t n);
 extern __global__ void fq2_sqr_kernel(const Fq2Element* __restrict__ a, Fq2Element* __restrict__ out, uint32_t n);
+
+// Fq6 (cubic extension) kernel declarations
+extern __global__ void fq6_add_kernel(const Fq6Element* __restrict__ a, const Fq6Element* __restrict__ b, Fq6Element* __restrict__ out, uint32_t n);
+extern __global__ void fq6_sub_kernel(const Fq6Element* __restrict__ a, const Fq6Element* __restrict__ b, Fq6Element* __restrict__ out, uint32_t n);
+extern __global__ void fq6_mul_kernel(const Fq6Element* __restrict__ a, const Fq6Element* __restrict__ b, Fq6Element* __restrict__ out, uint32_t n);
+extern __global__ void fq6_sqr_kernel(const Fq6Element* __restrict__ a, Fq6Element* __restrict__ out, uint32_t n);
 
 // EC kernel declarations (defined in src/ec_kernels.cu)
 extern __global__ void g1_double_kernel(const G1Jacobian* __restrict__ in, G1Jacobian* __restrict__ out, uint32_t n);
@@ -4281,6 +4288,419 @@ void test_fq2_algebraic() {
     TEST_ASSERT(pass_sqr == N, "Fq2 sqr consistency failure");
     printf("  Comm: %d/%d, Assoc: %d/%d, Dist: %d/%d, Sqr: %d/%d\n",
            pass_comm, N, pass_assoc, N, pass_dist, N, pass_sqr, N);
+}
+
+// =============================================================================
+// v3.0.0 Session 31: Fq6 Field Arithmetic Tests
+// =============================================================================
+
+// ─── Helper: convert Fq6Ref <-> Fq6Element ─────────────────────────────────
+
+static Fq6Element fq6_ref_to_gpu(const ff_ref::Fq6Ref& r) {
+    Fq6Element e;
+    r.c0.c0.to_u32(e.c0.c0.limbs);
+    r.c0.c1.to_u32(e.c0.c1.limbs);
+    r.c1.c0.to_u32(e.c1.c0.limbs);
+    r.c1.c1.to_u32(e.c1.c1.limbs);
+    r.c2.c0.to_u32(e.c2.c0.limbs);
+    r.c2.c1.to_u32(e.c2.c1.limbs);
+    return e;
+}
+
+static ff_ref::Fq6Ref fq6_gpu_to_ref(const Fq6Element& e) {
+    using namespace ff_ref;
+    return {
+        {FqRef::from_u32(e.c0.c0.limbs), FqRef::from_u32(e.c0.c1.limbs)},
+        {FqRef::from_u32(e.c1.c0.limbs), FqRef::from_u32(e.c1.c1.limbs)},
+        {FqRef::from_u32(e.c2.c0.limbs), FqRef::from_u32(e.c2.c1.limbs)}
+    };
+}
+
+static ff_ref::Fq6Ref make_fq6_test_val(uint64_t seed) {
+    using namespace ff_ref;
+    return {
+        {make_fq_test_val(seed * 6 + 1), make_fq_test_val(seed * 6 + 2)},
+        {make_fq_test_val(seed * 6 + 3), make_fq_test_val(seed * 6 + 4)},
+        {make_fq_test_val(seed * 6 + 5), make_fq_test_val(seed * 6 + 6)}
+    };
+}
+
+// ─── Fq6 CPU Self-Test ──────────────────────────────────────────────────────
+
+void test_fq6_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_fq6_cpu_self_test...\n");
+
+    Fq6Ref z = Fq6Ref::zero();
+    Fq6Ref one = Fq6Ref::one_mont();
+
+    // Basic identities
+    TEST_ASSERT(fq6_add_ref(z, z) == z, "Fq6: 0 + 0 = 0");
+    TEST_ASSERT(fq6_mul_ref(one, one) == one, "Fq6: 1 * 1 = 1");
+
+    Fq6Ref a = make_fq6_test_val(1);
+
+    TEST_ASSERT(fq6_add_ref(a, z) == a, "Fq6: a + 0 = a");
+    TEST_ASSERT(fq6_sub_ref(a, a) == z, "Fq6: a - a = 0");
+    TEST_ASSERT(fq6_mul_ref(a, one) == a, "Fq6: a * 1 = a");
+
+    // Negation
+    Fq6Ref neg_a = fq6_neg_ref(a);
+    TEST_ASSERT(fq6_add_ref(a, neg_a) == z, "Fq6: a + (-a) = 0");
+
+    // Inverse: a * a^{-1} = 1
+    Fq6Ref a_inv = fq6_inv_ref(a);
+    Fq6Ref should_one = fq6_mul_ref(a, a_inv);
+    TEST_ASSERT(should_one == one, "Fq6: a * a^{-1} = 1");
+
+    // Commutativity
+    Fq6Ref b = make_fq6_test_val(2);
+    TEST_ASSERT(fq6_mul_ref(a, b) == fq6_mul_ref(b, a), "Fq6: a*b = b*a");
+
+    // Squaring consistency: sqr(a) == mul(a, a)
+    Fq6Ref sq1 = fq6_sqr_ref(a);
+    Fq6Ref sq2 = fq6_mul_ref(a, a);
+    TEST_ASSERT(sq1 == sq2, "Fq6: sqr(a) == mul(a,a)");
+
+    // mul_by_nonresidue: multiply by v
+    // (c0 + c1·v + c2·v²)·v = β·c2 + c0·v + c1·v²
+    Fq6Ref nr = fq6_mul_by_nonresidue_ref(a);
+    TEST_ASSERT(nr.c0 == fq2_mul_by_nonresidue_ref(a.c2), "Fq6: mul_by_nonresidue c0");
+    TEST_ASSERT(nr.c1 == a.c0, "Fq6: mul_by_nonresidue c1");
+    TEST_ASSERT(nr.c2 == a.c1, "Fq6: mul_by_nonresidue c2");
+
+    // mul_by_01: should match general mul with c2=0
+    Fq2Ref b0 = {make_fq_test_val(100), make_fq_test_val(101)};
+    Fq2Ref b1 = {make_fq_test_val(102), make_fq_test_val(103)};
+    Fq6Ref sparse_b = {b0, b1, Fq2Ref::zero()};
+    Fq6Ref full_prod = fq6_mul_ref(a, sparse_b);
+    Fq6Ref sparse_prod = fq6_mul_by_01_ref(a, b0, b1);
+    TEST_ASSERT(full_prod == sparse_prod, "Fq6: mul_by_01 matches general mul");
+
+    // mul_by_1: should match general mul with c0=c2=0
+    Fq6Ref sparse_b1 = {Fq2Ref::zero(), b1, Fq2Ref::zero()};
+    Fq6Ref full_prod1 = fq6_mul_ref(a, sparse_b1);
+    Fq6Ref sparse_prod1 = fq6_mul_by_1_ref(a, b1);
+    TEST_ASSERT(full_prod1 == sparse_prod1, "Fq6: mul_by_1 matches general mul");
+
+    // Distributivity: (a+b)*c = a*c + b*c
+    Fq6Ref c = make_fq6_test_val(3);
+    Fq6Ref lhs = fq6_mul_ref(fq6_add_ref(a, b), c);
+    Fq6Ref rhs = fq6_add_ref(fq6_mul_ref(a, c), fq6_mul_ref(b, c));
+    TEST_ASSERT(lhs == rhs, "Fq6: distributivity");
+
+    printf("  All Fq6 CPU self-tests passed\n");
+}
+
+// ─── Fq6 GPU Mul Test ──────────────────────────────────────────────────────
+
+void test_fq6_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_fq6_gpu_mul...\n");
+
+    const uint32_t N = 256;
+    std::vector<Fq6Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 1));
+        h_b[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 2));
+    }
+
+    Fq6Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+
+    fq6_mul_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq6Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq6Ref ra = fq6_gpu_to_ref(h_a[i]);
+        Fq6Ref rb = fq6_gpu_to_ref(h_b[i]);
+        Fq6Ref expected = fq6_mul_ref(ra, rb);
+        Fq6Ref got = fq6_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq6 GPU mul: all elements match CPU reference");
+    printf("  Fq6 mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq6 GPU Add Test ──────────────────────────────────────────────────────
+
+void test_fq6_gpu_add() {
+    using namespace ff_ref;
+    printf("test_fq6_gpu_add...\n");
+
+    const uint32_t N = 256;
+    std::vector<Fq6Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 1));
+        h_b[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 2));
+    }
+
+    Fq6Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+
+    fq6_add_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq6Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq6Ref ra = fq6_gpu_to_ref(h_a[i]);
+        Fq6Ref rb = fq6_gpu_to_ref(h_b[i]);
+        Fq6Ref expected = fq6_add_ref(ra, rb);
+        Fq6Ref got = fq6_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq6 GPU add: all elements match CPU reference");
+    printf("  Fq6 add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq6 GPU Sub Test ──────────────────────────────────────────────────────
+
+void test_fq6_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_fq6_gpu_sub...\n");
+
+    const uint32_t N = 256;
+    std::vector<Fq6Element> h_a(N), h_b(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 1));
+        h_b[i] = fq6_ref_to_gpu(make_fq6_test_val(i * 2 + 2));
+    }
+
+    Fq6Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+
+    fq6_sub_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq6Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq6Ref ra = fq6_gpu_to_ref(h_a[i]);
+        Fq6Ref rb = fq6_gpu_to_ref(h_b[i]);
+        Fq6Ref expected = fq6_sub_ref(ra, rb);
+        Fq6Ref got = fq6_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq6 GPU sub: all elements match CPU reference");
+    printf("  Fq6 sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq6 GPU Sqr Test ──────────────────────────────────────────────────────
+
+void test_fq6_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_fq6_gpu_sqr...\n");
+
+    const uint32_t N = 256;
+    std::vector<Fq6Element> h_a(N), h_out(N);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq6_ref_to_gpu(make_fq6_test_val(i + 1));
+    }
+
+    Fq6Element *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq6Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq6Element), cudaMemcpyHostToDevice));
+
+    fq6_sqr_kernel<<<(N + 63) / 64, 64>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq6Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq6Ref ra = fq6_gpu_to_ref(h_a[i]);
+        Fq6Ref expected = fq6_sqr_ref(ra);
+        Fq6Ref got = fq6_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq6 GPU sqr: all elements match CPU reference");
+    printf("  Fq6 sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq6 Algebraic Properties Test ─────────────────────────────────────────
+
+void test_fq6_algebraic() {
+    using namespace ff_ref;
+    printf("test_fq6_algebraic...\n");
+
+    const int N = 64;
+    int pass_comm = 0, pass_assoc = 0, pass_dist = 0, pass_sqr = 0;
+
+    for (int i = 0; i < N; ++i) {
+        Fq6Ref a = make_fq6_test_val(i * 3 + 1);
+        Fq6Ref b = make_fq6_test_val(i * 3 + 2);
+        Fq6Ref c = make_fq6_test_val(i * 3 + 3);
+
+        if (fq6_mul_ref(a, b) == fq6_mul_ref(b, a)) ++pass_comm;
+        if (fq6_mul_ref(fq6_mul_ref(a, b), c) == fq6_mul_ref(a, fq6_mul_ref(b, c))) ++pass_assoc;
+
+        Fq6Ref lhs = fq6_mul_ref(a, fq6_add_ref(b, c));
+        Fq6Ref rhs = fq6_add_ref(fq6_mul_ref(a, b), fq6_mul_ref(a, c));
+        if (lhs == rhs) ++pass_dist;
+
+        if (fq6_sqr_ref(a) == fq6_mul_ref(a, a)) ++pass_sqr;
+    }
+    TEST_ASSERT(pass_comm == N, "Fq6 commutativity failure");
+    TEST_ASSERT(pass_assoc == N, "Fq6 associativity failure");
+    TEST_ASSERT(pass_dist == N, "Fq6 distributivity failure");
+    TEST_ASSERT(pass_sqr == N, "Fq6 sqr consistency failure");
+    printf("  Comm: %d/%d, Assoc: %d/%d, Dist: %d/%d, Sqr: %d/%d\n",
+           pass_comm, N, pass_assoc, N, pass_dist, N, pass_sqr, N);
+}
+
+// ─── Fq6 Inverse Round-Trip Test ────────────────────────────────────────────
+
+void test_fq6_inverse() {
+    using namespace ff_ref;
+    printf("test_fq6_inverse...\n");
+
+    const int N = 32;
+    int pass = 0;
+    Fq6Ref one = Fq6Ref::one_mont();
+
+    for (int i = 0; i < N; ++i) {
+        Fq6Ref a = make_fq6_test_val(i + 1);
+        Fq6Ref a_inv = fq6_inv_ref(a);
+        Fq6Ref prod = fq6_mul_ref(a, a_inv);
+        if (prod == one) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Fq6 inverse round-trip failure");
+    printf("  Fq6 inverse: %d/%d passed\n", pass, N);
+}
+
+// ─── Fq6 Sparse Mul Tests ──────────────────────────────────────────────────
+
+void test_fq6_sparse_mul() {
+    using namespace ff_ref;
+    printf("test_fq6_sparse_mul...\n");
+
+    const int N = 32;
+    int pass_01 = 0, pass_1 = 0;
+
+    for (int i = 0; i < N; ++i) {
+        Fq6Ref a = make_fq6_test_val(i + 1);
+        Fq2Ref b0 = {make_fq_test_val(i * 10 + 100), make_fq_test_val(i * 10 + 101)};
+        Fq2Ref b1 = {make_fq_test_val(i * 10 + 102), make_fq_test_val(i * 10 + 103)};
+
+        // mul_by_01 vs general mul
+        Fq6Ref sparse_b = {b0, b1, Fq2Ref::zero()};
+        if (fq6_mul_by_01_ref(a, b0, b1) == fq6_mul_ref(a, sparse_b)) ++pass_01;
+
+        // mul_by_1 vs general mul
+        Fq6Ref sparse_b1 = {Fq2Ref::zero(), b1, Fq2Ref::zero()};
+        if (fq6_mul_by_1_ref(a, b1) == fq6_mul_ref(a, sparse_b1)) ++pass_1;
+    }
+    TEST_ASSERT(pass_01 == N, "Fq6 mul_by_01 mismatch");
+    TEST_ASSERT(pass_1 == N, "Fq6 mul_by_1 mismatch");
+    printf("  mul_by_01: %d/%d, mul_by_1: %d/%d\n", pass_01, N, pass_1, N);
+}
+
+// ─── Fq6 Frobenius Test ────────────────────────────────────────────────────
+
+void test_fq6_frobenius() {
+    using namespace ff_ref;
+    printf("test_fq6_frobenius...\n");
+
+    // Compute Frobenius coefficients
+    Fq2Ref frob_c1[6], frob_c2[6];
+    compute_fq6_frobenius_coefficients(frob_c1, frob_c2);
+
+    // γ₁[0] should be 1
+    TEST_ASSERT(frob_c1[0] == Fq2Ref::one_mont(), "Fq6 Frobenius: gamma1[0] = 1");
+
+    const int N = 16;
+
+    // φ^6(a) = a (Frobenius order divides 6)
+    int pass_period = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq6Ref a = make_fq6_test_val(i + 1);
+        Fq6Ref result = a;
+        for (int k = 0; k < 6; ++k) {
+            result = fq6_frobenius_map_ref(result, 1, frob_c1, frob_c2);
+        }
+        if (result == a) ++pass_period;
+    }
+    TEST_ASSERT(pass_period == N, "Fq6 Frobenius: phi^6(a) != a");
+
+    // φ is multiplicative: φ(a*b) = φ(a)*φ(b)
+    int pass_mult = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq6Ref a = make_fq6_test_val(i * 2 + 1);
+        Fq6Ref b = make_fq6_test_val(i * 2 + 2);
+        Fq6Ref lhs = fq6_frobenius_map_ref(fq6_mul_ref(a, b), 1, frob_c1, frob_c2);
+        Fq6Ref rhs = fq6_mul_ref(
+            fq6_frobenius_map_ref(a, 1, frob_c1, frob_c2),
+            fq6_frobenius_map_ref(b, 1, frob_c1, frob_c2)
+        );
+        if (lhs == rhs) ++pass_mult;
+    }
+    TEST_ASSERT(pass_mult == N, "Fq6 Frobenius: phi(a*b) != phi(a)*phi(b)");
+
+    // φ fixes Fq2 elements (embedded as c0 only)
+    Fq6Ref fq2_elem = {
+        {make_fq_test_val(42), make_fq_test_val(43)},
+        Fq2Ref::zero(), Fq2Ref::zero()
+    };
+    Fq6Ref phi_fq2 = fq6_frobenius_map_ref(fq2_elem, 2, frob_c1, frob_c2);
+    TEST_ASSERT(phi_fq2 == fq2_elem, "Fq6 Frobenius: phi^2 fixes Fq2 elements");
+
+    printf("  Period: %d/%d, Multiplicative: %d/%d, fixes Fq2: OK\n",
+           pass_period, N, pass_mult, N);
+}
+
+// ─── Fq6 mul_by_nonresidue chain test ──────────────────────────────────────
+
+void test_fq6_nonresidue_chain() {
+    using namespace ff_ref;
+    printf("test_fq6_nonresidue_chain...\n");
+
+    // Multiplying by v three times should multiply by β = (1+u)
+    Fq6Ref a = make_fq6_test_val(7);
+    Fq6Ref v3_a = fq6_mul_by_nonresidue_ref(
+                    fq6_mul_by_nonresidue_ref(
+                     fq6_mul_by_nonresidue_ref(a)));
+
+    // v^3 = β, so a*v^3 = a*β = scale(a, β)
+    Fq2Ref beta = fq2_mul_by_nonresidue_ref(Fq2Ref::one_mont());
+    // Actually β for the Fq6 tower is (1+u), same as fq2_mul_by_nonresidue(1) = (1-0, 1+0) = (1, 1)
+    // Wait: fq2_mul_by_nonresidue_ref({1,0}) = (1-0, 1+0) = (1, 1). Yes, β = (1, 1) = 1+u.
+    Fq6Ref expected = fq6_scale_ref(a, beta);
+    TEST_ASSERT(v3_a == expected, "Fq6: v^3 * a = beta * a");
+    printf("  v^3 chain: OK\n");
 }
 
 // =============================================================================
@@ -9000,6 +9420,19 @@ int main() {
     test_fq2_gpu_mul();
     test_fq2_gpu_sqr();
     test_fq2_algebraic();
+
+    // ─── v3.0.0 Session 31: Fq6 (cubic extension) arithmetic ────────────────
+    printf("\n--- v3.0.0 Session 31: Fq6 (cubic extension) arithmetic ---\n");
+    test_fq6_cpu_self_test();
+    test_fq6_gpu_add();
+    test_fq6_gpu_sub();
+    test_fq6_gpu_mul();
+    test_fq6_gpu_sqr();
+    test_fq6_algebraic();
+    test_fq6_inverse();
+    test_fq6_sparse_mul();
+    test_fq6_frobenius();
+    test_fq6_nonresidue_chain();
 
     // ─── v2.0.0 Session 21: Elliptic Curve Arithmetic Tests ──────────────────
     printf("\n--- v2.0.0 Session 21: G1 Elliptic Curve Arithmetic ---\n");

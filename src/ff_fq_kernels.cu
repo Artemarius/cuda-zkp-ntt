@@ -1,9 +1,10 @@
 // src/ff_fq_kernels.cu
-// GPU throughput kernels for Fq and Fq2 field arithmetic.
+// GPU throughput kernels for Fq, Fq2, and Fq6 field arithmetic.
 // Used by correctness tests and microbenchmarks.
 
 #include "ff_fq.cuh"
 #include "ff_fq2.cuh"
+#include "ff_fq6.cuh"
 
 // ─── Fq Throughput Kernels ──────────────────────────────────────────────────
 
@@ -69,4 +70,37 @@ __global__ void fq2_sqr_kernel(const Fq2Element* __restrict__ a,
                                uint32_t n) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) out[idx] = fq2_sqr(a[idx]);
+}
+
+// ─── Fq6 Throughput Kernels ─────────────────────────────────────────────────
+
+__global__ void fq6_add_kernel(const Fq6Element* __restrict__ a,
+                               const Fq6Element* __restrict__ b,
+                               Fq6Element* __restrict__ out,
+                               uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = fq6_add(a[idx], b[idx]);
+}
+
+__global__ void fq6_sub_kernel(const Fq6Element* __restrict__ a,
+                               const Fq6Element* __restrict__ b,
+                               Fq6Element* __restrict__ out,
+                               uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = fq6_sub(a[idx], b[idx]);
+}
+
+__global__ void fq6_mul_kernel(const Fq6Element* __restrict__ a,
+                               const Fq6Element* __restrict__ b,
+                               Fq6Element* __restrict__ out,
+                               uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = fq6_mul(a[idx], b[idx]);
+}
+
+__global__ void fq6_sqr_kernel(const Fq6Element* __restrict__ a,
+                               Fq6Element* __restrict__ out,
+                               uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = fq6_sqr(a[idx]);
 }
