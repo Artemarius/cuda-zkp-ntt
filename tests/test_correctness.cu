@@ -7527,6 +7527,509 @@ void test_groth16_different_randomness() {
     TEST_ASSERT(different, "different randomness → different proof");
 }
 
+// ─── v2.2.0 Session 29: Fibonacci Circuit Tests ─────────────────────────────
+
+// Conversion helpers (same as in groth16.cu, needed here for tests)
+static ff_ref::G1AffineRef gpu_to_ref_g1(const G1Affine& g) {
+    if (g.infinity) return ff_ref::G1AffineRef::point_at_infinity();
+    ff_ref::G1AffineRef r;
+    r.x = ff_ref::FqRef::from_u32(g.x.limbs);
+    r.y = ff_ref::FqRef::from_u32(g.y.limbs);
+    r.infinity = false;
+    return r;
+}
+
+static ff_ref::G2AffineRef gpu_to_ref_g2(const G2Affine& g) {
+    if (g.infinity) return ff_ref::G2AffineRef::point_at_infinity();
+    ff_ref::G2AffineRef r;
+    r.x.c0 = ff_ref::FqRef::from_u32(g.x.c0.limbs);
+    r.x.c1 = ff_ref::FqRef::from_u32(g.x.c1.limbs);
+    r.y.c0 = ff_ref::FqRef::from_u32(g.y.c0.limbs);
+    r.y.c1 = ff_ref::FqRef::from_u32(g.y.c1.limbs);
+    r.infinity = false;
+    return r;
+}
+
+void test_fibonacci_witness_small() {
+    printf("test_fibonacci_witness_small...\n");
+
+    // Standard Fibonacci: F(0)=1, F(1)=1, F(2)=2, F(3)=3, F(4)=5, ...
+    auto w = compute_fibonacci_witness(1, 1, 8);
+
+    // w = [1, a0=1, a1=1, a2=2, a3=3, a4=5, a5=8, a6=13, a7=21, a8=34, a9=55]
+    TEST_ASSERT(w[0].limbs[0] == 1 && w[0].limbs[1] == 0, "fib: w[0] = 1 (constant)");
+    TEST_ASSERT(w[1].limbs[0] == 1, "fib: a0 = 1");
+    TEST_ASSERT(w[2].limbs[0] == 1, "fib: a1 = 1");
+    TEST_ASSERT(w[3].limbs[0] == 2, "fib: a2 = 2");
+    TEST_ASSERT(w[4].limbs[0] == 3, "fib: a3 = 3");
+    TEST_ASSERT(w[5].limbs[0] == 5, "fib: a4 = 5");
+    TEST_ASSERT(w[6].limbs[0] == 8, "fib: a5 = 8");
+    TEST_ASSERT(w[7].limbs[0] == 13, "fib: a6 = 13");
+    TEST_ASSERT(w[8].limbs[0] == 21, "fib: a7 = 21");
+    TEST_ASSERT(w[9].limbs[0] == 34, "fib: a8 = 34");
+
+    // Check recurrence: a_{i+2} = a_i + a_{i+1}
+    for (size_t i = 0; i < 8; ++i) {
+        uint32_t ai   = w[i + 1].limbs[0];
+        uint32_t ai1  = w[i + 2].limbs[0];
+        uint32_t ai2  = w[i + 3].limbs[0];
+        char msg[128];
+        snprintf(msg, sizeof(msg), "fib: a[%d] + a[%d] = a[%d]", (int)i, (int)(i+1), (int)(i+2));
+        TEST_ASSERT(ai + ai1 == ai2, msg);
+    }
+}
+
+void test_fibonacci_witness_different_start() {
+    printf("test_fibonacci_witness_different_start...\n");
+
+    // F(0)=0, F(1)=1: classic Fibonacci
+    auto w = compute_fibonacci_witness(0, 1, 4);
+    TEST_ASSERT(w[1].limbs[0] == 0, "fib(0,1): a0 = 0");
+    TEST_ASSERT(w[2].limbs[0] == 1, "fib(0,1): a1 = 1");
+    TEST_ASSERT(w[3].limbs[0] == 1, "fib(0,1): a2 = 1");
+    TEST_ASSERT(w[4].limbs[0] == 2, "fib(0,1): a3 = 2");
+    TEST_ASSERT(w[5].limbs[0] == 3, "fib(0,1): a4 = 3");
+    TEST_ASSERT(w[6].limbs[0] == 5, "fib(0,1): a5 = 5");
+
+    // F(0)=2, F(1)=3: Lucas-like
+    w = compute_fibonacci_witness(2, 3, 4);
+    TEST_ASSERT(w[1].limbs[0] == 2, "fib(2,3): a0 = 2");
+    TEST_ASSERT(w[2].limbs[0] == 3, "fib(2,3): a1 = 3");
+    TEST_ASSERT(w[3].limbs[0] == 5, "fib(2,3): a2 = 5");
+    TEST_ASSERT(w[4].limbs[0] == 8, "fib(2,3): a3 = 8");
+}
+
+void test_fibonacci_r1cs_satisfied() {
+    using namespace ff_ref;
+    printf("test_fibonacci_r1cs_satisfied...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    // Build dense evaluation vectors for the active constraints
+    // Check: A_row · w * B_row · w = C_row · w for each constraint
+    size_t n = r1cs.domain_size;
+    size_t nv = r1cs.num_variables;
+
+    // Initialize dense evaluations to zero
+    std::vector<FpRef> a_dot(n, FpRef::zero());
+    std::vector<FpRef> b_dot(n, FpRef::zero());
+    std::vector<FpRef> c_dot(n, FpRef::zero());
+
+    for (const auto& e : r1cs.A) {
+        FpRef val_m = to_montgomery(FpRef::from_u64(e.val));
+        FpRef w_m = to_montgomery(FpRef::from_u32(witness[e.col].limbs));
+        a_dot[e.row] = fp_add(a_dot[e.row], fp_mul(val_m, w_m));
+    }
+    for (const auto& e : r1cs.B) {
+        FpRef val_m = to_montgomery(FpRef::from_u64(e.val));
+        FpRef w_m = to_montgomery(FpRef::from_u32(witness[e.col].limbs));
+        b_dot[e.row] = fp_add(b_dot[e.row], fp_mul(val_m, w_m));
+    }
+    for (const auto& e : r1cs.C) {
+        FpRef val_m = to_montgomery(FpRef::from_u64(e.val));
+        FpRef w_m = to_montgomery(FpRef::from_u32(witness[e.col].limbs));
+        c_dot[e.row] = fp_add(c_dot[e.row], fp_mul(val_m, w_m));
+    }
+
+    for (size_t k = 0; k < r1cs.num_constraints; ++k) {
+        FpRef product = fp_mul(a_dot[k], b_dot[k]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "fib R1CS constraint %d satisfied", (int)k);
+        TEST_ASSERT(product == c_dot[k], msg);
+    }
+
+    // Padded rows (beyond num_constraints) should be zero
+    for (size_t k = r1cs.num_constraints; k < n; ++k) {
+        TEST_ASSERT(a_dot[k] == FpRef::zero(), "fib: padded A row is zero");
+        TEST_ASSERT(b_dot[k] == FpRef::zero(), "fib: padded B row is zero");
+        TEST_ASSERT(c_dot[k] == FpRef::zero(), "fib: padded C row is zero");
+    }
+}
+
+void test_fibonacci_r1cs_medium() {
+    using namespace ff_ref;
+    printf("test_fibonacci_r1cs_medium...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(256);
+    auto witness = compute_fibonacci_witness(1, 1, 256);
+
+    // Spot check a few constraints
+    for (size_t k : {(size_t)0, (size_t)1, (size_t)100, (size_t)255}) {
+        // Constraint k: (a_k + a_{k+1}) * 1 = a_{k+2}
+        FpRef a_k  = to_montgomery(FpRef::from_u32(witness[k + 1].limbs));
+        FpRef a_k1 = to_montgomery(FpRef::from_u32(witness[k + 2].limbs));
+        FpRef a_k2 = to_montgomery(FpRef::from_u32(witness[k + 3].limbs));
+        FpRef sum = fp_add(a_k, a_k1);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "fib256: constraint %d: a[%d]+a[%d]=a[%d]",
+                 (int)k, (int)k, (int)(k+1), (int)(k+2));
+        TEST_ASSERT(sum == a_k2, msg);
+    }
+}
+
+void test_fibonacci_batch_inversion() {
+    using namespace ff_ref;
+    printf("test_fibonacci_batch_inversion...\n");
+
+    // Test batch inversion against individual inversions
+    size_t n = 16;
+    std::vector<FpRef> inputs(n);
+    for (size_t i = 0; i < n; ++i)
+        inputs[i] = to_montgomery(FpRef::from_u64(i + 3));  // avoid zero
+
+    std::vector<FpRef> batch_outputs;
+    fp_batch_inverse(inputs, batch_outputs, n);
+
+    // Compare with individual inversions
+    for (size_t i = 0; i < n; ++i) {
+        FpRef expected = fp_inv(inputs[i]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "batch_inv[%d] matches fp_inv", (int)i);
+        TEST_ASSERT(batch_outputs[i] == expected, msg);
+    }
+
+    // Verify a * a^{-1} = 1 for each
+    FpRef one_m;
+    one_m.limbs = R_MOD;
+    for (size_t i = 0; i < n; ++i) {
+        FpRef product = fp_mul(inputs[i], batch_outputs[i]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "batch_inv[%d]: a * a^-1 = 1", (int)i);
+        TEST_ASSERT(product == one_m, msg);
+    }
+}
+
+void test_fibonacci_sparse_setup_on_curve() {
+    using namespace ff_ref;
+    printf("test_fibonacci_sparse_setup_on_curve...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    // Check G1 SRS points
+    G1AffineRef a_ref = gpu_to_ref_g1(pk.alpha_g1);
+    TEST_ASSERT(g1_is_on_curve_ref(a_ref), "sparse SRS: alpha_g1 on curve");
+
+    G1AffineRef b_ref = gpu_to_ref_g1(pk.beta_g1);
+    TEST_ASSERT(g1_is_on_curve_ref(b_ref), "sparse SRS: beta_g1 on curve");
+
+    G1AffineRef d_ref = gpu_to_ref_g1(pk.delta_g1);
+    TEST_ASSERT(g1_is_on_curve_ref(d_ref), "sparse SRS: delta_g1 on curve");
+
+    // Sample u_tau_g1 points
+    for (size_t i = 0; i < 5 && i < pk.u_tau_g1.size(); ++i) {
+        G1AffineRef p = gpu_to_ref_g1(pk.u_tau_g1[i]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "sparse SRS: u_tau_g1[%d] on curve", (int)i);
+        TEST_ASSERT(p.infinity || g1_is_on_curve_ref(p), msg);
+    }
+
+    // Sample h_query points
+    for (size_t j = 0; j < 5 && j < pk.h_query.size(); ++j) {
+        G1AffineRef p = gpu_to_ref_g1(pk.h_query[j]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "sparse SRS: h_query[%d] on curve", (int)j);
+        TEST_ASSERT(p.infinity || g1_is_on_curve_ref(p), msg);
+    }
+
+    // Sample l_query points
+    for (size_t i = 0; i < 5 && i < pk.l_query.size(); ++i) {
+        G1AffineRef p = gpu_to_ref_g1(pk.l_query[i]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "sparse SRS: l_query[%d] on curve", (int)i);
+        TEST_ASSERT(p.infinity || g1_is_on_curve_ref(p), msg);
+    }
+
+    // Check v_tau_scalars populated
+    TEST_ASSERT(pk.v_tau_scalars.size() == r1cs.num_variables, "sparse SRS: v_tau_scalars populated");
+}
+
+void test_fibonacci_lagrange_basis() {
+    using namespace ff_ref;
+    printf("test_fibonacci_lagrange_basis...\n");
+
+    // Verify Lagrange basis: Σ L_k(tau) * f(omega^k) = f(tau) for known polynomial
+    // Use f(x) = x^2 evaluated at roots of unity, then check evaluation at tau
+    size_t n = 8;
+    FpRef tau = to_montgomery(FpRef::from_u64(42));
+    FpRef omega = get_root_of_unity(n);
+    FpRef one_m;
+    one_m.limbs = R_MOD;
+
+    // Compute omega^k
+    std::vector<FpRef> omega_pows(n);
+    omega_pows[0] = one_m;
+    for (size_t k = 1; k < n; ++k)
+        omega_pows[k] = fp_mul(omega_pows[k - 1], omega);
+
+    // f(omega^k) = (omega^k)^2
+    std::vector<FpRef> f_evals(n);
+    for (size_t k = 0; k < n; ++k)
+        f_evals[k] = fp_mul(omega_pows[k], omega_pows[k]);
+
+    // Compute Lagrange basis at tau using the same formula as generate_proving_key_sparse
+    std::vector<FpRef> tau_minus_omega(n);
+    for (size_t k = 0; k < n; ++k)
+        tau_minus_omega[k] = fp_sub(tau, omega_pows[k]);
+
+    std::vector<FpRef> inv_tmo;
+    fp_batch_inverse(tau_minus_omega, inv_tmo, n);
+
+    std::array<uint64_t, 4> n_exp = {{(uint64_t)n, 0, 0, 0}};
+    FpRef tau_n = fp_pow(tau, n_exp);
+    FpRef t_tau = fp_sub(tau_n, one_m);
+    FpRef n_mont = to_montgomery(FpRef::from_u64((uint64_t)n));
+    FpRef n_inv = fp_inv(n_mont);
+    FpRef common = fp_mul(t_tau, n_inv);
+
+    // Σ L_k(tau) * f(omega^k)
+    // L_k(tau) = omega^k * common / (tau - omega^k)
+    FpRef interp = FpRef::zero();
+    for (size_t k = 0; k < n; ++k) {
+        FpRef L_k = fp_mul(fp_mul(omega_pows[k], common), inv_tmo[k]);
+        interp = fp_add(interp, fp_mul(L_k, f_evals[k]));
+    }
+
+    // Should equal f(tau) = tau^2
+    FpRef expected = fp_mul(tau, tau);
+    TEST_ASSERT(interp == expected, "Lagrange interpolation: Σ L_k * f(ω^k) = f(τ)");
+}
+
+void test_fibonacci_gpu_proof_small() {
+    using namespace ff_ref;
+    printf("test_fibonacci_gpu_proof_small...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+
+    // Check proof elements on curve
+    G1AffineRef pa = gpu_to_ref_g1(proof.pi_a);
+    TEST_ASSERT(proof.pi_a.infinity || g1_is_on_curve_ref(pa), "fib GPU proof: pi_a on G1");
+
+    G2AffineRef pb = gpu_to_ref_g2(proof.pi_b);
+    TEST_ASSERT(proof.pi_b.infinity || g2_is_on_curve_ref(pb), "fib GPU proof: pi_b on G2");
+
+    G1AffineRef pc = gpu_to_ref_g1(proof.pi_c);
+    TEST_ASSERT(proof.pi_c.infinity || g1_is_on_curve_ref(pc), "fib GPU proof: pi_c on G1");
+
+    // Proof elements should not be infinity
+    TEST_ASSERT(!proof.pi_a.infinity, "fib GPU proof: pi_a not infinity");
+    TEST_ASSERT(!proof.pi_b.infinity, "fib GPU proof: pi_b not infinity");
+}
+
+void test_fibonacci_gpu_vs_cpu_small() {
+    using namespace ff_ref;
+    printf("test_fibonacci_gpu_vs_cpu_small...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof gpu_proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+    Groth16Proof cpu_proof = groth16_prove_cpu_sparse(r1cs, pk, witness, 17, 23);
+
+    // Note: GPU and CPU use different assembly methods (GPU: MSM + field arith for B,
+    // CPU: sequential scalar muls with G2 points), so pi_B will differ.
+    // pi_A and pi_C should match if NTT and H(x) are identical.
+    // However, the GPU proof uses GPU MSM for pi_A and pi_C, while CPU uses sequential
+    // scalar muls — both are mathematically equivalent, so results should match.
+
+    // Compare π_A
+    bool a_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_a.x.limbs[i] != cpu_proof.pi_a.x.limbs[i]) a_match = false;
+        if (gpu_proof.pi_a.y.limbs[i] != cpu_proof.pi_a.y.limbs[i]) a_match = false;
+    }
+    TEST_ASSERT(a_match, "fib GPU vs CPU: pi_a match");
+
+    // Compare π_C
+    bool c_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_c.x.limbs[i] != cpu_proof.pi_c.x.limbs[i]) c_match = false;
+        if (gpu_proof.pi_c.y.limbs[i] != cpu_proof.pi_c.y.limbs[i]) c_match = false;
+    }
+    TEST_ASSERT(c_match, "fib GPU vs CPU: pi_c match");
+}
+
+void test_fibonacci_gpu_proof_256() {
+    using namespace ff_ref;
+    printf("test_fibonacci_gpu_proof_256...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(256);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto witness = compute_fibonacci_witness(1, 1, 256);
+
+    Groth16Proof proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+
+    G1AffineRef pa = gpu_to_ref_g1(proof.pi_a);
+    TEST_ASSERT(proof.pi_a.infinity || g1_is_on_curve_ref(pa), "fib256 GPU: pi_a on G1");
+
+    G2AffineRef pb = gpu_to_ref_g2(proof.pi_b);
+    TEST_ASSERT(proof.pi_b.infinity || g2_is_on_curve_ref(pb), "fib256 GPU: pi_b on G2");
+
+    G1AffineRef pc = gpu_to_ref_g1(proof.pi_c);
+    TEST_ASSERT(proof.pi_c.infinity || g1_is_on_curve_ref(pc), "fib256 GPU: pi_c on G1");
+
+    TEST_ASSERT(!proof.pi_a.infinity, "fib256 GPU: pi_a not infinity");
+    TEST_ASSERT(!proof.pi_b.infinity, "fib256 GPU: pi_b not infinity");
+}
+
+void test_fibonacci_determinism() {
+    printf("test_fibonacci_determinism...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof p1 = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+    Groth16Proof p2 = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+
+    bool match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (p1.pi_a.x.limbs[i] != p2.pi_a.x.limbs[i]) match = false;
+        if (p1.pi_a.y.limbs[i] != p2.pi_a.y.limbs[i]) match = false;
+    }
+    TEST_ASSERT(match, "fib determinism: same input → same proof");
+}
+
+void test_fibonacci_different_inputs() {
+    printf("test_fibonacci_different_inputs...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    Groth16Proof p1 = groth16_prove_sparse(r1cs, pk,
+                         compute_fibonacci_witness(1, 1, 8), 17, 23);
+    Groth16Proof p2 = groth16_prove_sparse(r1cs, pk,
+                         compute_fibonacci_witness(2, 3, 8), 17, 23);
+
+    bool different = false;
+    for (int i = 0; i < 12; ++i) {
+        if (p1.pi_a.x.limbs[i] != p2.pi_a.x.limbs[i]) { different = true; break; }
+    }
+    TEST_ASSERT(different, "fib: different inputs → different proof");
+}
+
+void test_fibonacci_zero_start() {
+    using namespace ff_ref;
+    printf("test_fibonacci_zero_start...\n");
+
+    // F(0)=0, F(1)=0: all-zeros Fibonacci (trivial circuit)
+    auto w = compute_fibonacci_witness(0, 0, 4);
+    TEST_ASSERT(w[0].limbs[0] == 1, "fib(0,0): w[0] = 1 (constant)");
+    for (size_t i = 1; i < w.size(); ++i) {
+        bool is_zero = true;
+        for (int j = 0; j < 8; ++j)
+            if (w[i].limbs[j] != 0) { is_zero = false; break; }
+        char msg[128];
+        snprintf(msg, sizeof(msg), "fib(0,0): w[%d] = 0", (int)i);
+        TEST_ASSERT(is_zero, msg);
+    }
+
+    // Should still produce valid R1CS
+    SparseR1CS r1cs = make_fibonacci_r1cs(4);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    Groth16Proof proof = groth16_prove_sparse(r1cs, pk, w, 17, 23);
+
+    G1AffineRef pa = gpu_to_ref_g1(proof.pi_a);
+    TEST_ASSERT(proof.pi_a.infinity || g1_is_on_curve_ref(pa), "fib(0,0): pi_a valid");
+}
+
+void test_fibonacci_sparse_qap_vs_dense() {
+    using namespace ff_ref;
+    printf("test_fibonacci_sparse_qap_vs_dense...\n");
+
+    // At small n, verify sparse Lagrange setup matches dense INTT approach
+    size_t nc = 4;
+    SparseR1CS sparse_r1cs = make_fibonacci_r1cs(nc);
+    size_t n = sparse_r1cs.domain_size;
+    size_t nv = sparse_r1cs.num_variables;
+
+    // Build dense R1CS equivalent
+    R1CS dense;
+    dense.num_constraints = nc;
+    dense.num_variables = nv;
+    dense.domain_size = n;
+    dense.A.assign(n, std::vector<uint64_t>(nv, 0));
+    dense.B.assign(n, std::vector<uint64_t>(nv, 0));
+    dense.C.assign(n, std::vector<uint64_t>(nv, 0));
+
+    for (const auto& e : sparse_r1cs.A)
+        dense.A[e.row][e.col] = e.val;
+    for (const auto& e : sparse_r1cs.B)
+        dense.B[e.row][e.col] = e.val;
+    for (const auto& e : sparse_r1cs.C)
+        dense.C[e.row][e.col] = e.val;
+
+    // Generate keys with same seed
+    ProvingKey pk_sparse = generate_proving_key_sparse(sparse_r1cs, 42);
+    ProvingKey pk_dense  = generate_proving_key(dense, 42);
+
+    // Compare u_tau_g1 points
+    bool all_match = true;
+    for (size_t i = 0; i < nv && all_match; ++i) {
+        for (int j = 0; j < 12 && all_match; ++j) {
+            if (pk_sparse.u_tau_g1[i].x.limbs[j] != pk_dense.u_tau_g1[i].x.limbs[j])
+                all_match = false;
+            if (pk_sparse.u_tau_g1[i].y.limbs[j] != pk_dense.u_tau_g1[i].y.limbs[j])
+                all_match = false;
+        }
+    }
+    TEST_ASSERT(all_match, "sparse vs dense: u_tau_g1 match");
+
+    // Compare h_query points
+    bool h_match = true;
+    for (size_t j = 0; j < pk_sparse.h_query.size() && h_match; ++j) {
+        for (int k = 0; k < 12 && h_match; ++k) {
+            if (pk_sparse.h_query[j].x.limbs[k] != pk_dense.h_query[j].x.limbs[k])
+                h_match = false;
+        }
+    }
+    TEST_ASSERT(h_match, "sparse vs dense: h_query match");
+
+    // Compare l_query points
+    bool l_match = true;
+    for (size_t i = 0; i < pk_sparse.l_query.size() && l_match; ++i) {
+        for (int j = 0; j < 12 && l_match; ++j) {
+            if (pk_sparse.l_query[i].x.limbs[j] != pk_dense.l_query[i].x.limbs[j])
+                l_match = false;
+        }
+    }
+    TEST_ASSERT(l_match, "sparse vs dense: l_query match");
+}
+
+void test_fibonacci_gpu_vs_cpu_256() {
+    using namespace ff_ref;
+    printf("test_fibonacci_gpu_vs_cpu_256...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(256);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto witness = compute_fibonacci_witness(1, 1, 256);
+
+    Groth16Proof gpu_proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+    Groth16Proof cpu_proof = groth16_prove_cpu_sparse(r1cs, pk, witness, 17, 23);
+
+    // Compare π_A
+    bool a_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_a.x.limbs[i] != cpu_proof.pi_a.x.limbs[i]) a_match = false;
+        if (gpu_proof.pi_a.y.limbs[i] != cpu_proof.pi_a.y.limbs[i]) a_match = false;
+    }
+    TEST_ASSERT(a_match, "fib256 GPU vs CPU: pi_a match");
+
+    // Compare π_C
+    bool c_match = true;
+    for (int i = 0; i < 12; ++i) {
+        if (gpu_proof.pi_c.x.limbs[i] != cpu_proof.pi_c.x.limbs[i]) c_match = false;
+        if (gpu_proof.pi_c.y.limbs[i] != cpu_proof.pi_c.y.limbs[i]) c_match = false;
+    }
+    TEST_ASSERT(c_match, "fib256 GPU vs CPU: pi_c match");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -8325,6 +8828,24 @@ int main() {
     test_groth16_determinism();
     test_groth16_different_witness();
     test_groth16_different_randomness();
+
+    // ─── v2.2.0 Session 29: Fibonacci Circuit Tests ──────────────────────────
+    printf("\n--- v2.2.0 Session 29: Fibonacci Circuit ---\n");
+    test_fibonacci_witness_small();
+    test_fibonacci_witness_different_start();
+    test_fibonacci_r1cs_satisfied();
+    test_fibonacci_r1cs_medium();
+    test_fibonacci_batch_inversion();
+    test_fibonacci_lagrange_basis();
+    test_fibonacci_sparse_setup_on_curve();
+    test_fibonacci_sparse_qap_vs_dense();
+    test_fibonacci_gpu_proof_small();
+    test_fibonacci_gpu_vs_cpu_small();
+    test_fibonacci_gpu_proof_256();
+    test_fibonacci_gpu_vs_cpu_256();
+    test_fibonacci_determinism();
+    test_fibonacci_different_inputs();
+    test_fibonacci_zero_start();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

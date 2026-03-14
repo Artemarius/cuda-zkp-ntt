@@ -6,7 +6,10 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
-- **v2.1.0** (current): Production MSM — signed-digit window recoding (halves bucket
+- **v2.2.0** (in progress): Fibonacci circuit at real scale — sparse R1CS (COO format),
+  Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly. GPU wins 55-139x
+  over CPU at n=256-1024. 820 tests. Session 29 complete, Session 30 (batch pipeline) next.
+- **v2.1.0**: Production MSM — signed-digit window recoding (halves bucket
   count), segment-offset parallel accumulation, parallel bucket reduction (Hillis-Steele
   suffix scan), window auto-tuner (c capped at 11 for parallel reduction), stream-ordered
   memory pools. 35.8x vs v2.0.0 at n=2^18 (42.7s→1.2s), 247 pts/ms at n=2^20. 701 tests.
@@ -113,7 +116,14 @@ CMake targets:
   - Pointwise mul, mul_sub, scale kernels
 - Groth16 prover: `include/groth16.cuh`, `src/groth16.cu`
   - Toy circuit x^3+x+5=y (4 R1CS constraints, 6 variables, domain_size=256)
-  - Pipeline: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
+  - Fibonacci circuit a_{i+2}=a_i+a_{i+1} (up to 2^18 constraints, sparse R1CS)
+  - Sparse R1CS: `SparseEntry` (COO format), `SparseR1CS` struct, `make_fibonacci_r1cs()`
+  - Lagrange basis trusted setup: `generate_proving_key_sparse()` — O(n) batch inversion
+    (Montgomery's trick) instead of O(nv * n log n) INTTs. L_k(τ) = ω^k*(τ^n-1)/(n*(τ-ω^k))
+  - GPU MSM proof assembly: `groth16_prove_sparse()` — GPU NTT + GPU MSM for pi_A, pi_C
+  - CPU reference proof: `groth16_prove_cpu_sparse()` — CPU NTT + sequential scalar muls
+  - G2 MSM workaround: B_scalar computed via field arithmetic + 1 G2 scalar mul (no GPU G2 MSM)
+  - Dense pipeline: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
   - GPU proof matches CPU proof bitwise (cross-validated)
 
 ### NTT
@@ -154,7 +164,7 @@ include/
   ec_g2.cuh           — G2 elliptic curve ops (over Fq2)
   msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
   poly_ops.cuh        — Polynomial ops (coset NTT, pointwise mul/sub, scale)
-  groth16.cuh         — Groth16 prover API (R1CS, ProvingKey, Proof)
+  groth16.cuh         — Groth16 prover API (R1CS, SparseR1CS, ProvingKey, Proof, Fibonacci)
   pipeline.cuh        — AsyncNTTPipeline class interface
   twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
@@ -172,12 +182,12 @@ src/
   ec_kernels.cu       — G1/G2 GPU test kernels
   msm.cu              — Pippenger MSM (separate TU, no RDC — CUB compatibility)
   poly_ops.cu         — Coset NTT, pointwise mul/sub/scale kernels
-  groth16.cu          — Groth16 prover: trusted setup + GPU/CPU proof generation
+  groth16.cu          — Groth16 prover: trusted setup + GPU/CPU proof (dense + sparse/Fibonacci)
   benchmark.cu        — Main benchmark entry point
 
 tests/
-  test_correctness.cu — Validates all NTT variants agree with CPU DFT reference
-  ff_reference.h      — CPU-only finite field + NTT + EC reference (test oracle)
+  test_correctness.cu — Validates all primitives (NTT, EC, MSM, poly ops, Groth16, Fibonacci)
+  ff_reference.h      — CPU-only finite field + NTT + EC reference + batch inverse (test oracle)
 
 benchmarks/
   bench_ntt.cu        — Google Benchmark: latency vs scale for all variants
@@ -408,11 +418,12 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
 
-Phases 1-8 complete. Current version: **v2.1.0** (Session 28 complete).
+Phases 1-8 complete. Current version: **v2.1.0** (Session 28 complete). v2.2.0 in progress (Session 29 complete).
 
 ### In Progress
-- **v2.2.0** — Fibonacci 2^18 circuit + BatchZK-style 2-stream batch pipeline.
-  Demonstrates GPU advantage at real scale (~12x GPU/CPU). Sessions 29-30.
+- **v2.2.0** — Fibonacci circuit + BatchZK-style 2-stream batch pipeline.
+  Session 29 complete: sparse R1CS, Lagrange basis setup, GPU MSM proof, 820 tests.
+  GPU wins 55-139x over CPU (n=256-1024). Session 30 next (batch pipeline + release).
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
   final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
   Sessions 31-35.

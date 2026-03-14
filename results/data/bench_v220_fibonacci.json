@@ -1,0 +1,25 @@
+{
+  "benchmark": "groth16_v220",
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "sm": "8.6",
+  "fibonacci": [
+    {
+      "num_constraints": 256,
+      "domain_size": 256,
+      "num_variables": 259,
+      "setup_ms": 19855.0943,
+      "gpu_prove_ms": 145.3139,
+      "cpu_prove_ms": 8246.3677,
+      "cpu_over_gpu": 56.7487
+    },
+    {
+      "num_constraints": 1024,
+      "domain_size": 1024,
+      "num_variables": 1027,
+      "setup_ms": 78914.1081,
+      "gpu_prove_ms": 270.5529,
+      "cpu_prove_ms": 38265.2182,
+      "cpu_over_gpu": 141.4334
+    }
+  ]
+}

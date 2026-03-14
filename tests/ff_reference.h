@@ -1468,6 +1468,43 @@ inline bool g2_is_on_curve_ref(const G2AffineRef& p) {
     return y2 == fq2_add_ref(x3, b_prime);
 }
 
+// ─── Batch Inversion (Montgomery's trick) ────────────────────────────────────
+// Computes inverses of n elements using a single fp_inv + 3(n-1) multiplications.
+// Input/output in Montgomery form. Zero inputs are left as zero in output.
+
+inline void fp_batch_inverse(const std::vector<FpRef>& inputs,
+                             std::vector<FpRef>& outputs, size_t n) {
+    outputs.resize(n);
+    if (n == 0) return;
+
+    FpRef one;
+    one.limbs = R_MOD;  // Montgomery(1)
+
+    // Partial products (skip zeros by carrying forward previous product)
+    std::vector<FpRef> products(n);
+    products[0] = (inputs[0] == FpRef::zero()) ? one : inputs[0];
+    for (size_t i = 1; i < n; ++i) {
+        if (inputs[i] == FpRef::zero())
+            products[i] = products[i - 1];
+        else
+            products[i] = fp_mul(products[i - 1], inputs[i]);
+    }
+
+    // Single inversion of the total product
+    FpRef inv = fp_inv(products[n - 1]);
+
+    // Back-propagate
+    for (size_t i = n - 1; i > 0; --i) {
+        if (inputs[i] == FpRef::zero()) {
+            outputs[i] = FpRef::zero();
+        } else {
+            outputs[i] = fp_mul(inv, products[i - 1]);
+            inv = fp_mul(inv, inputs[i]);
+        }
+    }
+    outputs[0] = (inputs[0] == FpRef::zero()) ? FpRef::zero() : inv;
+}
+
 // ─── Polynomial Operations (CPU reference) ──────────────────────────────────
 
 // Coset scale: data[i] *= g^i (Montgomery form in/out)

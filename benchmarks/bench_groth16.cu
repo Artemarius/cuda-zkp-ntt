@@ -1,6 +1,6 @@
 // benchmarks/bench_groth16.cu
 // End-to-end Groth16 pipeline benchmark with phase breakdown.
-// Measures: trusted setup, QAP construction, H(x) quotient, proof assembly.
+// Supports both toy circuit (x^3+x+5=y) and Fibonacci circuit (a_{i+2}=a_i+a_{i+1}).
 // Outputs JSON to stdout for plotting.
 
 #include "groth16.cuh"
@@ -11,9 +11,6 @@
 #include <algorithm>
 #include <vector>
 #include <chrono>
-
-static constexpr int NUM_REPS = 5;
-static constexpr int WARMUP_REPS = 1;
 
 // ─── Timing helpers ──────────────────────────────────────────────────────────
 
@@ -39,91 +36,87 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    fprintf(stderr, "=== Groth16 Pipeline Benchmark ===\n");
+    fprintf(stderr, "=== Groth16 Pipeline Benchmark (v2.2.0) ===\n");
     fprintf(stderr, "Device: %s (SM %d.%d, %d SMs)\n",
             prop.name, prop.major, prop.minor, prop.multiProcessorCount);
-    fprintf(stderr, "Circuit: x^3 + x + 5 = y (4 R1CS constraints, 6 variables)\n");
-    fprintf(stderr, "Reps: %d (median), Warmup: %d\n\n", NUM_REPS, WARMUP_REPS);
 
-    // Domain sizes to test
-    int domain_sizes[] = {256, 512, 1024};
-    int num_domains = sizeof(domain_sizes) / sizeof(domain_sizes[0]);
-
-    fprintf(stderr, "%-10s %-12s %-12s %-12s %-12s %-12s\n",
-            "Domain", "Setup(ms)", "GPU(ms)", "CPU(ms)", "GPU/CPU", "Total(ms)");
-    fprintf(stderr, "%-10s %-12s %-12s %-12s %-12s %-12s\n",
-            "------", "--------", "------", "------", "-------", "--------");
-
-    // JSON output to stdout
+    // JSON header
     printf("{\n");
-    printf("  \"benchmark\": \"groth16\",\n");
+    printf("  \"benchmark\": \"groth16_v220\",\n");
     printf("  \"device\": \"%s\",\n", prop.name);
     printf("  \"sm\": \"%d.%d\",\n", prop.major, prop.minor);
-    printf("  \"circuit\": \"x^3 + x + 5 = y\",\n");
-    printf("  \"constraints\": 4,\n");
-    printf("  \"variables\": 6,\n");
-    printf("  \"reps\": %d,\n", NUM_REPS);
-    printf("  \"results\": [\n");
 
-    for (int di = 0; di < num_domains; ++di) {
-        int domain_size = domain_sizes[di];
+    // ─── Fibonacci Circuit Benchmark ─────────────────────────────────────────
+    fprintf(stderr, "\n=== Fibonacci Circuit: a_{i+2} = a_i + a_{i+1} ===\n");
+    fprintf(stderr, "%-10s %-10s %-10s %-12s %-12s %-12s %-12s\n",
+            "NumConst", "Domain", "NumVars", "Setup(s)", "GPU(ms)", "CPU(ms)", "CPU/GPU");
+    fprintf(stderr, "%-10s %-10s %-10s %-12s %-12s %-12s %-12s\n",
+            "--------", "------", "-------", "--------", "------", "------", "-------");
 
-        // Build R1CS and witness
-        R1CS r1cs = make_toy_r1cs((size_t)domain_size);
-        std::vector<FpElement> witness = compute_witness(3);
+    printf("  \"fibonacci\": [\n");
 
-        // ── Phase 1: Trusted setup (CPU) ──
-        std::vector<double> setup_times(NUM_REPS);
-        ProvingKey pk;
-        for (int r = 0; r < NUM_REPS; ++r) {
-            auto t0 = Clock::now();
-            pk = generate_proving_key(r1cs, 42);
-            setup_times[r] = ms_since(t0);
-        }
-        double setup_ms = median(setup_times);
+    size_t sizes[] = {256, 1024};
+    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+    constexpr int GPU_REPS = 3;
+    constexpr int CPU_REPS = 1;  // CPU proof is slow (sequential scalar muls)
 
-        // ── Phase 2: GPU proof generation ──
-        // Warmup
-        for (int i = 0; i < WARMUP_REPS; ++i) {
-            Groth16Proof p = groth16_prove(r1cs, pk, witness, 17, 23);
+    for (int si = 0; si < num_sizes; ++si) {
+        size_t nc = sizes[si];
+
+        SparseR1CS r1cs = make_fibonacci_r1cs(nc);
+        auto witness = compute_fibonacci_witness(1, 1, nc);
+
+        // Setup
+        fprintf(stderr, "  Setting up nc=%d...", (int)nc);
+        fflush(stderr);
+        auto t_setup = Clock::now();
+        ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+        double setup_ms = ms_since(t_setup);
+        fprintf(stderr, " %.1fs\n", setup_ms / 1000.0);
+
+        // GPU proof (warmup + measured)
+        {
+            Groth16Proof p = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
             (void)p;
         }
 
-        std::vector<double> gpu_times(NUM_REPS);
-        for (int r = 0; r < NUM_REPS; ++r) {
+        std::vector<double> gpu_times(GPU_REPS);
+        for (int r = 0; r < GPU_REPS; ++r) {
             CUDA_CHECK(cudaDeviceSynchronize());
             auto t0 = Clock::now();
-            Groth16Proof p = groth16_prove(r1cs, pk, witness, 17, 23);
+            Groth16Proof p = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
             CUDA_CHECK(cudaDeviceSynchronize());
             gpu_times[r] = ms_since(t0);
             (void)p;
         }
         double gpu_ms = median(gpu_times);
 
-        // ── Phase 3: CPU proof generation (for comparison) ──
-        std::vector<double> cpu_times(NUM_REPS);
-        for (int r = 0; r < NUM_REPS; ++r) {
-            auto t0 = Clock::now();
-            Groth16Proof p = groth16_prove_cpu(r1cs, pk, witness, 17, 23);
-            cpu_times[r] = ms_since(t0);
+        // CPU proof (1 rep — sequential scalar muls are very slow)
+        fprintf(stderr, "  CPU prove nc=%d...", (int)nc);
+        fflush(stderr);
+        auto t_cpu = Clock::now();
+        {
+            Groth16Proof p = groth16_prove_cpu_sparse(r1cs, pk, witness, 17, 23);
             (void)p;
         }
-        double cpu_ms = median(cpu_times);
+        double cpu_ms = ms_since(t_cpu);
+        fprintf(stderr, " %.1fs\n", cpu_ms / 1000.0);
 
-        double total_ms = setup_ms + gpu_ms;
-        double ratio = gpu_ms / cpu_ms;
+        double ratio = cpu_ms / gpu_ms;
 
-        fprintf(stderr, "%-10d %-12.2f %-12.2f %-12.2f %-12.3f %-12.2f\n",
-                domain_size, setup_ms, gpu_ms, cpu_ms, ratio, total_ms);
+        fprintf(stderr, "%-10d %-10d %-10d %-12.1f %-12.1f %-12.1f %-12.1fx\n",
+                (int)nc, (int)r1cs.domain_size, (int)r1cs.num_variables,
+                setup_ms / 1000.0, gpu_ms, cpu_ms, ratio);
 
         printf("    {\n");
-        printf("      \"domain_size\": %d,\n", domain_size);
+        printf("      \"num_constraints\": %d,\n", (int)nc);
+        printf("      \"domain_size\": %d,\n", (int)r1cs.domain_size);
+        printf("      \"num_variables\": %d,\n", (int)r1cs.num_variables);
         printf("      \"setup_ms\": %.4f,\n", setup_ms);
         printf("      \"gpu_prove_ms\": %.4f,\n", gpu_ms);
         printf("      \"cpu_prove_ms\": %.4f,\n", cpu_ms);
-        printf("      \"gpu_cpu_ratio\": %.4f,\n", ratio);
-        printf("      \"total_ms\": %.4f\n", total_ms);
-        printf("    }%s\n", (di < num_domains - 1) ? "," : "");
+        printf("      \"cpu_over_gpu\": %.4f\n", ratio);
+        printf("    }%s\n", (si < num_sizes - 1) ? "," : "");
     }
 
     printf("  ]\n");

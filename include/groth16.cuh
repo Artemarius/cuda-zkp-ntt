@@ -1,12 +1,15 @@
 // include/groth16.cuh
-// Toy Groth16 prover for x^3 + x + 5 = y.
-// Demonstrates GPU-accelerated NTT, polynomial ops, MSM, and EC arithmetic
-// working together in an end-to-end proof generation pipeline.
+// Groth16 prover with GPU-accelerated NTT, polynomial ops, MSM, and EC arithmetic.
+//
+// Supports two circuit types:
+//   - Toy circuit: x^3 + x + 5 = y (4 constraints, dense R1CS, domain_size=256)
+//   - Fibonacci circuit: a_{i+2} = a_i + a_{i+1} (sparse R1CS, up to 2^18 constraints)
 //
 // No pairing verification (future work). Correctness verified via:
 //   - QAP identity: A*B - C = H*Z_H at random evaluation point
 //   - Proof elements on-curve
 //   - Determinism: same inputs → same proof
+//   - GPU vs CPU cross-validation
 
 #pragma once
 #include "ec_g1.cuh"
@@ -14,7 +17,7 @@
 #include "ff_arithmetic.cuh"
 #include <vector>
 
-// ─── R1CS ────────────────────────────────────────────────────────────────────
+// ─── R1CS (Dense) ────────────────────────────────────────────────────────────
 // Rank-1 Constraint System: A * w ∘ B * w = C * w
 // where w is the witness vector and ∘ is the Hadamard (pointwise) product.
 
@@ -25,6 +28,23 @@ struct R1CS {
     // Dense matrices: A[constraint][variable] as small integers
     // Stored row-major. Padded rows (beyond num_constraints) are zero.
     std::vector<std::vector<uint64_t>> A, B, C;
+};
+
+// ─── R1CS (Sparse) ───────────────────────────────────────────────────────────
+// COO (coordinate) format for large circuits where dense is infeasible.
+// Fibonacci at n=2^18: ~4 nonzeros per constraint vs 2^18 dense entries.
+
+struct SparseEntry {
+    uint32_t row;    // constraint index
+    uint32_t col;    // variable index
+    uint64_t val;    // coefficient value (small integer, typically 1)
+};
+
+struct SparseR1CS {
+    size_t num_constraints;  // actual constraints
+    size_t num_variables;    // variables in witness
+    size_t domain_size;      // power-of-2 NTT domain (≥ num_constraints)
+    std::vector<SparseEntry> A, B, C;
 };
 
 // ─── Proving Key (Structured Reference String) ──────────────────────────────
@@ -54,6 +74,14 @@ struct ProvingKey {
     // For variables i in the private witness range
     std::vector<G1Affine> l_query;    // private_count entries
     size_t public_count;              // number of public inputs (1=constant + public)
+
+    // Raw scalar values for sparse circuits (G2 MSM workaround).
+    // v_tau_scalars[i] = v_i(τ) in standard form. Used to compute B_scalar on CPU
+    // instead of requiring GPU G2 MSM.
+    // Empty for toy circuit; populated by generate_proving_key_sparse().
+    std::vector<FpElement> v_tau_scalars;
+    FpElement beta_scalar;   // β in standard form
+    FpElement delta_scalar;  // δ in standard form
 };
 
 // ─── Proof ───────────────────────────────────────────────────────────────────
@@ -64,29 +92,18 @@ struct Groth16Proof {
     G1Affine pi_c;   // [C]_1
 };
 
-// ─── API ─────────────────────────────────────────────────────────────────────
+// ─── API: Toy Circuit (x^3 + x + 5 = y) ─────────────────────────────────────
 
-// Construct R1CS for x^3 + x + 5 = y.
-// Variables: w = [1, x, y, v1=x*x, v2=v1*x, v3=v2+x]
-// Constraints:
-//   v1 = x * x
-//   v2 = v1 * x
-//   v3 = v2 + x   (= (v2+x)*1)
-//   y  = v3 + 5    (= (v3+5)*1)
+// Construct dense R1CS for x^3 + x + 5 = y.
 R1CS make_toy_r1cs(size_t domain_size = 256);
 
 // Compute witness for x^3 + x + 5 = y given input x.
-// Returns: [1, x, y, x*x, x*x*x, x*x*x+x] in standard form.
 std::vector<FpElement> compute_witness(uint64_t x);
 
-// Generate proving key (trusted setup, CPU-side).
-// Uses small seed values for deterministic, fast generation.
-// tau_seed controls the secret evaluation point τ.
+// Generate proving key for dense R1CS (trusted setup, CPU-side).
 ProvingKey generate_proving_key(const R1CS& r1cs, uint64_t tau_seed = 42);
 
-// Generate Groth16 proof using GPU-accelerated primitives.
-// Pipeline: QAP construction → H(x) quotient (coset NTT) → commitments (MSM).
-// r_seed and s_seed control proof randomization.
+// Generate Groth16 proof using GPU NTT + CPU assembly (toy circuit).
 Groth16Proof groth16_prove(const R1CS& r1cs,
                            const ProvingKey& pk,
                            const std::vector<FpElement>& witness,
@@ -94,9 +111,44 @@ Groth16Proof groth16_prove(const R1CS& r1cs,
                            uint64_t s_seed = 23,
                            cudaStream_t stream = 0);
 
-// CPU-only proof generation (for cross-validation).
+// CPU-only proof generation (toy circuit, for cross-validation).
 Groth16Proof groth16_prove_cpu(const R1CS& r1cs,
                                const ProvingKey& pk,
                                const std::vector<FpElement>& witness,
                                uint64_t r_seed = 17,
                                uint64_t s_seed = 23);
+
+// ─── API: Fibonacci Circuit (a_{i+2} = a_i + a_{i+1}) ───────────────────────
+
+// Construct sparse R1CS for Fibonacci sequence.
+// num_constraints Fibonacci recurrence constraints, domain_size = next power of 2.
+// Variables: w = [1, a_0, a_1, ..., a_{num_constraints+1}]
+// Each constraint i: (a_i + a_{i+1}) * 1 = a_{i+2}
+SparseR1CS make_fibonacci_r1cs(size_t num_constraints);
+
+// Compute Fibonacci witness starting from (a0, a1) in the BLS12-381 scalar field.
+// Returns: [1, a_0, a_1, a_2, ..., a_{num_constraints+1}] in standard form.
+// Fibonacci values are computed modulo the field prime (wraps for large sequences).
+std::vector<FpElement> compute_fibonacci_witness(uint64_t a0, uint64_t a1,
+                                                  size_t num_constraints);
+
+// Generate proving key for sparse R1CS using Lagrange basis evaluation.
+// Uses batch inversion (Montgomery's trick) for O(n) setup instead of O(nv * n log n).
+// Stores v_tau_scalars for CPU-side B_scalar computation (no GPU G2 MSM needed).
+ProvingKey generate_proving_key_sparse(const SparseR1CS& r1cs, uint64_t tau_seed = 42);
+
+// Generate Groth16 proof using GPU MSM + GPU NTT (full GPU acceleration).
+// Pipeline: sparse mat-vec → GPU INTT → coset NTT → H(x) → GPU MSM assembly.
+Groth16Proof groth16_prove_sparse(const SparseR1CS& r1cs,
+                                   const ProvingKey& pk,
+                                   const std::vector<FpElement>& witness,
+                                   uint64_t r_seed = 17,
+                                   uint64_t s_seed = 23,
+                                   cudaStream_t stream = 0);
+
+// CPU-only proof for sparse R1CS (for cross-validation and GPU/CPU comparison).
+Groth16Proof groth16_prove_cpu_sparse(const SparseR1CS& r1cs,
+                                       const ProvingKey& pk,
+                                       const std::vector<FpElement>& witness,
+                                       uint64_t r_seed = 17,
+                                       uint64_t s_seed = 23);
