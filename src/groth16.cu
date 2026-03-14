@@ -865,6 +865,224 @@ Groth16Proof groth16_prove_sparse(const SparseR1CS& r1cs,
     return proof;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Batch Pipeline (v2.2.0 Session 30)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Sequential batch: baseline reference — just calls groth16_prove_sparse() in a loop.
+
+std::vector<Groth16Proof> groth16_prove_batch_sequential_sparse(
+    const SparseR1CS& r1cs,
+    const ProvingKey& pk,
+    const std::vector<std::vector<FpElement>>& witnesses,
+    uint64_t r_seed_base,
+    uint64_t s_seed_base)
+{
+    std::vector<Groth16Proof> proofs(witnesses.size());
+    for (size_t i = 0; i < witnesses.size(); ++i) {
+        proofs[i] = groth16_prove_sparse(r1cs, pk, witnesses[i],
+                                          r_seed_base + (uint64_t)i * 2,
+                                          s_seed_base + (uint64_t)i * 2);
+    }
+    return proofs;
+}
+
+// Pipelined batch: pre-allocated device memory (2 slots), 2 CUDA streams,
+// reusable host scalar buffers. Eliminates per-proof cudaMalloc/cudaFree
+// overhead and uses stream-specific synchronization.
+
+std::vector<Groth16Proof> groth16_prove_batch_sparse(
+    const SparseR1CS& r1cs,
+    const ProvingKey& pk,
+    const std::vector<std::vector<FpElement>>& witnesses,
+    uint64_t r_seed_base,
+    uint64_t s_seed_base)
+{
+    size_t batch_size = witnesses.size();
+    if (batch_size == 0) return {};
+
+    size_t n = pk.n;
+    size_t nv = r1cs.num_variables;
+    size_t priv_count = nv - pk.public_count;
+    size_t h_size = pk.h_query.size();  // n-1
+    size_t max_pts = nv;
+    if (h_size > max_pts) max_pts = h_size;
+
+    // Precompute constants (shared across all proofs)
+    FpRef zh_inv_ref = compute_zh_inv(n);
+    FpElement zh_inv_std = from_ref_mont(zh_inv_ref);
+    FpElement coset_gen = make_fp(7);
+
+    // Pre-warm NTT twiddle cache (first call precomputes, subsequent reuse)
+    {
+        FpElement* d_warm;
+        CUDA_CHECK(cudaMalloc(&d_warm, n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMemset(d_warm, 0, n * sizeof(FpElement)));
+        ntt_inverse(d_warm, n, NTTMode::OPTIMIZED, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_warm));
+    }
+
+    // ── Allocate 2 pipeline slots ──
+    constexpr int NUM_SLOTS = 2;
+    struct Slot {
+        FpElement* d_A;
+        FpElement* d_B;
+        FpElement* d_C;
+        FpElement* d_H;
+        G1Affine*  d_bases;
+        uint32_t*  d_scalars;
+        cudaStream_t stream;
+    } slots[NUM_SLOTS];
+
+    for (int s = 0; s < NUM_SLOTS; ++s) {
+        CUDA_CHECK(cudaStreamCreate(&slots[s].stream));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_A, n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_B, n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_C, n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_H, n * sizeof(FpElement)));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_bases, max_pts * sizeof(G1Affine)));
+        CUDA_CHECK(cudaMalloc(&slots[s].d_scalars, max_pts * 8 * sizeof(uint32_t)));
+    }
+
+    // Reusable host scalar buffer (avoids per-proof vector allocation)
+    std::vector<uint32_t> scalar_buf(max_pts * 8);
+
+    std::vector<Groth16Proof> proofs(batch_size);
+
+    for (size_t i = 0; i < batch_size; ++i) {
+        int si = (int)(i % NUM_SLOTS);
+        Slot& slot = slots[si];
+        const auto& witness = witnesses[i];
+        uint64_t r_seed = r_seed_base + (uint64_t)i * 2;
+        uint64_t s_seed = s_seed_base + (uint64_t)i * 2;
+
+        FpRef r_rand = make_ref(r_seed);
+        FpRef s_rand = make_ref(s_seed);
+        uint32_t sc_buf[8];
+
+        // ── Phase 1: CPU sparse mat-vec → QAP evaluations ──
+        std::vector<FpRef> eval_A_ref, eval_B_ref, eval_C_ref;
+        sparse_matvec(eval_A_ref, n, r1cs.A, witness);
+        sparse_matvec(eval_B_ref, n, r1cs.B, witness);
+        sparse_matvec(eval_C_ref, n, r1cs.C, witness);
+
+        std::vector<FpElement> eval_A(n), eval_B(n), eval_C(n);
+        for (size_t k = 0; k < n; ++k) {
+            eval_A[k] = from_ref_mont(eval_A_ref[k]);
+            eval_B[k] = from_ref_mont(eval_B_ref[k]);
+            eval_C[k] = from_ref_mont(eval_C_ref[k]);
+        }
+
+        // ── Phase 2: GPU INTT + coset NTT + H(x) → h_coeffs ──
+        CUDA_CHECK(cudaMemcpy(slot.d_A, eval_A.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(slot.d_B, eval_B.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(slot.d_C, eval_C.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+        ntt_inverse(slot.d_A, n, NTTMode::OPTIMIZED, slot.stream);
+        ntt_inverse(slot.d_B, n, NTTMode::OPTIMIZED, slot.stream);
+        ntt_inverse(slot.d_C, n, NTTMode::OPTIMIZED, slot.stream);
+
+        poly_coset_ntt_forward(slot.d_A, n, coset_gen, NTTMode::OPTIMIZED, slot.stream);
+        poly_coset_ntt_forward(slot.d_B, n, coset_gen, NTTMode::OPTIMIZED, slot.stream);
+        poly_coset_ntt_forward(slot.d_C, n, coset_gen, NTTMode::OPTIMIZED, slot.stream);
+
+        poly_pointwise_mul_sub(slot.d_H, slot.d_A, slot.d_B, slot.d_C, n, slot.stream);
+        poly_scale(slot.d_H, zh_inv_std, n, slot.stream);
+        poly_coset_ntt_inverse(slot.d_H, n, coset_gen, NTTMode::OPTIMIZED, slot.stream);
+
+        CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+        std::vector<FpElement> h_coeffs(n);
+        CUDA_CHECK(cudaMemcpy(h_coeffs.data(), slot.d_H, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+        // ── Phase 3a: GPU MSM for π_A ──
+        CUDA_CHECK(cudaMemcpy(slot.d_bases, pk.u_tau_g1.data(), nv * sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+        for (size_t j = 0; j < nv; ++j)
+            for (int k = 0; k < 8; ++k)
+                scalar_buf[j * 8 + k] = witness[j].limbs[k];
+        CUDA_CHECK(cudaMemcpy(slot.d_scalars, scalar_buf.data(), nv * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        G1Affine pi_a_msm;
+        msm_g1(&pi_a_msm, slot.d_bases, slot.d_scalars, nv, slot.stream);
+
+        // Add α and r*δ
+        G1AffineRef pi_a = g1_add_ref(gpu_to_ref_g1(pk.alpha_g1), gpu_to_ref_g1(pi_a_msm));
+        ref_to_scalar(r_rand, sc_buf);
+        pi_a = g1_add_ref(pi_a, g1_scalar_mul_ref(gpu_to_ref_g1(pk.delta_g1), sc_buf));
+
+        // ── Phase 3b: CPU B_scalar (G2 MSM workaround) ──
+        FpRef b_scalar = to_ref_mont(pk.beta_scalar);
+        for (size_t j = 0; j < nv; ++j) {
+            FpRef w_m = to_ref_mont(witness[j]);
+            FpRef v_m = to_ref_mont(pk.v_tau_scalars[j]);
+            b_scalar = fp_add(b_scalar, fp_mul(w_m, v_m));
+        }
+        b_scalar = fp_add(b_scalar, fp_mul(s_rand, to_ref_mont(pk.delta_scalar)));
+
+        ref_to_scalar(b_scalar, sc_buf);
+        G2AffineRef pi_b = g2_scalar_mul_ref(G2AffineRef::generator(), sc_buf);
+
+        // ── Phase 3c: GPU MSM for π_C (L-query) ──
+        G1AffineRef pi_c = G1AffineRef::point_at_infinity();
+
+        if (priv_count > 0) {
+            CUDA_CHECK(cudaMemcpy(slot.d_bases, pk.l_query.data(), priv_count * sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+            for (size_t j = 0; j < priv_count; ++j) {
+                size_t vi = pk.public_count + j;
+                for (int k = 0; k < 8; ++k)
+                    scalar_buf[j * 8 + k] = witness[vi].limbs[k];
+            }
+            CUDA_CHECK(cudaMemcpy(slot.d_scalars, scalar_buf.data(), priv_count * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            G1Affine l_result;
+            msm_g1(&l_result, slot.d_bases, slot.d_scalars, priv_count, slot.stream);
+            pi_c = gpu_to_ref_g1(l_result);
+        }
+
+        // ── Phase 3d: GPU MSM for π_C (H-query) ──
+        if (h_size > 0) {
+            CUDA_CHECK(cudaMemcpy(slot.d_bases, pk.h_query.data(), h_size * sizeof(G1Affine), cudaMemcpyHostToDevice));
+
+            for (size_t j = 0; j < h_size; ++j)
+                for (int k = 0; k < 8; ++k)
+                    scalar_buf[j * 8 + k] = h_coeffs[j].limbs[k];
+            CUDA_CHECK(cudaMemcpy(slot.d_scalars, scalar_buf.data(), h_size * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            G1Affine h_result;
+            msm_g1(&h_result, slot.d_bases, slot.d_scalars, h_size, slot.stream);
+            pi_c = g1_add_ref(pi_c, gpu_to_ref_g1(h_result));
+        }
+
+        // ── Phase 4: CPU assembly ──
+        ref_to_scalar(s_rand, sc_buf);
+        pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(pi_a, sc_buf));
+
+        FpRef rs = fp_mul(r_rand, s_rand);
+        ref_to_scalar(rs, sc_buf);
+        G1AffineRef rs_delta = g1_scalar_mul_ref(gpu_to_ref_g1(pk.delta_g1), sc_buf);
+        pi_c = g1_add_ref(pi_c, g1_negate_ref(rs_delta));
+
+        proofs[i].pi_a = ref_to_gpu_g1(pi_a);
+        proofs[i].pi_b = ref_to_gpu_g2(pi_b);
+        proofs[i].pi_c = ref_to_gpu_g1(pi_c);
+    }
+
+    // Cleanup
+    for (int s = 0; s < NUM_SLOTS; ++s) {
+        CUDA_CHECK(cudaFree(slots[s].d_A));
+        CUDA_CHECK(cudaFree(slots[s].d_B));
+        CUDA_CHECK(cudaFree(slots[s].d_C));
+        CUDA_CHECK(cudaFree(slots[s].d_H));
+        CUDA_CHECK(cudaFree(slots[s].d_bases));
+        CUDA_CHECK(cudaFree(slots[s].d_scalars));
+        CUDA_CHECK(cudaStreamDestroy(slots[s].stream));
+    }
+
+    return proofs;
+}
+
 // ─── CPU-only Proof for Sparse R1CS ──────────────────────────────────────────
 
 Groth16Proof groth16_prove_cpu_sparse(const SparseR1CS& r1cs,

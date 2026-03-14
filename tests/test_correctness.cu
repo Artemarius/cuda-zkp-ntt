@@ -8030,6 +8030,288 @@ void test_fibonacci_gpu_vs_cpu_256() {
     TEST_ASSERT(c_match, "fib256 GPU vs CPU: pi_c match");
 }
 
+// ─── v2.2.0 Session 30: Batch Pipeline Tests ────────────────────────────────
+
+// Helper: compare two G1Affine points for bitwise equality
+static bool g1_affine_equal(const G1Affine& a, const G1Affine& b) {
+    if (a.infinity != b.infinity) return false;
+    if (a.infinity) return true;
+    for (int i = 0; i < 12; ++i) {
+        if (a.x.limbs[i] != b.x.limbs[i]) return false;
+        if (a.y.limbs[i] != b.y.limbs[i]) return false;
+    }
+    return true;
+}
+
+static bool g2_affine_equal(const G2Affine& a, const G2Affine& b) {
+    if (a.infinity != b.infinity) return false;
+    if (a.infinity) return true;
+    for (int i = 0; i < 12; ++i) {
+        if (a.x.c0.limbs[i] != b.x.c0.limbs[i]) return false;
+        if (a.x.c1.limbs[i] != b.x.c1.limbs[i]) return false;
+        if (a.y.c0.limbs[i] != b.y.c0.limbs[i]) return false;
+        if (a.y.c1.limbs[i] != b.y.c1.limbs[i]) return false;
+    }
+    return true;
+}
+
+static bool proof_equal(const Groth16Proof& a, const Groth16Proof& b) {
+    return g1_affine_equal(a.pi_a, b.pi_a) &&
+           g2_affine_equal(a.pi_b, b.pi_b) &&
+           g1_affine_equal(a.pi_c, b.pi_c);
+}
+
+void test_batch_empty() {
+    printf("test_batch_empty...\n");
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses;
+    auto proofs = groth16_prove_batch_sparse(r1cs, pk, witnesses);
+    TEST_ASSERT(proofs.empty(), "batch: empty input → empty output");
+}
+
+void test_batch_single_matches_individual() {
+    using namespace ff_ref;
+    printf("test_batch_single_matches_individual...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto w = compute_fibonacci_witness(1, 1, 8);
+
+    // Single proof via batch
+    auto batch = groth16_prove_batch_sparse(r1cs, pk, {w}, 17, 23);
+    // Single proof via individual call (same r_seed, s_seed)
+    auto single = groth16_prove_sparse(r1cs, pk, w, 17, 23);
+
+    TEST_ASSERT(batch.size() == 1, "batch(1): size = 1");
+    TEST_ASSERT(proof_equal(batch[0], single), "batch(1): matches individual prove");
+}
+
+void test_batch_vs_sequential() {
+    printf("test_batch_vs_sequential...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(2, 3, 8),
+        compute_fibonacci_witness(5, 8, 8),
+        compute_fibonacci_witness(1, 2, 8),
+    };
+
+    auto batch = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+    auto seq   = groth16_prove_batch_sequential_sparse(r1cs, pk, witnesses, 17, 23);
+
+    TEST_ASSERT(batch.size() == 4, "batch vs seq: batch size = 4");
+    TEST_ASSERT(seq.size() == 4, "batch vs seq: seq size = 4");
+
+    for (int i = 0; i < 4; ++i) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "batch vs seq: proof[%d] matches", i);
+        TEST_ASSERT(proof_equal(batch[i], seq[i]), msg);
+    }
+}
+
+void test_batch_on_curve() {
+    using namespace ff_ref;
+    printf("test_batch_on_curve...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(3, 7, 8),
+        compute_fibonacci_witness(10, 20, 8),
+        compute_fibonacci_witness(0, 1, 8),
+    };
+
+    auto proofs = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+
+    for (int i = 0; i < 4; ++i) {
+        G1AffineRef pa = gpu_to_ref_g1(proofs[i].pi_a);
+        G2AffineRef pb = gpu_to_ref_g2(proofs[i].pi_b);
+        G1AffineRef pc = gpu_to_ref_g1(proofs[i].pi_c);
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "batch on-curve: proof[%d] pi_a on G1", i);
+        TEST_ASSERT(proofs[i].pi_a.infinity || g1_is_on_curve_ref(pa), msg);
+
+        snprintf(msg, sizeof(msg), "batch on-curve: proof[%d] pi_b on G2", i);
+        TEST_ASSERT(proofs[i].pi_b.infinity || g2_is_on_curve_ref(pb), msg);
+
+        snprintf(msg, sizeof(msg), "batch on-curve: proof[%d] pi_c on G1", i);
+        TEST_ASSERT(proofs[i].pi_c.infinity || g1_is_on_curve_ref(pc), msg);
+
+        snprintf(msg, sizeof(msg), "batch on-curve: proof[%d] pi_a not infinity", i);
+        TEST_ASSERT(!proofs[i].pi_a.infinity, msg);
+
+        snprintf(msg, sizeof(msg), "batch on-curve: proof[%d] pi_b not infinity", i);
+        TEST_ASSERT(!proofs[i].pi_b.infinity, msg);
+    }
+}
+
+void test_batch_determinism() {
+    printf("test_batch_determinism...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(2, 3, 8),
+    };
+
+    auto run1 = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+    auto run2 = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+
+    TEST_ASSERT(proof_equal(run1[0], run2[0]), "batch determinism: proof[0] matches");
+    TEST_ASSERT(proof_equal(run1[1], run2[1]), "batch determinism: proof[1] matches");
+}
+
+void test_batch_different_witnesses() {
+    printf("test_batch_different_witnesses...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(2, 3, 8),
+        compute_fibonacci_witness(5, 8, 8),
+    };
+
+    auto proofs = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+
+    // Different witnesses → different proofs (pi_a should differ)
+    TEST_ASSERT(!proof_equal(proofs[0], proofs[1]), "batch: proof[0] != proof[1]");
+    TEST_ASSERT(!proof_equal(proofs[1], proofs[2]), "batch: proof[1] != proof[2]");
+    TEST_ASSERT(!proof_equal(proofs[0], proofs[2]), "batch: proof[0] != proof[2]");
+}
+
+void test_batch_same_witness_different_seeds() {
+    printf("test_batch_same_witness_different_seeds...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+    auto w = compute_fibonacci_witness(1, 1, 8);
+
+    // Same witness duplicated — but batch assigns different r/s seeds per proof
+    std::vector<std::vector<FpElement>> witnesses = {w, w, w};
+    auto proofs = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+
+    // Different r/s seeds → different proofs even with same witness
+    TEST_ASSERT(!proof_equal(proofs[0], proofs[1]),
+                "batch same witness: proof[0] != proof[1] (different r/s)");
+    TEST_ASSERT(!proof_equal(proofs[1], proofs[2]),
+                "batch same witness: proof[1] != proof[2] (different r/s)");
+}
+
+void test_batch_sequential_reference() {
+    using namespace ff_ref;
+    printf("test_batch_sequential_reference...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(2, 3, 8),
+    };
+
+    auto seq = groth16_prove_batch_sequential_sparse(r1cs, pk, witnesses, 17, 23);
+
+    // Verify sequential matches individual calls
+    auto p0 = groth16_prove_sparse(r1cs, pk, witnesses[0], 17, 23);
+    auto p1 = groth16_prove_sparse(r1cs, pk, witnesses[1], 19, 25);
+
+    TEST_ASSERT(proof_equal(seq[0], p0), "seq batch: proof[0] matches individual");
+    TEST_ASSERT(proof_equal(seq[1], p1), "seq batch: proof[1] matches individual");
+}
+
+void test_batch_256() {
+    using namespace ff_ref;
+    printf("test_batch_256...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(256);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 256),
+        compute_fibonacci_witness(2, 3, 256),
+    };
+
+    auto batch = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+    auto seq   = groth16_prove_batch_sequential_sparse(r1cs, pk, witnesses, 17, 23);
+
+    TEST_ASSERT(batch.size() == 2, "batch256: size = 2");
+    TEST_ASSERT(proof_equal(batch[0], seq[0]), "batch256: proof[0] matches sequential");
+    TEST_ASSERT(proof_equal(batch[1], seq[1]), "batch256: proof[1] matches sequential");
+
+    // On curve
+    G1AffineRef pa0 = gpu_to_ref_g1(batch[0].pi_a);
+    TEST_ASSERT(!batch[0].pi_a.infinity && g1_is_on_curve_ref(pa0), "batch256: proof[0] pi_a on curve");
+    G1AffineRef pa1 = gpu_to_ref_g1(batch[1].pi_a);
+    TEST_ASSERT(!batch[1].pi_a.infinity && g1_is_on_curve_ref(pa1), "batch256: proof[1] pi_a on curve");
+}
+
+void test_batch_eight() {
+    printf("test_batch_eight...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses;
+    for (int i = 0; i < 8; ++i)
+        witnesses.push_back(compute_fibonacci_witness(i + 1, i + 2, 8));
+
+    auto batch = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+    auto seq   = groth16_prove_batch_sequential_sparse(r1cs, pk, witnesses, 17, 23);
+
+    TEST_ASSERT(batch.size() == 8, "batch8: size = 8");
+    bool all_match = true;
+    for (int i = 0; i < 8; ++i) {
+        if (!proof_equal(batch[i], seq[i])) { all_match = false; break; }
+    }
+    TEST_ASSERT(all_match, "batch8: all proofs match sequential");
+
+    // All proofs should be different (different witnesses + different r/s seeds)
+    bool all_different = true;
+    for (int i = 0; i < 8 && all_different; ++i)
+        for (int j = i + 1; j < 8 && all_different; ++j)
+            if (proof_equal(batch[i], batch[j])) all_different = false;
+    TEST_ASSERT(all_different, "batch8: all proofs pairwise different");
+}
+
+void test_batch_vs_cpu_reference() {
+    using namespace ff_ref;
+    printf("test_batch_vs_cpu_reference...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42);
+
+    std::vector<std::vector<FpElement>> witnesses = {
+        compute_fibonacci_witness(1, 1, 8),
+        compute_fibonacci_witness(2, 3, 8),
+    };
+
+    auto batch = groth16_prove_batch_sparse(r1cs, pk, witnesses, 17, 23);
+
+    // Compare each batch proof's pi_A and pi_C with CPU reference
+    for (int i = 0; i < 2; ++i) {
+        auto cpu = groth16_prove_cpu_sparse(r1cs, pk, witnesses[i],
+                                             17 + (uint64_t)i * 2, 23 + (uint64_t)i * 2);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "batch vs CPU: proof[%d] pi_a match", i);
+        TEST_ASSERT(g1_affine_equal(batch[i].pi_a, cpu.pi_a), msg);
+
+        snprintf(msg, sizeof(msg), "batch vs CPU: proof[%d] pi_c match", i);
+        TEST_ASSERT(g1_affine_equal(batch[i].pi_c, cpu.pi_c), msg);
+    }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -8846,6 +9128,20 @@ int main() {
     test_fibonacci_determinism();
     test_fibonacci_different_inputs();
     test_fibonacci_zero_start();
+
+    // ─── v2.2.0 Session 30: Batch Pipeline Tests ────────────────────────────
+    printf("\n--- v2.2.0 Session 30: Batch Pipeline ---\n");
+    test_batch_empty();
+    test_batch_single_matches_individual();
+    test_batch_vs_sequential();
+    test_batch_on_curve();
+    test_batch_determinism();
+    test_batch_different_witnesses();
+    test_batch_same_witness_different_seeds();
+    test_batch_sequential_reference();
+    test_batch_256();
+    test_batch_eight();
+    test_batch_vs_cpu_reference();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

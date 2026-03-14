@@ -152,3 +152,25 @@ Groth16Proof groth16_prove_cpu_sparse(const SparseR1CS& r1cs,
                                        const std::vector<FpElement>& witness,
                                        uint64_t r_seed = 17,
                                        uint64_t s_seed = 23);
+
+// ─── API: Batch Pipeline (2-stream, pre-allocated device memory) ─────────────
+
+// Batch prove: generates proofs for multiple witnesses against the same circuit.
+// Pre-allocates device memory (2 slots with CUDA streams) to eliminate per-proof
+// malloc/free overhead. Each proof uses r_seed = r_seed_base + 2*i,
+// s_seed = s_seed_base + 2*i. Returns proofs in witness order.
+std::vector<Groth16Proof> groth16_prove_batch_sparse(
+    const SparseR1CS& r1cs,
+    const ProvingKey& pk,
+    const std::vector<std::vector<FpElement>>& witnesses,
+    uint64_t r_seed_base = 17,
+    uint64_t s_seed_base = 23);
+
+// Sequential batch: calls groth16_prove_sparse() in a loop (baseline for
+// comparison with the pipelined batch version).
+std::vector<Groth16Proof> groth16_prove_batch_sequential_sparse(
+    const SparseR1CS& r1cs,
+    const ProvingKey& pk,
+    const std::vector<std::vector<FpElement>>& witnesses,
+    uint64_t r_seed_base = 17,
+    uint64_t s_seed_base = 23);

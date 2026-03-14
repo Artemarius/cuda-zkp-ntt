@@ -1,0 +1,45 @@
+{
+  "benchmark": "groth16_v220",
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "sm": "8.6",
+  "fibonacci": [
+    {
+      "num_constraints": 256,
+      "domain_size": 256,
+      "num_variables": 259,
+      "setup_ms": 18738.6910,
+      "gpu_prove_ms": 145.4058,
+      "cpu_prove_ms": 8050.1125,
+      "cpu_over_gpu": 55.3631
+    },
+    {
+      "num_constraints": 1024,
+      "domain_size": 1024,
+      "num_variables": 1027,
+      "setup_ms": 74514.2991,
+      "gpu_prove_ms": 281.9577,
+      "cpu_prove_ms": 38331.8847,
+      "cpu_over_gpu": 135.9491
+    }
+  ],
+  "batch_pipeline": [
+    {
+      "num_constraints": 256,
+      "batch_size": 4,
+      "sequential_ms": 585.4185,
+      "pipelined_ms": 570.4935,
+      "speedup": 1.0262,
+      "seq_proofs_per_sec": 6.8327,
+      "pipe_proofs_per_sec": 7.0115
+    },
+    {
+      "num_constraints": 1024,
+      "batch_size": 4,
+      "sequential_ms": 1132.4457,
+      "pipelined_ms": 1114.4358,
+      "speedup": 1.0162,
+      "seq_proofs_per_sec": 3.5322,
+      "pipe_proofs_per_sec": 3.5893
+    }
+  ]
+}

@@ -6,9 +6,11 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
-- **v2.2.0** (in progress): Fibonacci circuit at real scale — sparse R1CS (COO format),
-  Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly. GPU wins 55-139x
-  over CPU at n=256-1024. 820 tests. Session 29 complete, Session 30 (batch pipeline) next.
+- **v2.2.0**: Fibonacci circuit + batch pipeline — sparse R1CS (COO format),
+  Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly, 2-stream batch
+  pipeline with pre-allocated device memory. GPU wins 55-139x over CPU at n=256-1024.
+  Batch pipeline: 1.03x at nc=256, 1.02x at nc=1024 (limited by cooperative NTT blocking
+  all SMs and MSM internal sync). 870 tests.
 - **v2.1.0**: Production MSM — signed-digit window recoding (halves bucket
   count), segment-offset parallel accumulation, parallel bucket reduction (Hillis-Steele
   suffix scan), window auto-tuner (c capped at 11 for parallel reduction), stream-ordered
@@ -125,6 +127,11 @@ CMake targets:
   - G2 MSM workaround: B_scalar computed via field arithmetic + 1 G2 scalar mul (no GPU G2 MSM)
   - Dense pipeline: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
   - GPU proof matches CPU proof bitwise (cross-validated)
+  - Batch pipeline: `groth16_prove_batch_sparse()` — 2 CUDA streams, pre-allocated device
+    memory (2 slots), reusable host scalar buffers. Eliminates per-proof malloc/free overhead.
+    Batch reference: `groth16_prove_batch_sequential_sparse()` (loop baseline).
+    Measured speedup: 1.03x at nc=256, 1.02x at nc=1024 (cooperative NTT blocks all SMs,
+    MSM internal sync prevents CPU-GPU overlap — true overlap needs async MSM)
 
 ### NTT
 - BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -418,17 +425,18 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
 
-Phases 1-8 complete. Current version: **v2.1.0** (Session 28 complete). v2.2.0 in progress (Session 29 complete).
+Phases 1-8 complete. Current version: **v2.2.0** (Session 30 complete).
 
 ### In Progress
-- **v2.2.0** — Fibonacci circuit + BatchZK-style 2-stream batch pipeline.
-  Session 29 complete: sparse R1CS, Lagrange basis setup, GPU MSM proof, 820 tests.
-  GPU wins 55-139x over CPU (n=256-1024). Session 30 next (batch pipeline + release).
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
   final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
   Sessions 31-35.
 
 ### Completed Releases
+- **v2.2.0** — Fibonacci circuit + batch pipeline. Sparse R1CS (COO format), Lagrange basis
+  trusted setup (O(n) batch inversion), GPU MSM proof assembly. 2-stream batch pipeline with
+  pre-allocated device memory. GPU wins **55-139x** over CPU at n=256-1024. Batch pipeline
+  1.03x at nc=256 (cooperative NTT + MSM sync limit overlap). 870 tests (169 new over v2.1.0).
 - **v2.1.0** — Production MSM: signed-digit window recoding, CUB radix sort, segment-offset
   parallel accumulation, Hillis-Steele parallel bucket reduction, window auto-tuner (c capped
   at 11), stream-ordered memory pools. **35.8x speedup** at n=2^18 (42.7s→1.2s vs v2.0.0),
