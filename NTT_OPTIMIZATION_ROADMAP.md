@@ -1767,30 +1767,32 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 - Frobenius: φ^6(a)=a period (16), multiplicativity φ(ab)=φ(a)φ(b) (16), fixes Fq2 elements
 - Nonresidue chain: v^3 = β algebraic identity
 
-### Session 32 — Fq12 Arithmetic
+### Session 32 — Fq12 Arithmetic ✅ COMPLETE
 
 **Objective:** Implement Fq12 = Fq6[w] / (w² − v), completing the tower.
 
 **Deliverables:**
 1. `include/ff_fq12.cuh` — GPU Fq12 arithmetic:
-   - `Fq12Element = {Fq6Element c0, c1}` (element = c0 + c1·w)
+   - `Fq12Element = {Fq6Element c0, c1}` (element = c0 + c1·w, 576 bytes)
    - `fq12_add/sub/neg/mul/sqr/inv/conjugate`
    - `fq12_mul`: Karatsuba (3 Fq6 muls = 54 Fq muls)
-   - `fq12_frobenius_map` (precomputed coefficients from Sage/Python)
-   - `fq12_mul_by_034` (sparse mul for Miller loop line functions)
-2. CPU reference `Fq12Ref` in `tests/ff_reference.h`
-3. Frobenius coefficients: roots of unity `(1+u)^((q^k-1)/6)` hardcoded as constants
+   - `fq12_sqr`: Complex method (2 Fq6 muls = 36 Fq muls)
+   - `fq12_inv`: Via norm to Fq6
+   - `fq12_conjugate`: a0 − a1·w (unitary inverse for cyclotomic subgroup)
+   - `fq12_mul_by_034`: Sparse mul for Miller loop line functions (13 Fq2 muls = 39 Fq muls)
+   - `fq12_frobenius_map`: φ^k with precomputed γ_w[k] = β^((q^k-1)/6), period 12
+2. CPU reference `Fq12Ref` in `tests/ff_reference.h` + all operations + Frobenius coefficient computation
+3. GPU test kernels in `src/ff_fq_kernels.cu` (add, sub, mul, sqr)
+4. Key identity verified: w² = v
 
-**Note:** Fq12Element = 576 bytes. GPU pairing will spill to local memory (~216 registers
-for f + T alone). Acceptable for correctness; performance optimization is future work.
-
-**Tests (~20 new, cumulative ~736):**
-- CPU self-test: add/sub/mul/sqr/inv
+**Tests (36 new, cumulative 937):**
+- CPU self-test: add/sub/mul/sqr/inv/conjugate
 - GPU vs CPU: add, sub, mul, sqr
 - Inverse: a · a^{-1} = 1
 - Conjugation: for unitary elements, conjugate = inverse
-- Frobenius: f^{q^k} identity for k=1,2,3,6,12
+- Frobenius: φ^k identity for k=1,2,3,6,12 (period 12)
 - Sparse mul: `mul_by_034` matches general mul
+- Key identity: w² = v
 
 ### Session 33 — Miller Loop
 
@@ -1874,10 +1876,10 @@ for f + T alone). Acceptable for correctness; performance optimization is future
 | 29 | v2.2.0 | Fibonacci R1CS circuit + sparse setup + GPU MSM proof ✅ | 119 | 820 |
 | 30 | v2.2.0 | 2-stream batch pipeline + release ✅ | 50 | 870 |
 | 31 | v3.0.0 | Fq6 arithmetic ✅ | 31 | 901 |
-| 32 | v3.0.0 | Fq12 arithmetic | ~20 | ~875 |
-| 33 | v3.0.0 | Miller loop | ~15 | ~890 |
-| 34 | v3.0.0 | Final exponentiation | ~15 | ~905 |
-| 35 | v3.0.0 | Groth16 verification + release | ~20 | ~925 |
+| 32 | v3.0.0 | Fq12 arithmetic ✅ | 36 | 937 |
+| 33 | v3.0.0 | Miller loop | ~15 | ~952 |
+| 34 | v3.0.0 | Final exponentiation | ~15 | ~967 |
+| 35 | v3.0.0 | Groth16 verification + release | ~20 | ~987 |
 
 **Dependencies:**
 - Sessions 26→27→28 (linear, v2.1.0 MSM)

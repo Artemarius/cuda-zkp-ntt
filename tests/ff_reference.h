@@ -1303,6 +1303,17 @@ inline std::array<uint64_t, 6> div_6limb_by_3(const std::array<uint64_t, 6>& a) 
     return q;
 }
 
+// ─── Multi-precision div by 2 (right shift) ─────────────────────────────────
+
+inline std::array<uint64_t, 6> div_6limb_by_2(const std::array<uint64_t, 6>& a) {
+    std::array<uint64_t, 6> q = {{}};
+    for (int i = 0; i < 6; ++i) {
+        q[i] = a[i] >> 1;
+        if (i < 5) q[i] |= (a[i+1] & 1) << 63;
+    }
+    return q;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Fq6 = Fq2[v] / (v^3 - β) CPU Reference, β = (1+u)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1476,6 +1487,143 @@ inline Fq6Ref fq6_frobenius_map_ref(const Fq6Ref& a, int power,
     c2 = fq2_mul_ref(c2, frob_c2[power]);
 
     return {c0, c1, c2};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fq12 = Fq6[w] / (w² − v) CPU Reference
+// Top of the BLS12-381 tower: Fq → Fq2 → Fq6 → Fq12.
+// w² = v, so multiplying Fq6 by v is fq6_mul_by_nonresidue.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct Fq12Ref {
+    Fq6Ref c0, c1;  // c0 + c1*w
+
+    static Fq12Ref zero() { return {Fq6Ref::zero(), Fq6Ref::zero()}; }
+    static Fq12Ref one_mont() { return {Fq6Ref::one_mont(), Fq6Ref::zero()}; }
+
+    bool operator==(const Fq12Ref& o) const { return c0 == o.c0 && c1 == o.c1; }
+    bool operator!=(const Fq12Ref& o) const { return !(*this == o); }
+};
+
+inline Fq12Ref fq12_add_ref(const Fq12Ref& a, const Fq12Ref& b) {
+    return {fq6_add_ref(a.c0, b.c0), fq6_add_ref(a.c1, b.c1)};
+}
+
+inline Fq12Ref fq12_sub_ref(const Fq12Ref& a, const Fq12Ref& b) {
+    return {fq6_sub_ref(a.c0, b.c0), fq6_sub_ref(a.c1, b.c1)};
+}
+
+inline Fq12Ref fq12_neg_ref(const Fq12Ref& a) {
+    return {fq6_neg_ref(a.c0), fq6_neg_ref(a.c1)};
+}
+
+inline Fq12Ref fq12_conjugate_ref(const Fq12Ref& a) {
+    return {a.c0, fq6_neg_ref(a.c1)};
+}
+
+// Karatsuba: 3 Fq6 muls = 54 Fq muls
+inline Fq12Ref fq12_mul_ref(const Fq12Ref& a, const Fq12Ref& b) {
+    Fq6Ref v0 = fq6_mul_ref(a.c0, b.c0);
+    Fq6Ref v1 = fq6_mul_ref(a.c1, b.c1);
+
+    Fq6Ref c0 = fq6_add_ref(v0, fq6_mul_by_nonresidue_ref(v1));
+    Fq6Ref c1 = fq6_sub_ref(fq6_sub_ref(
+        fq6_mul_ref(fq6_add_ref(a.c0, a.c1), fq6_add_ref(b.c0, b.c1)), v0), v1);
+
+    return {c0, c1};
+}
+
+// Complex squaring: 2 Fq6 muls = 36 Fq muls
+inline Fq12Ref fq12_sqr_ref(const Fq12Ref& a) {
+    Fq6Ref ab = fq6_mul_ref(a.c0, a.c1);
+    Fq6Ref v_a1 = fq6_mul_by_nonresidue_ref(a.c1);
+
+    Fq6Ref c0 = fq6_sub_ref(fq6_sub_ref(
+        fq6_mul_ref(fq6_add_ref(a.c0, a.c1), fq6_add_ref(a.c0, v_a1)), ab),
+        fq6_mul_by_nonresidue_ref(ab));
+    Fq6Ref c1 = fq6_add_ref(ab, ab);
+
+    return {c0, c1};
+}
+
+// Inverse: norm = a0² - v·a1², result = (a0/norm, -a1/norm)
+inline Fq12Ref fq12_inv_ref(const Fq12Ref& a) {
+    Fq6Ref a0_sq = fq6_sqr_ref(a.c0);
+    Fq6Ref a1_sq = fq6_sqr_ref(a.c1);
+    Fq6Ref norm = fq6_sub_ref(a0_sq, fq6_mul_by_nonresidue_ref(a1_sq));
+    Fq6Ref norm_inv = fq6_inv_ref(norm);
+
+    return {fq6_mul_ref(a.c0, norm_inv), fq6_neg_ref(fq6_mul_ref(a.c1, norm_inv))};
+}
+
+// Sparse mul_by_034: 13 Fq2 muls = 39 Fq muls
+inline Fq12Ref fq12_mul_by_034_ref(const Fq12Ref& a,
+                                     const Fq2Ref& d0,
+                                     const Fq2Ref& d3,
+                                     const Fq2Ref& d4) {
+    Fq6Ref v0 = fq6_scale_ref(a.c0, d0);
+    Fq6Ref v1 = fq6_mul_by_01_ref(a.c1, d3, d4);
+
+    Fq6Ref c0 = fq6_add_ref(v0, fq6_mul_by_nonresidue_ref(v1));
+
+    Fq6Ref sum_a = fq6_add_ref(a.c0, a.c1);
+    Fq2Ref sum_d03 = fq2_add_ref(d0, d3);
+    Fq6Ref c1 = fq6_sub_ref(fq6_sub_ref(
+        fq6_mul_by_01_ref(sum_a, sum_d03, d4), v0), v1);
+
+    return {c0, c1};
+}
+
+// ─── Fq12 Frobenius Coefficient Computation ────────────────────────────────
+// γ_w[k] = β^((q^k-1)/6) where β = (1+u).
+// γ_w[k] = product_{i=0}^{k-1} φ^i(γ_w[1])
+// where φ^i on Fq2 = conjugation if i odd, identity if even.
+
+inline Fq2Ref compute_fq12_frobenius_w(int power) {
+    if (power == 0) return Fq2Ref::one_mont();
+
+    // β = (1+u) in Montgomery form
+    Fq2Ref beta = {fq_to_montgomery_ref(FqRef::from_u64(1)),
+                   fq_to_montgomery_ref(FqRef::from_u64(1))};
+
+    // Compute (q-1)/6 = div_by_2(q-1) then div_by_3
+    std::array<uint64_t, 6> q_minus_1 = FQ_MOD;
+    q_minus_1[0] -= 1;  // q is odd, no borrow
+    std::array<uint64_t, 6> half = div_6limb_by_2(q_minus_1);
+    std::array<uint64_t, 6> exp = div_6limb_by_3(half);
+
+    // γ_w[1] = β^((q-1)/6)
+    Fq2Ref gamma_w1 = fq2_pow_ref(beta, exp);
+    Fq2Ref conj_gamma_w1 = fq2_conjugate_ref(gamma_w1);
+
+    // γ_w[k] = product_{i=0}^{k-1} φ^i(γ_w[1])
+    Fq2Ref result = Fq2Ref::one_mont();
+    for (int i = 0; i < power; ++i) {
+        if (i % 2 == 0)
+            result = fq2_mul_ref(result, gamma_w1);
+        else
+            result = fq2_mul_ref(result, conj_gamma_w1);
+    }
+    return result;
+}
+
+inline void compute_fq12_frobenius_coefficients(Fq2Ref w_out[12]) {
+    for (int k = 0; k < 12; ++k) {
+        w_out[k] = compute_fq12_frobenius_w(k);
+    }
+}
+
+// Frobenius map: φ^k(c0 + c1·w) = φ^k(c0) + φ^k(c1)·γ_w[k]·w
+inline Fq12Ref fq12_frobenius_map_ref(const Fq12Ref& a, int power,
+                                       const Fq2Ref* fq6_frob_c1,
+                                       const Fq2Ref* fq6_frob_c2,
+                                       const Fq2Ref* fq12_frob_w) {
+    int fq6_power = power % 6;
+    Fq6Ref c0 = fq6_frobenius_map_ref(a.c0, fq6_power, fq6_frob_c1, fq6_frob_c2);
+    Fq6Ref c1 = fq6_frobenius_map_ref(a.c1, fq6_power, fq6_frob_c1, fq6_frob_c2);
+    c1 = fq6_scale_ref(c1, fq12_frob_w[power]);
+
+    return {c0, c1};
 }
 
 // =============================================================================

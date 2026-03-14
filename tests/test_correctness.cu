@@ -8,6 +8,7 @@
 #include "ff_fq.cuh"
 #include "ff_fq2.cuh"
 #include "ff_fq6.cuh"
+#include "ff_fq12.cuh"
 #include "ec_g1.cuh"
 #include "ec_g2.cuh"
 #include "msm.cuh"
@@ -63,6 +64,12 @@ extern __global__ void fq6_add_kernel(const Fq6Element* __restrict__ a, const Fq
 extern __global__ void fq6_sub_kernel(const Fq6Element* __restrict__ a, const Fq6Element* __restrict__ b, Fq6Element* __restrict__ out, uint32_t n);
 extern __global__ void fq6_mul_kernel(const Fq6Element* __restrict__ a, const Fq6Element* __restrict__ b, Fq6Element* __restrict__ out, uint32_t n);
 extern __global__ void fq6_sqr_kernel(const Fq6Element* __restrict__ a, Fq6Element* __restrict__ out, uint32_t n);
+
+// Fq12 (quadratic extension over Fq6) kernel declarations
+extern __global__ void fq12_add_kernel(const Fq12Element* __restrict__ a, const Fq12Element* __restrict__ b, Fq12Element* __restrict__ out, uint32_t n);
+extern __global__ void fq12_sub_kernel(const Fq12Element* __restrict__ a, const Fq12Element* __restrict__ b, Fq12Element* __restrict__ out, uint32_t n);
+extern __global__ void fq12_mul_kernel(const Fq12Element* __restrict__ a, const Fq12Element* __restrict__ b, Fq12Element* __restrict__ out, uint32_t n);
+extern __global__ void fq12_sqr_kernel(const Fq12Element* __restrict__ a, Fq12Element* __restrict__ out, uint32_t n);
 
 // EC kernel declarations (defined in src/ec_kernels.cu)
 extern __global__ void g1_double_kernel(const G1Jacobian* __restrict__ in, G1Jacobian* __restrict__ out, uint32_t n);
@@ -4701,6 +4708,455 @@ void test_fq6_nonresidue_chain() {
     Fq6Ref expected = fq6_scale_ref(a, beta);
     TEST_ASSERT(v3_a == expected, "Fq6: v^3 * a = beta * a");
     printf("  v^3 chain: OK\n");
+}
+
+// =============================================================================
+// v3.0.0 Session 32: Fq12 Field Arithmetic Tests
+// =============================================================================
+
+// ─── Helper: convert Fq12Ref <-> Fq12Element ───────────────────────────────
+
+static Fq12Element fq12_ref_to_gpu(const ff_ref::Fq12Ref& r) {
+    Fq12Element e;
+    e.c0 = fq6_ref_to_gpu(r.c0);
+    e.c1 = fq6_ref_to_gpu(r.c1);
+    return e;
+}
+
+static ff_ref::Fq12Ref fq12_gpu_to_ref(const Fq12Element& e) {
+    ff_ref::Fq12Ref r;
+    r.c0 = fq6_gpu_to_ref(e.c0);
+    r.c1 = fq6_gpu_to_ref(e.c1);
+    return r;
+}
+
+static ff_ref::Fq2Ref make_fq2_test_val(uint64_t seed) {
+    using namespace ff_ref;
+    return {make_fq_test_val(seed * 2 + 1), make_fq_test_val(seed * 2 + 2)};
+}
+
+static ff_ref::Fq12Ref make_fq12_test_val(uint64_t seed) {
+    using namespace ff_ref;
+    return {make_fq6_test_val(seed * 2 + 1), make_fq6_test_val(seed * 2 + 2)};
+}
+
+// ─── Fq12 CPU Self-Test ─────────────────────────────────────────────────────
+
+void test_fq12_cpu_self_test() {
+    using namespace ff_ref;
+    printf("test_fq12_cpu_self_test...\n");
+
+    Fq12Ref z = Fq12Ref::zero();
+    Fq12Ref one = Fq12Ref::one_mont();
+
+    // Basic identity tests
+    TEST_ASSERT(fq12_add_ref(z, z) == z, "Fq12: 0 + 0 = 0");
+    TEST_ASSERT(fq12_mul_ref(one, one) == one, "Fq12: 1 * 1 = 1");
+
+    Fq12Ref a = make_fq12_test_val(1);
+
+    TEST_ASSERT(fq12_add_ref(a, z) == a, "Fq12: a + 0 = a");
+    TEST_ASSERT(fq12_sub_ref(a, a) == z, "Fq12: a - a = 0");
+    TEST_ASSERT(fq12_mul_ref(a, one) == a, "Fq12: a * 1 = a");
+
+    // Negation
+    Fq12Ref neg_a = fq12_neg_ref(a);
+    TEST_ASSERT(fq12_add_ref(a, neg_a) == z, "Fq12: a + (-a) = 0");
+
+    // Inverse
+    Fq12Ref a_inv = fq12_inv_ref(a);
+    Fq12Ref should_one = fq12_mul_ref(a, a_inv);
+    TEST_ASSERT(should_one == one, "Fq12: a * a^{-1} = 1");
+
+    // Commutativity
+    Fq12Ref b = make_fq12_test_val(2);
+    TEST_ASSERT(fq12_mul_ref(a, b) == fq12_mul_ref(b, a), "Fq12: a*b = b*a");
+
+    // Squaring = mul(a, a)
+    Fq12Ref sq1 = fq12_sqr_ref(a);
+    Fq12Ref sq2 = fq12_mul_ref(a, a);
+    TEST_ASSERT(sq1 == sq2, "Fq12: sqr(a) == mul(a,a)");
+
+    // Conjugate: conj(a) = a0 - a1*w
+    Fq12Ref conj_a = fq12_conjugate_ref(a);
+    TEST_ASSERT(conj_a.c0 == a.c0, "Fq12: conjugate preserves c0");
+    TEST_ASSERT(conj_a.c1 == fq6_neg_ref(a.c1), "Fq12: conjugate negates c1");
+
+    // Sparse mul: mul_by_034 matches general mul
+    Fq2Ref d0 = make_fq2_test_val(100);
+    Fq2Ref d3 = make_fq2_test_val(200);
+    Fq2Ref d4 = make_fq2_test_val(300);
+    Fq12Ref sparse_b = {{d0, Fq2Ref::zero(), Fq2Ref::zero()},
+                         {d3, d4, Fq2Ref::zero()}};
+    Fq12Ref full_prod = fq12_mul_ref(a, sparse_b);
+    Fq12Ref sparse_prod = fq12_mul_by_034_ref(a, d0, d3, d4);
+    TEST_ASSERT(full_prod == sparse_prod, "Fq12: mul_by_034 matches general mul");
+
+    // Distributivity
+    Fq12Ref c = make_fq12_test_val(3);
+    Fq12Ref lhs = fq12_mul_ref(fq12_add_ref(a, b), c);
+    Fq12Ref rhs = fq12_add_ref(fq12_mul_ref(a, c), fq12_mul_ref(b, c));
+    TEST_ASSERT(lhs == rhs, "Fq12: distributivity");
+
+    printf("  All Fq12 CPU self-tests passed\n");
+}
+
+// ─── Fq12 GPU Mul Test ─────────────────────────────────────────────────────
+
+void test_fq12_gpu_mul() {
+    using namespace ff_ref;
+    printf("test_fq12_gpu_mul...\n");
+    const uint32_t N = 64;
+
+    std::vector<Fq12Element> h_a(N), h_b(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 1));
+        h_b[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 2));
+    }
+
+    Fq12Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+
+    fq12_mul_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq12Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq12Ref ra = fq12_gpu_to_ref(h_a[i]);
+        Fq12Ref rb = fq12_gpu_to_ref(h_b[i]);
+        Fq12Ref expected = fq12_mul_ref(ra, rb);
+        Fq12Ref got = fq12_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq12 GPU mul: all elements match CPU reference");
+    printf("  Fq12 mul: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq12 GPU Add Test ─────────────────────────────────────────────────────
+
+void test_fq12_gpu_add() {
+    using namespace ff_ref;
+    printf("test_fq12_gpu_add...\n");
+    const uint32_t N = 64;
+
+    std::vector<Fq12Element> h_a(N), h_b(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 1));
+        h_b[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 2));
+    }
+
+    Fq12Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+
+    fq12_add_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq12Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq12Ref ra = fq12_gpu_to_ref(h_a[i]);
+        Fq12Ref rb = fq12_gpu_to_ref(h_b[i]);
+        Fq12Ref expected = fq12_add_ref(ra, rb);
+        Fq12Ref got = fq12_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq12 GPU add: all elements match CPU reference");
+    printf("  Fq12 add: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq12 GPU Sub Test ─────────────────────────────────────────────────────
+
+void test_fq12_gpu_sub() {
+    using namespace ff_ref;
+    printf("test_fq12_gpu_sub...\n");
+    const uint32_t N = 64;
+
+    std::vector<Fq12Element> h_a(N), h_b(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 1));
+        h_b[i] = fq12_ref_to_gpu(make_fq12_test_val(i * 2 + 2));
+    }
+
+    Fq12Element *d_a, *d_b, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_b, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+
+    fq12_sub_kernel<<<(N + 63) / 64, 64>>>(d_a, d_b, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq12Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq12Ref ra = fq12_gpu_to_ref(h_a[i]);
+        Fq12Ref rb = fq12_gpu_to_ref(h_b[i]);
+        Fq12Ref expected = fq12_sub_ref(ra, rb);
+        Fq12Ref got = fq12_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq12 GPU sub: all elements match CPU reference");
+    printf("  Fq12 sub: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq12 GPU Sqr Test ─────────────────────────────────────────────────────
+
+void test_fq12_gpu_sqr() {
+    using namespace ff_ref;
+    printf("test_fq12_gpu_sqr...\n");
+    const uint32_t N = 64;
+
+    std::vector<Fq12Element> h_a(N), h_out(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        h_a[i] = fq12_ref_to_gpu(make_fq12_test_val(i + 1));
+    }
+
+    Fq12Element *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(Fq12Element)));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), N * sizeof(Fq12Element), cudaMemcpyHostToDevice));
+
+    fq12_sqr_kernel<<<(N + 63) / 64, 64>>>(d_a, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N * sizeof(Fq12Element), cudaMemcpyDeviceToHost));
+
+    int pass = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        Fq12Ref ra = fq12_gpu_to_ref(h_a[i]);
+        Fq12Ref expected = fq12_sqr_ref(ra);
+        Fq12Ref got = fq12_gpu_to_ref(h_out[i]);
+        if (got == expected) ++pass;
+    }
+    TEST_ASSERT(pass == (int)N, "Fq12 GPU sqr: all elements match CPU reference");
+    printf("  Fq12 sqr: %d/%d matched\n", pass, N);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+// ─── Fq12 Algebraic Properties Test ────────────────────────────────────────
+
+void test_fq12_algebraic() {
+    using namespace ff_ref;
+    printf("test_fq12_algebraic...\n");
+    const int N = 8;
+
+    int pass_comm = 0, pass_assoc = 0, pass_dist = 0, pass_sqr = 0;
+
+    for (int i = 0; i < N; ++i) {
+        Fq12Ref a = make_fq12_test_val(i * 3 + 1);
+        Fq12Ref b = make_fq12_test_val(i * 3 + 2);
+        Fq12Ref c = make_fq12_test_val(i * 3 + 3);
+
+        if (fq12_mul_ref(a, b) == fq12_mul_ref(b, a)) ++pass_comm;
+        if (fq12_mul_ref(fq12_mul_ref(a, b), c) == fq12_mul_ref(a, fq12_mul_ref(b, c))) ++pass_assoc;
+
+        Fq12Ref lhs = fq12_mul_ref(a, fq12_add_ref(b, c));
+        Fq12Ref rhs = fq12_add_ref(fq12_mul_ref(a, b), fq12_mul_ref(a, c));
+        if (lhs == rhs) ++pass_dist;
+
+        if (fq12_sqr_ref(a) == fq12_mul_ref(a, a)) ++pass_sqr;
+    }
+    TEST_ASSERT(pass_comm == N, "Fq12 commutativity failure");
+    TEST_ASSERT(pass_assoc == N, "Fq12 associativity failure");
+    TEST_ASSERT(pass_dist == N, "Fq12 distributivity failure");
+    TEST_ASSERT(pass_sqr == N, "Fq12 sqr consistency failure");
+    printf("  Fq12 algebraic: OK\n");
+}
+
+// ─── Fq12 Inverse Round-Trip Test ──────────────────────────────────────────
+
+void test_fq12_inverse() {
+    using namespace ff_ref;
+    printf("test_fq12_inverse...\n");
+    const int N = 8;
+
+    Fq12Ref one = Fq12Ref::one_mont();
+    int pass = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq12Ref a = make_fq12_test_val(i + 1);
+        Fq12Ref a_inv = fq12_inv_ref(a);
+        Fq12Ref prod = fq12_mul_ref(a, a_inv);
+        if (prod == one) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Fq12 inverse round-trip failure");
+    printf("  Fq12 inverse: %d/%d passed\n", pass, N);
+}
+
+// ─── Fq12 Conjugate Test ───────────────────────────────────────────────────
+// For a unitary element f (i.e., f·conj(f) = 1), conjugate is the inverse.
+// Construct unitary: f = a * inv(conj(a)) has norm 1 when |a|_Fq12 != 0.
+// Actually, f = a / conj(a) gives f · conj(f) = (a / conj(a)) · (conj(a) / a) = 1.
+
+void test_fq12_conjugate() {
+    using namespace ff_ref;
+    printf("test_fq12_conjugate...\n");
+    const int N = 4;
+
+    int pass = 0;
+    for (int i = 0; i < N; ++i) {
+        // Construct unitary element: f = a * conj(a)^{-1}
+        Fq12Ref a = make_fq12_test_val(i + 10);
+        Fq12Ref conj_a = fq12_conjugate_ref(a);
+        Fq12Ref conj_a_inv = fq12_inv_ref(conj_a);
+        Fq12Ref f = fq12_mul_ref(a, conj_a_inv);
+
+        // For unitary f: conj(f) should equal inv(f)
+        Fq12Ref conj_f = fq12_conjugate_ref(f);
+        Fq12Ref inv_f = fq12_inv_ref(f);
+        if (conj_f == inv_f) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Fq12 conjugate: unitary elements conj != inv");
+    printf("  Fq12 conjugate (unitary): %d/%d passed\n", pass, N);
+}
+
+// ─── Fq12 Sparse Mul Test ──────────────────────────────────────────────────
+
+void test_fq12_sparse_mul() {
+    using namespace ff_ref;
+    printf("test_fq12_sparse_mul...\n");
+    const int N = 8;
+
+    int pass = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq12Ref a = make_fq12_test_val(i + 1);
+
+        Fq2Ref d0 = make_fq2_test_val(i * 3 + 100);
+        Fq2Ref d3 = make_fq2_test_val(i * 3 + 200);
+        Fq2Ref d4 = make_fq2_test_val(i * 3 + 300);
+
+        // Construct full Fq12 element matching 034 sparsity pattern
+        Fq12Ref sparse_b = {{d0, Fq2Ref::zero(), Fq2Ref::zero()},
+                             {d3, d4, Fq2Ref::zero()}};
+        Fq12Ref full_prod = fq12_mul_ref(a, sparse_b);
+        Fq12Ref sparse_prod = fq12_mul_by_034_ref(a, d0, d3, d4);
+        if (full_prod == sparse_prod) ++pass;
+    }
+    TEST_ASSERT(pass == N, "Fq12 mul_by_034 mismatch");
+    printf("  Fq12 sparse mul: %d/%d passed\n", pass, N);
+}
+
+// ─── Fq12 Frobenius Test ───────────────────────────────────────────────────
+
+void test_fq12_frobenius() {
+    using namespace ff_ref;
+    printf("test_fq12_frobenius...\n");
+
+    // Compute Fq6 Frobenius coefficients (indices 0-5)
+    Fq2Ref fq6_c1[6], fq6_c2[6];
+    compute_fq6_frobenius_coefficients(fq6_c1, fq6_c2);
+
+    // Compute Fq12 Frobenius coefficients (indices 0-11)
+    Fq2Ref fq12_w[12];
+    compute_fq12_frobenius_coefficients(fq12_w);
+
+    // γ_w[0] should be 1
+    TEST_ASSERT(fq12_w[0] == Fq2Ref::one_mont(), "Fq12 Frobenius: gamma_w[0] = 1");
+
+    // γ_w[k]² should equal γ₁[k] (Fq6 Frobenius c1 coefficient)
+    // because γ_w[k] = β^((q^k-1)/6) and γ₁[k] = β^((q^k-1)/3) = γ_w[k]²
+    for (int k = 1; k < 6; ++k) {
+        Fq2Ref gamma_w_sq = fq2_sqr_ref(fq12_w[k]);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Fq12 Frobenius: gamma_w[%d]^2 = gamma_1[%d]", k, k);
+        TEST_ASSERT(gamma_w_sq == fq6_c1[k], msg);
+    }
+
+    // φ^12(a) = a (period 12 for Fq12 Frobenius)
+    const int N = 4;
+    int pass_period = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq12Ref a = make_fq12_test_val(i + 1);
+        Fq12Ref result = a;
+        for (int k = 0; k < 12; ++k)
+            result = fq12_frobenius_map_ref(result, 1, fq6_c1, fq6_c2, fq12_w);
+        if (result == a) ++pass_period;
+    }
+    TEST_ASSERT(pass_period == N, "Fq12 Frobenius: phi^12(a) != a");
+
+    // Multiplicativity: φ(a*b) = φ(a) * φ(b)
+    int pass_mult = 0;
+    for (int i = 0; i < N; ++i) {
+        Fq12Ref a = make_fq12_test_val(i * 2 + 1);
+        Fq12Ref b = make_fq12_test_val(i * 2 + 2);
+        Fq12Ref lhs = fq12_frobenius_map_ref(fq12_mul_ref(a, b), 1, fq6_c1, fq6_c2, fq12_w);
+        Fq12Ref rhs = fq12_mul_ref(
+            fq12_frobenius_map_ref(a, 1, fq6_c1, fq6_c2, fq12_w),
+            fq12_frobenius_map_ref(b, 1, fq6_c1, fq6_c2, fq12_w)
+        );
+        if (lhs == rhs) ++pass_mult;
+    }
+    TEST_ASSERT(pass_mult == N, "Fq12 Frobenius: phi(a*b) != phi(a)*phi(b)");
+
+    // φ^6 fixes Fq6 elements (Fq6 embedded as c0 + 0·w)
+    Fq12Ref fq6_elem = {make_fq6_test_val(42), Fq6Ref::zero()};
+    Fq12Ref phi6_fq6 = fq6_elem;
+    for (int k = 0; k < 6; ++k)
+        phi6_fq6 = fq12_frobenius_map_ref(phi6_fq6, 1, fq6_c1, fq6_c2, fq12_w);
+    TEST_ASSERT(phi6_fq6 == fq6_elem, "Fq12 Frobenius: phi^6 fixes Fq6 elements");
+
+    // φ^2 fixes Fq2 elements (Fq2 embedded as {{fq2, 0, 0}, {0, 0, 0}})
+    Fq2Ref fq2_val = make_fq2_test_val(99);
+    Fq12Ref fq2_elem = {{fq2_val, Fq2Ref::zero(), Fq2Ref::zero()},
+                         {Fq2Ref::zero(), Fq2Ref::zero(), Fq2Ref::zero()}};
+    Fq12Ref phi2_fq2 = fq12_frobenius_map_ref(
+        fq12_frobenius_map_ref(fq2_elem, 1, fq6_c1, fq6_c2, fq12_w),
+        1, fq6_c1, fq6_c2, fq12_w);
+    TEST_ASSERT(phi2_fq2 == fq2_elem, "Fq12 Frobenius: phi^2 fixes Fq2 elements");
+
+    printf("  Fq12 Frobenius: OK\n");
+}
+
+// ─── Fq12 w² = v identity test ─────────────────────────────────────────────
+
+void test_fq12_w_squared() {
+    using namespace ff_ref;
+    printf("test_fq12_w_squared...\n");
+
+    // w = (0, 1) in Fq12, i.e., c0 = Fq6::zero(), c1 = Fq6::one()
+    Fq12Ref w = {Fq6Ref::zero(), Fq6Ref::one_mont()};
+    Fq12Ref w_sq = fq12_sqr_ref(w);
+
+    // w² should be v, which in Fq12 is the element with c0 = (0, 1, 0), c1 = 0
+    // v in Fq6 = {Fq2::zero(), Fq2::one_mont(), Fq2::zero()}
+    Fq6Ref v_fq6 = {Fq2Ref::zero(), Fq2Ref::one_mont(), Fq2Ref::zero()};
+    Fq12Ref v_fq12 = {v_fq6, Fq6Ref::zero()};
+
+    TEST_ASSERT(w_sq == v_fq12, "Fq12: w^2 = v");
+
+    // Also test: a * w² = a * v = fq6_mul_by_nonresidue on Fq12 level
+    Fq12Ref a = make_fq12_test_val(5);
+    Fq12Ref a_times_w_sq = fq12_mul_ref(a, w_sq);
+    // a * v should give c0 = fq6_mul_by_nonresidue(a.c1), c1 = a.c0 (from the tower structure)
+    // Wait: a = (a0, a1), v = ({0,1,0}, {0,0,0})
+    // a * v = (a0*{0,1,0} + a1*{0,0,0}*v_fq6, a0*{0,0,0} + a1*{0,1,0})... this is more complex.
+    // Let's just verify via general mul
+    Fq12Ref a_times_v = fq12_mul_ref(a, v_fq12);
+    TEST_ASSERT(a_times_w_sq == a_times_v, "Fq12: a*w^2 = a*v");
+
+    printf("  w^2 = v: OK\n");
 }
 
 // =============================================================================
@@ -9433,6 +9889,20 @@ int main() {
     test_fq6_sparse_mul();
     test_fq6_frobenius();
     test_fq6_nonresidue_chain();
+
+    // ─── v3.0.0 Session 32: Fq12 (quadratic extension over Fq6) arithmetic ──
+    printf("\n--- v3.0.0 Session 32: Fq12 (quadratic extension) arithmetic ---\n");
+    test_fq12_cpu_self_test();
+    test_fq12_gpu_add();
+    test_fq12_gpu_sub();
+    test_fq12_gpu_mul();
+    test_fq12_gpu_sqr();
+    test_fq12_algebraic();
+    test_fq12_inverse();
+    test_fq12_conjugate();
+    test_fq12_sparse_mul();
+    test_fq12_frobenius();
+    test_fq12_w_squared();
 
     // ─── v2.0.0 Session 21: Elliptic Curve Arithmetic Tests ──────────────────
     printf("\n--- v2.0.0 Session 21: G1 Elliptic Curve Arithmetic ---\n");

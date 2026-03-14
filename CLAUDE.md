@@ -6,9 +6,11 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
-- **v3.0.0** (in progress, S31): Pairing verification — Fq6 cubic extension over Fq2
+- **v3.0.0** (in progress, S32): Pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
-  Miller loop, Frobenius map). 901 tests.
+  Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
+  complex-method sqr, inverse via norm, conjugate, sparse mul_by_034 for Miller loop,
+  Frobenius map with γ_w[k] coefficients). 937 tests.
 - **v2.2.0**: Fibonacci circuit + batch pipeline — sparse R1CS (COO format),
   Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly, 2-stream batch
   pipeline with pre-allocated device memory. GPU wins 55-139x over CPU at n=256-1024.
@@ -109,6 +111,10 @@ CMake targets:
   - Fq6 cubic extension: `include/ff_fq6.cuh` (Fq6 = Fq2[v]/(v³−β), β=(1+u), Karatsuba
     6 Fq2 muls per mul, CH-SQR2 squaring 2 muls + 3 sqrs, inverse via norm to Fq2,
     sparse mul_by_01/mul_by_1 for Miller loop, Frobenius map)
+  - Fq12 quadratic extension: `include/ff_fq12.cuh` (Fq12 = Fq6[w]/(w²−v), 576 bytes,
+    Karatsuba 3 Fq6 muls per mul = 54 Fq muls, complex-method sqr = 36 Fq muls,
+    inverse via norm to Fq6, conjugate a0−a1·w, sparse mul_by_034 for Miller loop
+    line functions = 13 Fq2 muls, Frobenius map with γ_w[k] = β^((q^k-1)/6) period 12)
 - Elliptic curve G1/G2: `include/ec_g1.cuh`, `include/ec_g2.cuh`
   - Jacobian projective coordinates, affine conversion, on-curve check, scalar_mul
   - G1 over Fq (curve: y^2 = x^3 + 4), G2 over Fq2 (curve: y^2 = x^3 + 4(1+u))
@@ -174,6 +180,7 @@ include/
   ff_fq.cuh           — BLS12-381 base field Fq (381-bit, 12×uint32 Montgomery)
   ff_fq2.cuh          — Fq2 quadratic extension (Karatsuba, 3 Fq muls)
   ff_fq6.cuh          — Fq6 cubic extension (Fq2[v]/(v³−β), Karatsuba 6 Fq2 muls, CH-SQR2, inverse via norm, sparse mul, Frobenius)
+  ff_fq12.cuh         — Fq12 quadratic extension (Fq6[w]/(w²−v), Karatsuba 3 Fq6 muls, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034, Frobenius)
   ec_g1.cuh           — G1 elliptic curve ops (Jacobian, affine, scalar_mul)
   ec_g2.cuh           — G2 elliptic curve ops (over Fq2)
   msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
@@ -437,8 +444,9 @@ Phases 1-8 complete. Current version: **v2.2.0** (Session 30 complete).
 ### In Progress
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
   final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
-  Sessions 31-35. **Session 31 complete**: Fq6 cubic extension (Karatsuba mul, CH-SQR2 sqr,
-  inverse via norm, sparse mul_by_01/mul_by_1, Frobenius map). 901 tests.
+  Sessions 31-35. **Sessions 31-32 complete**: Fq6 cubic extension + Fq12 quadratic extension
+  (Karatsuba mul, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034,
+  Frobenius map). 937 tests.
 
 ### Completed Releases
 - **v2.2.0** — Fibonacci circuit + batch pipeline. Sparse R1CS (COO format), Lagrange basis
