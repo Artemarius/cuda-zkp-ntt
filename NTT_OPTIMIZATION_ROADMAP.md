@@ -1,10 +1,11 @@
 # NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v2.0.0)
+## Current State (v2.1.0)
 
-**BLS12-381 (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
+**NTT (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
-**Previous target:** ≤20 ms — **exceeded** (15.5 ms = −38% vs v1.1.0's 25.2 ms)
+**MSM (n=2^18):** 1.2s (35.8x vs v2.0.0), 247 pts/ms at n=2^20
+**v2.1.0:** Production MSM (signed-digit, parallel reduction, memory pools). 701 tests.
 **v2.0.0:** Groth16 GPU primitives (Fq/Fq2, G1/G2, MSM, poly ops, end-to-end prover). 621 tests.
 
 ### Where Time Goes (n=2^22, v1.5.0 — 3 kernel launches)
@@ -1514,14 +1515,15 @@ Production MSM (ICICLE, bellman-cuda) would be orders of magnitude faster.
 
 ---
 
-## v2.1.0 — Production MSM (IN PROGRESS — Session 27 complete)
+## v2.1.0 — Production MSM (COMPLETE)
 
 **Goal:** Replace correctness-focused single-thread MSM with production-quality parallel Pippenger.
 Current: 261ms at 2^10, 42.6s at 2^18. Gap vs SOTA: ~20-85x in throughput.
-Target: >20x speedup (n=2^18 from 42.7s → <2s).
+Target: >20x speedup (n=2^18 from 42.7s → <2s). **Achieved: 35.8x (1.2s).**
 
-**Session 26 status:** 5.4x speedup achieved (42.7s → 8.0s at 2^18). 641 tests.
-**Session 27 status:** Parallel bucket reduction: 6.8x over S26 (8.0s → 1.2s at 2^18), **36.2x vs v2.0.0**. 655 tests.
+**Session 26:** Signed-digit recoding + CUB sort + segment offsets. 5.4x (42.7s → 8.0s). 641 tests.
+**Session 27:** Parallel bucket reduction (Hillis-Steele suffix scan). 36.2x vs v2.0.0. 655 tests.
+**Session 28:** Window auto-tuner + memory pools + benchmark + release. 701 tests.
 
 **Primary references:**
 - **cuZK** (Lu et al., TCHES 2023) — SpMV formulation: radix sort → sparse coordinate → parallel accumulation

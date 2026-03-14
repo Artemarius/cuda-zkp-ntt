@@ -11,6 +11,7 @@
 
 ## Highlights
 
+- **v2.1.0: Production MSM** — signed-digit recoding, CUB radix sort, parallel bucket reduction (Hillis-Steele), stream-ordered memory pools. **35.8x speedup** at n=2^18 (42.7s to 1.2s), 247 pts/ms at n=2^20.
 - **v2.0.0: End-to-end Groth16 prover** — Fq/Fq2 field arithmetic, G1/G2 elliptic curve ops, MSM (Pippenger), polynomial operations, toy circuit x^3+x+5=y. GPU proof matches CPU proof bitwise.
 - **v1.6.0: 3-field NTT** — BLS12-381 (15.1 ms), Goldilocks (3.6 ms, 4.2x faster), BabyBear (2.4 ms, 6.2x faster) at n=2^22
 - **Multi-field comparison** demonstrates memory-bound convergence: speedup shrinks at large sizes as DRAM traffic dominates
@@ -22,7 +23,7 @@
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
 - **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
 - **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX
-- **621 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **701 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - 3 fields: BLS12-381 (256-bit), Goldilocks (64-bit, Plonky2/3), BabyBear (31-bit, RISC Zero)
 - **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%)
 
@@ -179,6 +180,24 @@ See [`results/analysis.md`](results/analysis.md) for the full annotated NTT anal
 
 ---
 
+## v2.1.0 — Production MSM
+
+Signed-digit window recoding halves bucket count, CUB radix sort replaces single-thread sort,
+segment-offset parallel accumulation replaces binary search, Hillis-Steele suffix scan replaces
+single-thread running sum. Window auto-tuner caps `c` at 11 for parallel reduction.
+Stream-ordered memory pools (cudaMallocAsync) cache allocations across calls.
+
+**MSM benchmark (RTX 3060, 7-rep median):**
+
+| Size | v2.0.0 | v2.1.0 | Speedup | Throughput |
+|------|--------|--------|---------|------------|
+| 2^10 | 261 ms | 123 ms | 2.1x | 8 pts/ms |
+| 2^14 | 2,697 ms | 565 ms | 4.8x | 29 pts/ms |
+| 2^18 | 42,603 ms | **1,194 ms** | **35.8x** | 220 pts/ms |
+| 2^20 | — | 4,249 ms | — | 247 pts/ms |
+
+---
+
 ## v2.0.0 — Groth16 GPU Primitives
 
 End-to-end GPU-accelerated Groth16 prover for BLS12-381, connecting NTT, coset NTT, MSM (Pippenger), and elliptic curve arithmetic.
@@ -187,22 +206,12 @@ End-to-end GPU-accelerated Groth16 prover for BLS12-381, connecting NTT, coset N
 - **Fq** (381-bit base field, 12×u32 CIOS Montgomery): add/sub/mul/sqr/inv/neg
 - **Fq2** (quadratic extension, Karatsuba): 3 Fq muls per Fq2 mul
 - **G1/G2** (Jacobian projective): point add, double, scalar_mul, affine conversion, on-curve checks
-- **MSM** (Pippenger): CUB radix sort → bucket accumulation → running sum → Horner combination
+- **MSM** (Pippenger): signed-digit recoding → CUB radix sort → parallel accumulation → parallel reduction → Horner
 - **Polynomial ops**: coset NTT, pointwise mul/sub, scale kernels
 - **Groth16 pipeline**: R1CS×witness → INTT → coset NTT → pointwise → coset INTT → EC assembly
 
 **Toy circuit: x³ + x + 5 = y** (4 R1CS constraints, 6 variables, domain_size=256).
 GPU proof matches CPU proof bitwise (cross-validated).
-
-**MSM benchmark (RTX 3060, 7-rep median):**
-
-| Size | Latency | Throughput |
-|------|---------|------------|
-| 2^10 | 261 ms | 3.9 pts/ms |
-| 2^14 | 2,697 ms | 6.1 pts/ms |
-| 2^18 | 42,603 ms | 6.2 pts/ms |
-
-*Correctness-focused implementation (single-thread bucket reduction). v2.1.0 will add cuZK-style parallel bucket accumulation (>20x target). See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full v2.1.0-v3.0.0 roadmap.*
 
 <p align="center">
   <img src="results/charts/msm_scaling.png" width="48%" alt="MSM scaling">
@@ -228,7 +237,7 @@ cuda-zkp-ntt/
 │   ├── ff_fq2.cuh             # Fq2 quadratic extension (Karatsuba, 3 Fq muls)
 │   ├── ec_g1.cuh              # G1 elliptic curve ops (Jacobian projective)
 │   ├── ec_g2.cuh              # G2 elliptic curve ops (over Fq2)
-│   ├── msm.cuh                # GPU MSM (Pippenger's bucket method, G1)
+│   ├── msm.cuh                # GPU MSM (Pippenger, signed-digit, parallel reduce)
 │   ├── poly_ops.cuh           # Polynomial ops (coset NTT, pointwise mul/sub)
 │   ├── groth16.cuh            # Groth16 prover API (R1CS, ProvingKey, Proof)
 │   ├── ntt.cuh                # BLS12-381 NTT (single + batched + graph, 5 modes)
@@ -253,7 +262,7 @@ cuda-zkp-ntt/
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   ├── test_correctness.cu    # Validation against CPU reference (621 tests)
+│   ├── test_correctness.cu    # Validation against CPU reference (701 tests)
 │   └── ff_reference.h         # CPU-only finite field + NTT + EC reference oracle
 ├── benchmarks/
 │   ├── bench_ntt.cu           # Google Benchmark: BLS12-381 NTT latency vs scale
@@ -366,7 +375,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields; viable only for word-size moduli). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover with GPU proof matching CPU bitwise. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields; viable only for word-size moduli). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover with GPU proof matching CPU bitwise. v2.1.0 delivers production MSM with signed-digit recoding, CUB radix sort, parallel bucket reduction (Hillis-Steele suffix scan), and stream-ordered memory pools — achieving 35.8x speedup at n=2^18. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
 
 ---
 
