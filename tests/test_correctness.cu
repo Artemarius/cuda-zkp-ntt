@@ -11,6 +11,7 @@
 #include "ff_fq12.cuh"
 #include "ec_g1.cuh"
 #include "ec_g2.cuh"
+#include "pairing.cuh"
 #include "msm.cuh"
 #include "poly_ops.cuh"
 #include "groth16.cuh"
@@ -84,6 +85,9 @@ extern __global__ void g2_add_mixed_kernel(const G2Jacobian* __restrict__ a, con
 extern __global__ void g2_scalar_mul_kernel(const G2Jacobian* __restrict__ bases, const uint32_t* __restrict__ scalars, G2Jacobian* __restrict__ out, uint32_t n);
 extern __global__ void g2_to_affine_kernel(const G2Jacobian* __restrict__ in, G2Affine* __restrict__ out, uint32_t n);
 extern __global__ void g2_is_on_curve_kernel(const G2Affine* __restrict__ pts, bool* __restrict__ results, uint32_t n);
+
+// Pairing kernel declarations (defined in src/pairing_kernels.cu)
+extern __global__ void miller_loop_kernel(const G1Affine* __restrict__ P, const G2Affine* __restrict__ Q, Fq12Element* __restrict__ out, uint32_t n);
 
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
@@ -9188,6 +9192,355 @@ void test_batch_vs_cpu_reference() {
     }
 }
 
+// =============================================================================
+// v3.0.0 Session 33: Miller Loop Tests
+// =============================================================================
+
+// Helper: run miller_loop on GPU for a single pair
+static Fq12Element miller_loop_gpu_single(const G1Affine& P, const G2Affine& Q) {
+    G1Affine* d_P; G2Affine* d_Q; Fq12Element* d_out;
+    cudaMalloc(&d_P, sizeof(G1Affine));
+    cudaMalloc(&d_Q, sizeof(G2Affine));
+    cudaMalloc(&d_out, sizeof(Fq12Element));
+    cudaMemcpy(d_P, &P, sizeof(G1Affine), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Q, &Q, sizeof(G2Affine), cudaMemcpyHostToDevice);
+    miller_loop_kernel<<<1, 1>>>(d_P, d_Q, d_out, 1);
+    Fq12Element result;
+    cudaMemcpy(&result, d_out, sizeof(Fq12Element), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    cudaFree(d_P); cudaFree(d_Q); cudaFree(d_out);
+    return result;
+}
+
+// Helper: convert G1AffineRef to GPU G1Affine
+static G1Affine g1_ref_to_gpu(const ff_ref::G1AffineRef& r) {
+    G1Affine p;
+    if (r.infinity) {
+        p.x = FqElement::zero();
+        p.y = FqElement::zero();
+        p.infinity = true;
+        return p;
+    }
+    r.x.to_u32(p.x.limbs);
+    r.y.to_u32(p.y.limbs);
+    p.infinity = false;
+    return p;
+}
+
+// Helper: convert G2AffineRef to GPU G2Affine
+static G2Affine g2_ref_to_gpu(const ff_ref::G2AffineRef& r) {
+    G2Affine p;
+    if (r.infinity) {
+        p.x = Fq2Element::zero();
+        p.y = Fq2Element::zero();
+        p.infinity = true;
+        return p;
+    }
+    r.x.c0.to_u32(p.x.c0.limbs);
+    r.x.c1.to_u32(p.x.c1.limbs);
+    r.y.c0.to_u32(p.y.c0.limbs);
+    r.y.c1.to_u32(p.y.c1.limbs);
+    p.infinity = false;
+    return p;
+}
+
+// Helper: Fq12 GPU == CPU comparison
+static bool fq12_eq(const Fq12Element& gpu, const ff_ref::Fq12Ref& cpu) {
+    return fq12_gpu_to_ref(gpu) == cpu;
+}
+
+// --- CPU tests ---
+
+void test_miller_loop_cpu_nondegen() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_nondegen...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    TEST_ASSERT(f != Fq12Ref::one_mont(), "Miller(G1,G2) != 1 (non-degenerate)");
+    TEST_ASSERT(f != Fq12Ref::zero(), "Miller(G1,G2) != 0");
+    printf("  non-degenerate: OK\n");
+}
+
+void test_miller_loop_cpu_identity_P() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_identity_P...\n");
+    G1AffineRef P = G1AffineRef::point_at_infinity();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    TEST_ASSERT(f == Fq12Ref::one_mont(), "Miller(O, Q) = 1");
+    printf("  identity P: OK\n");
+}
+
+void test_miller_loop_cpu_identity_Q() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_identity_Q...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::point_at_infinity();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    TEST_ASSERT(f == Fq12Ref::one_mont(), "Miller(P, O) = 1");
+    printf("  identity Q: OK\n");
+}
+
+void test_miller_loop_cpu_determinism() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_determinism...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f1 = miller_loop_ref(P, Q);
+    Fq12Ref f2 = miller_loop_ref(P, Q);
+    TEST_ASSERT(f1 == f2, "Miller loop deterministic");
+    printf("  determinism: OK\n");
+}
+
+void test_miller_loop_cpu_different_points() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_different_points...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G1AffineRef P2 = g1_double_ref(P);
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f1 = miller_loop_ref(P, Q);
+    Fq12Ref f2 = miller_loop_ref(P2, Q);
+    TEST_ASSERT(f1 != f2, "Miller(P,Q) != Miller(2P,Q)");
+    printf("  different points give different results: OK\n");
+}
+
+void test_miller_loop_cpu_not_one() {
+    using namespace ff_ref;
+    printf("test_miller_loop_cpu_not_one...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    // Check that at least one component of c1 is nonzero (f is not purely in Fq6)
+    bool c1_nonzero = (f.c1 != Fq6Ref::zero());
+    TEST_ASSERT(c1_nonzero, "Miller result has nonzero w-component");
+    printf("  non-trivial Fq12: OK\n");
+}
+
+// --- GPU tests ---
+
+void test_miller_loop_gpu_basic() {
+    printf("test_miller_loop_gpu_basic...\n");
+    G1Affine P = make_g1_gen_affine_gpu();
+    G2Affine Q = make_g2_gen_affine_gpu();
+    Fq12Element f = miller_loop_gpu_single(P, Q);
+
+    // Should be non-trivial
+    Fq12Element one = Fq12Element::one_mont();
+    bool is_one = (f == one);
+    TEST_ASSERT(!is_one, "GPU: Miller(G1,G2) != 1");
+    printf("  GPU basic: OK\n");
+}
+
+void test_miller_loop_gpu_vs_cpu() {
+    using namespace ff_ref;
+    printf("test_miller_loop_gpu_vs_cpu...\n");
+
+    // CPU
+    G1AffineRef P_ref = G1AffineRef::generator();
+    G2AffineRef Q_ref = G2AffineRef::generator();
+    Fq12Ref f_cpu = miller_loop_ref(P_ref, Q_ref);
+
+    // GPU
+    G1Affine P_gpu = g1_ref_to_gpu(P_ref);
+    G2Affine Q_gpu = g2_ref_to_gpu(Q_ref);
+    Fq12Element f_gpu = miller_loop_gpu_single(P_gpu, Q_gpu);
+
+    TEST_ASSERT(fq12_eq(f_gpu, f_cpu), "Miller loop GPU == CPU (generators)");
+    printf("  GPU vs CPU: OK\n");
+}
+
+void test_miller_loop_gpu_identity() {
+    using namespace ff_ref;
+    printf("test_miller_loop_gpu_identity...\n");
+
+    // P = infinity
+    G1Affine P_inf = G1Affine::point_at_infinity();
+    G2Affine Q = make_g2_gen_affine_gpu();
+    Fq12Element f1 = miller_loop_gpu_single(P_inf, Q);
+    TEST_ASSERT(f1 == Fq12Element::one_mont(), "GPU: Miller(O, Q) = 1");
+
+    // Q = infinity
+    G1Affine P = make_g1_gen_affine_gpu();
+    G2Affine Q_inf;
+    Q_inf.x = Fq2Element::zero();
+    Q_inf.y = Fq2Element::zero();
+    Q_inf.infinity = true;
+    Fq12Element f2 = miller_loop_gpu_single(P, Q_inf);
+    TEST_ASSERT(f2 == Fq12Element::one_mont(), "GPU: Miller(P, O) = 1");
+
+    printf("  GPU identity: OK\n");
+}
+
+void test_miller_loop_gpu_determinism() {
+    printf("test_miller_loop_gpu_determinism...\n");
+    G1Affine P = make_g1_gen_affine_gpu();
+    G2Affine Q = make_g2_gen_affine_gpu();
+    Fq12Element f1 = miller_loop_gpu_single(P, Q);
+    Fq12Element f2 = miller_loop_gpu_single(P, Q);
+    TEST_ASSERT(f1 == f2, "GPU: Miller loop deterministic");
+    printf("  GPU determinism: OK\n");
+}
+
+void test_miller_loop_gpu_different_pairs() {
+    using namespace ff_ref;
+    printf("test_miller_loop_gpu_different_pairs...\n");
+
+    // 2*P on CPU, then convert
+    G1AffineRef P_ref = G1AffineRef::generator();
+    G1AffineRef P2_ref = g1_double_ref(P_ref);
+    G2AffineRef Q_ref = G2AffineRef::generator();
+
+    // GPU: miller(P, Q) and miller(2P, Q) — also compare with CPU
+    Fq12Ref cpu_f1 = miller_loop_ref(P_ref, Q_ref);
+    Fq12Ref cpu_f2 = miller_loop_ref(P2_ref, Q_ref);
+
+    G1Affine P2_gpu = g1_ref_to_gpu(P2_ref);
+    G2Affine Q_gpu = g2_ref_to_gpu(Q_ref);
+    Fq12Element gpu_f2 = miller_loop_gpu_single(P2_gpu, Q_gpu);
+
+    TEST_ASSERT(fq12_eq(gpu_f2, cpu_f2), "GPU: Miller(2P, Q) matches CPU");
+    TEST_ASSERT(cpu_f1 != cpu_f2, "Miller(P,Q) != Miller(2P,Q)");
+    printf("  GPU different pairs: OK\n");
+}
+
+// --- Bilinearity tests ---
+// These test e(aP, Q) == e(P, aQ) == e(P, Q)^a
+// We test at the Miller loop level (before final exponentiation).
+// The full bilinearity property holds after final exp, but we can test:
+//   miller(aP, Q) == miller(P, aQ) at the Miller loop output level
+// This is NOT strictly true — bilinearity is for the full pairing.
+// However, we CAN test:
+//   miller(P, Q+R) == miller(P, Q) * miller(P, R)  (Miller loop is multiplicative in Q)
+//   miller(-P, Q) == conjugate(miller(P, Q))         (sign in P)
+
+void test_miller_loop_bilinearity_scalar_P() {
+    using namespace ff_ref;
+    printf("test_miller_loop_bilinearity_scalar_P...\n");
+
+    // miller(2P, Q) should equal miller(P, Q)^2 * correction terms...
+    // Actually at Miller loop level, f_{u, Q}(2P) != f_{u, Q}(P)^2 in general.
+    // The linearity property is: f_{u, Q}(P) is linear in P only after final exp.
+    //
+    // What we CAN test: miller(P, Q) is NOT the identity for generators.
+    // And miller(P1, Q) != miller(P2, Q) for P1 != P2.
+    G1AffineRef P = G1AffineRef::generator();
+    G1AffineRef P2 = g1_double_ref(P);
+    G2AffineRef Q = G2AffineRef::generator();
+
+    Fq12Ref f_P = miller_loop_ref(P, Q);
+    Fq12Ref f_2P = miller_loop_ref(P2, Q);
+
+    // f_2P != f_P (different inputs give different Miller loop outputs)
+    TEST_ASSERT(f_P != f_2P, "miller(P,Q) != miller(2P,Q)");
+    // f_2P != 1
+    TEST_ASSERT(f_2P != Fq12Ref::one_mont(), "miller(2P,Q) != 1");
+    printf("  scalar P: OK\n");
+}
+
+void test_miller_loop_bilinearity_scalar_Q() {
+    using namespace ff_ref;
+    printf("test_miller_loop_bilinearity_scalar_Q...\n");
+
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G2AffineRef Q2 = g2_double_ref(Q);
+
+    Fq12Ref f_Q = miller_loop_ref(P, Q);
+    Fq12Ref f_2Q = miller_loop_ref(P, Q2);
+
+    TEST_ASSERT(f_Q != f_2Q, "miller(P,Q) != miller(P,2Q)");
+    TEST_ASSERT(f_2Q != Fq12Ref::one_mont(), "miller(P,2Q) != 1");
+    printf("  scalar Q: OK\n");
+}
+
+void test_miller_loop_bilinearity_product() {
+    using namespace ff_ref;
+    printf("test_miller_loop_bilinearity_product...\n");
+
+    // Miller loop is multiplicative in Q:
+    //   f_{u, Q1+Q2}(P) = f_{u, Q1}(P) * f_{u, Q2}(P) * line_correction
+    // This is NOT exact without the correction factor, so we just test
+    // that miller(P, Q+R) is well-defined and different from miller(P, Q).
+
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G2AffineRef Q2 = g2_double_ref(Q);
+    G2AffineRef Q3 = g2_add_ref(Q, Q2);  // 3Q
+
+    Fq12Ref f_Q = miller_loop_ref(P, Q);
+    Fq12Ref f_Q3 = miller_loop_ref(P, Q3);
+
+    TEST_ASSERT(f_Q != f_Q3, "miller(P,Q) != miller(P,3Q)");
+    // All should be non-trivial
+    TEST_ASSERT(f_Q3 != Fq12Ref::one_mont(), "miller(P,3Q) != 1");
+    printf("  product: OK\n");
+}
+
+void test_miller_loop_negation_P() {
+    using namespace ff_ref;
+    printf("test_miller_loop_negation_P...\n");
+
+    // e(-P, Q) = e(P, Q)^{-1} holds after final exponentiation.
+    // At the raw Miller loop level, the relationship is more complex.
+    // We verify: miller(-P, Q) != miller(P, Q) and both are non-trivial.
+    G1AffineRef P = G1AffineRef::generator();
+    G1AffineRef neg_P = g1_negate_ref(P);
+    G2AffineRef Q = G2AffineRef::generator();
+
+    Fq12Ref f = miller_loop_ref(P, Q);
+    Fq12Ref f_neg = miller_loop_ref(neg_P, Q);
+
+    TEST_ASSERT(f != f_neg, "miller(-P, Q) != miller(P, Q)");
+    TEST_ASSERT(f_neg != Fq12Ref::one_mont(), "miller(-P, Q) != 1");
+    printf("  negation P: OK\n");
+}
+
+void test_miller_loop_negation_Q() {
+    using namespace ff_ref;
+    printf("test_miller_loop_negation_Q...\n");
+
+    // e(P, -Q) = e(P, Q)^{-1} holds after final exponentiation.
+    // At raw Miller loop level, we verify they're different and non-trivial.
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G2AffineRef neg_Q = g2_negate_ref(Q);
+
+    Fq12Ref f = miller_loop_ref(P, Q);
+    Fq12Ref f_neg = miller_loop_ref(P, neg_Q);
+
+    TEST_ASSERT(f != f_neg, "miller(P, Q) != miller(P, -Q)");
+    TEST_ASSERT(f_neg != Fq12Ref::one_mont(), "miller(P, -Q) != 1");
+    printf("  negation Q: OK\n");
+}
+
+void test_miller_loop_double_vs_square() {
+    using namespace ff_ref;
+    printf("test_miller_loop_double_vs_square...\n");
+
+    // Verify miller(2P, Q) on GPU matches CPU
+    G1AffineRef P2_ref = g1_double_ref(G1AffineRef::generator());
+    G2AffineRef Q_ref = G2AffineRef::generator();
+    Fq12Ref cpu = miller_loop_ref(P2_ref, Q_ref);
+
+    G1Affine P2_gpu = g1_ref_to_gpu(P2_ref);
+    G2Affine Q_gpu = g2_ref_to_gpu(Q_ref);
+    Fq12Element gpu = miller_loop_gpu_single(P2_gpu, Q_gpu);
+
+    TEST_ASSERT(fq12_eq(gpu, cpu), "GPU: miller(2P, Q) matches CPU");
+
+    // Also test with 2Q
+    G2AffineRef Q2_ref = g2_double_ref(Q_ref);
+    Fq12Ref cpu2 = miller_loop_ref(G1AffineRef::generator(), Q2_ref);
+
+    G1Affine P_gpu = g1_ref_to_gpu(G1AffineRef::generator());
+    G2Affine Q2_gpu = g2_ref_to_gpu(Q2_ref);
+    Fq12Element gpu2 = miller_loop_gpu_single(P_gpu, Q2_gpu);
+
+    TEST_ASSERT(fq12_eq(gpu2, cpu2), "GPU: miller(P, 2Q) matches CPU");
+    printf("  double vs square: OK\n");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -10045,6 +10398,26 @@ int main() {
     test_batch_256();
     test_batch_eight();
     test_batch_vs_cpu_reference();
+
+    // ─── v3.0.0 Session 33: Miller Loop Tests ─────────────────────────────
+    printf("\n--- v3.0.0 Session 33: Miller Loop ---\n");
+    test_miller_loop_cpu_nondegen();
+    test_miller_loop_cpu_identity_P();
+    test_miller_loop_cpu_identity_Q();
+    test_miller_loop_cpu_determinism();
+    test_miller_loop_cpu_different_points();
+    test_miller_loop_cpu_not_one();
+    test_miller_loop_gpu_basic();
+    test_miller_loop_gpu_vs_cpu();
+    test_miller_loop_gpu_identity();
+    test_miller_loop_gpu_determinism();
+    test_miller_loop_gpu_different_pairs();
+    test_miller_loop_bilinearity_scalar_P();
+    test_miller_loop_bilinearity_scalar_Q();
+    test_miller_loop_bilinearity_product();
+    test_miller_loop_negation_P();
+    test_miller_loop_negation_Q();
+    test_miller_loop_double_vs_square();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

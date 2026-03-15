@@ -6,11 +6,13 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
-- **v3.0.0** (in progress, S32): Pairing verification — Fq6 cubic extension over Fq2
+- **v3.0.0** (in progress, S33): Pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
   Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
   complex-method sqr, inverse via norm, conjugate, sparse mul_by_034 for Miller loop,
-  Frobenius map with γ_w[k] coefficients). 937 tests.
+  Frobenius map with γ_w[k] coefficients); Miller loop (optimal Ate, |u|=0xd201000000010000,
+  63 iterations, affine G2 line functions, D-type twist → sparse Fq12 via mul_by_034,
+  GPU kernel with __noinline__ wrappers for cicc crash workaround). 963 tests.
 - **v2.2.0**: Fibonacci circuit + batch pipeline — sparse R1CS (COO format),
   Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly, 2-stream batch
   pipeline with pre-allocated device memory. GPU wins 55-139x over CPU at n=256-1024.
@@ -144,6 +146,18 @@ CMake targets:
     Batch reference: `groth16_prove_batch_sequential_sparse()` (loop baseline).
     Measured speedup: 1.03x at nc=256, 1.02x at nc=1024 (cooperative NTT blocks all SMs,
     MSM internal sync prevents CPU-GPU overlap — true overlap needs async MSM)
+- BLS12-381 optimal Ate pairing — Miller loop: `include/pairing.cuh`, `src/pairing_kernels.cu`
+  - Parameter: u = -0xd201000000010000 (64-bit, Hamming weight 5)
+  - 63 Miller loop iterations (bit 62 down to 0), plus sign correction (conjugate for u<0)
+  - Affine G2 coordinates for running point T (requires Fq2 inversion per step)
+  - D-type sextic twist: line evaluations produce sparse Fq12 at positions (0, 3, 4)
+  - Doubling step: c0=2·yt·yP, c3=-3·xt²·xP, c4=3·xt³-2·yt² → fq12_mul_by_034
+  - Addition step: c0=(xq-xt)·yP, c3=-(yq-yt)·xP, c4=yq·xt-yt·xq → fq12_mul_by_034
+  - GPU: __noinline__ wrappers for fq12_sqr, fq12_mul_by_034, fq2_inv, fq_inv
+    (prevents nvcc cicc ACCESS_VIOLATION from explosive IR inlining in 63-iteration loop)
+  - Device functions in .cu file (not header) to avoid duplicate symbol linker errors
+  - pairing_lib compiled without RDC (separate TU, like msm_lib)
+  - CPU reference: `miller_loop_ref()` in `tests/ff_reference.h`
 
 ### NTT
 - BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -183,6 +197,7 @@ include/
   ff_fq12.cuh         — Fq12 quadratic extension (Fq6[w]/(w²−v), Karatsuba 3 Fq6 muls, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034, Frobenius)
   ec_g1.cuh           — G1 elliptic curve ops (Jacobian, affine, scalar_mul)
   ec_g2.cuh           — G2 elliptic curve ops (over Fq2)
+  pairing.cuh         — BLS12-381 pairing types (LineCoeffs, BLS12_381_U_ABS)
   msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
   poly_ops.cuh        — Polynomial ops (coset NTT, pointwise mul/sub, scale)
   groth16.cuh         — Groth16 prover API (R1CS, SparseR1CS, ProvingKey, Proof, Fibonacci)
@@ -201,6 +216,7 @@ src/
   ntt_goldilocks.cu   — Goldilocks NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
   ntt_babybear.cu     — BabyBear NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
   ec_kernels.cu       — G1/G2 GPU test kernels
+  pairing_kernels.cu  — Miller loop GPU kernel + device functions (NO RDC, __noinline__ wrappers)
   msm.cu              — Pippenger MSM (separate TU, no RDC — CUB compatibility)
   poly_ops.cu         — Coset NTT, pointwise mul/sub/scale kernels
   groth16.cu          — Groth16 prover: trusted setup + GPU/CPU proof (dense + sparse/Fibonacci)
@@ -439,14 +455,14 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
 
-Phases 1-8 complete. Current version: **v2.2.0** (Session 30 complete).
+Phases 1-8 complete. Current version: **v3.0.0-dev** (Session 33 complete, 963 tests).
 
 ### In Progress
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
   final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
-  Sessions 31-35. **Sessions 31-32 complete**: Fq6 cubic extension + Fq12 quadratic extension
+  Sessions 31-35. **Sessions 31-33 complete**: Fq6 cubic extension + Fq12 quadratic extension
   (Karatsuba mul, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034,
-  Frobenius map). 937 tests.
+  Frobenius map) + Miller loop (optimal Ate, affine G2, D-type twist line functions). 963 tests.
 
 ### Completed Releases
 - **v2.2.0** — Fibonacci circuit + batch pipeline. Sparse R1CS (COO format), Lagrange basis

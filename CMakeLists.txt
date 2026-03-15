@@ -68,6 +68,16 @@ set_target_properties(msm_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
+# ─── Pairing Library (NO RDC) ────────────────────────────────────────────────
+# Miller loop inlines massive Fq12 operations — compiling with RDC causes
+# nvcc cicc crash. All device functions are __device__ __forceinline__ in headers.
+add_library(pairing_lib STATIC
+    src/pairing_kernels.cu
+)
+set_target_properties(pairing_lib PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
 # ─── Core Library ─────────────────────────────────────────────────────────────
 # Finite-field arithmetic and NTT kernels compiled as a static library
 add_library(zkp_ntt_core STATIC
@@ -87,8 +97,8 @@ add_library(zkp_ntt_core STATIC
 set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
-# Link fused kernel library and MSM library (both compiled without RDC)
-target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib msm_lib)
+# Link fused kernel library, MSM library, and pairing library (all compiled without RDC)
+target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib msm_lib pairing_lib)
 # ntt_naive.cu uses ff_reference.h for CPU-side twiddle computation
 target_include_directories(zkp_ntt_core PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 

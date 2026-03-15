@@ -1,10 +1,11 @@
 # NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v2.2.0)
+## Current State (v3.0.0-dev, Session 33)
 
 **NTT (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
 **MSM (n=2^18):** 1.2s (35.8x vs v2.0.0), 247 pts/ms at n=2^20
+**v3.0.0-dev:** Pairing verification in progress — Fq6, Fq12, Miller loop complete (S31-33). 963 tests.
 **v2.2.0:** Fibonacci circuit + batch pipeline. GPU 55-139x over CPU. 870 tests.
 **v2.1.0:** Production MSM (signed-digit, parallel reduction, memory pools). 701 tests.
 **v2.0.0:** Groth16 GPU primitives (Fq/Fq2, G1/G2, MSM, poly ops, end-to-end prover). 621 tests.

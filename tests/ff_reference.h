@@ -1925,4 +1925,130 @@ inline void pointwise_mul_sub_ref(std::vector<FpRef>& out,
     }
 }
 
+// =============================================================================
+// BLS12-381 Optimal Ate Pairing — Miller Loop (CPU Reference)
+// =============================================================================
+//
+// The optimal Ate pairing for BLS12-381:
+//   e: G1 x G2 -> GT (subgroup of Fq12*)
+//
+// Miller loop parameter: u = -0xd201000000010000 (64-bit, Hamming weight 5)
+// |u| = 0xd201000000010000
+//
+// Uses affine coordinates for the running G2 point T throughout.
+// Requires one Fq2 inversion per step, but correct and simple.
+//
+// For BLS12-381 D-type sextic twist with ξ = (1+u):
+//   ψ(x', y') = (x'·v, y'·v·w) maps E'(Fq2) → E(Fq12)
+//   where v is the Fq6 generator and w is the Fq12 generator.
+//
+// The line evaluation at P∈G1 produces sparse Fq12 at positions (0, 3, 4),
+// matching our fq12_mul_by_034.
+
+struct MillerLineCoeffs {
+    Fq2Ref c0, c3, c4;  // sparse Fq12 coefficients at positions 0, 3, 4
+};
+
+// BLS12-381 Miller loop parameter (absolute value)
+static constexpr uint64_t BLS12_381_U = 0xd201000000010000ULL;
+
+// Scaling Fq2 by an Fq element: (a + bu) * s = (a*s) + (b*s)*u
+inline Fq2Ref fq2_mul_by_fq_ref(const Fq2Ref& a, const FqRef& s) {
+    return {fq_mul_ref(a.c0, s), fq_mul_ref(a.c1, s)};
+}
+
+// Miller loop doubling step (affine T, affine P).
+// T = (xt, yt) on E'(Fq2), P = (xP, yP) on E(Fq)
+// Returns sparse line coefficients (d0, d3, d4), updates T to 2T.
+//
+// Derivation: tangent line at T on untwisted curve evaluated at P:
+//   d0 = 2·yt · yP,  d3 = -3·xt² · xP,  d4 = 3·xt³ - 2·yt²
+inline MillerLineCoeffs miller_double_step_ref(G2AffineRef& T, const G1AffineRef& P) {
+    Fq2Ref xt = T.x, yt = T.y;
+
+    Fq2Ref xt2 = fq2_sqr_ref(xt);
+    Fq2Ref three_xt2 = fq2_add_ref(xt2, fq2_add_ref(xt2, xt2));
+    Fq2Ref two_yt = fq2_add_ref(yt, yt);
+    Fq2Ref lam = fq2_mul_ref(three_xt2, fq2_inv_ref(two_yt));
+
+    // 2T (affine)
+    Fq2Ref xr = fq2_sub_ref(fq2_sqr_ref(lam), fq2_add_ref(xt, xt));
+    Fq2Ref yr = fq2_sub_ref(fq2_mul_ref(lam, fq2_sub_ref(xt, xr)), yt);
+    T.x = xr;
+    T.y = yr;
+
+    // Line coefficients
+    MillerLineCoeffs line;
+    line.c0 = fq2_mul_by_fq_ref(two_yt, P.y);
+    line.c3 = fq2_neg_ref(fq2_mul_by_fq_ref(three_xt2, P.x));
+    Fq2Ref xt3 = fq2_mul_ref(xt2, xt);
+    Fq2Ref three_xt3 = fq2_add_ref(xt3, fq2_add_ref(xt3, xt3));
+    Fq2Ref yt2 = fq2_sqr_ref(yt);
+    Fq2Ref two_yt2 = fq2_add_ref(yt2, yt2);
+    line.c4 = fq2_sub_ref(three_xt3, two_yt2);
+
+    return line;
+}
+
+// Miller loop addition step (affine T + affine Q, affine P).
+// T = (xt, yt), Q = (xq, yq) on E'(Fq2), P on E(Fq).
+// Returns sparse line coefficients, updates T to T+Q.
+//
+// Derivation: chord line through T,Q on untwisted curve evaluated at P:
+//   d0 = (xq-xt)·yP,  d3 = -(yq-yt)·xP,  d4 = (yq-yt)·xt - (xq-xt)·yt
+inline MillerLineCoeffs miller_add_step_ref(G2AffineRef& T, const G2AffineRef& Q,
+                                              const G1AffineRef& P) {
+    Fq2Ref xt = T.x, yt = T.y;
+    Fq2Ref xq = Q.x, yq = Q.y;
+
+    Fq2Ref dy = fq2_sub_ref(yq, yt);
+    Fq2Ref dx = fq2_sub_ref(xq, xt);
+    Fq2Ref lam = fq2_mul_ref(dy, fq2_inv_ref(dx));
+
+    // T + Q (affine)
+    Fq2Ref xr = fq2_sub_ref(fq2_sub_ref(fq2_sqr_ref(lam), xt), xq);
+    Fq2Ref yr = fq2_sub_ref(fq2_mul_ref(lam, fq2_sub_ref(xt, xr)), yt);
+    T.x = xr;
+    T.y = yr;
+
+    // Line coefficients
+    MillerLineCoeffs line;
+    line.c0 = fq2_mul_by_fq_ref(dx, P.y);
+    line.c3 = fq2_neg_ref(fq2_mul_by_fq_ref(dy, P.x));
+    line.c4 = fq2_sub_ref(fq2_mul_ref(dy, xt), fq2_mul_ref(dx, yt));
+
+    return line;
+}
+
+// Miller loop: f_{|u|, Q}(P) with sign correction for negative u.
+// Does NOT include the final exponentiation.
+inline Fq12Ref miller_loop_ref(const G1AffineRef& P, const G2AffineRef& Q) {
+    if (P.infinity || Q.infinity) return Fq12Ref::one_mont();
+
+    Fq12Ref f = Fq12Ref::one_mont();
+    G2AffineRef T = Q;
+
+    // |u| = 0xd201000000010000, MSB is bit 63
+    uint64_t u_abs = BLS12_381_U;
+    int top_bit = 63;
+
+    // Iterate from bit 62 down to 0
+    for (int i = top_bit - 1; i >= 0; --i) {
+        f = fq12_sqr_ref(f);
+
+        MillerLineCoeffs ld = miller_double_step_ref(T, P);
+        f = fq12_mul_by_034_ref(f, ld.c0, ld.c3, ld.c4);
+
+        if ((u_abs >> i) & 1) {
+            MillerLineCoeffs la = miller_add_step_ref(T, Q, P);
+            f = fq12_mul_by_034_ref(f, la.c0, la.c3, la.c4);
+        }
+    }
+
+    // u < 0 for BLS12-381: conjugate f (cheap inversion for unitary elements)
+    f = fq12_conjugate_ref(f);
+
+    return f;
+}
+
 } // namespace ff_ref
