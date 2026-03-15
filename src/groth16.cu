@@ -187,27 +187,23 @@ static Groth16Proof assemble_proof(
     ref_to_scalar(s_rand, sc);
     pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(pi_a, sc));
 
-    // r * B(τ) in G1: we need B(τ) in G1, which requires [v_i(τ)]_1 points.
-    // For simplicity in toy demo, compute r * (Σ w_i * v_i(τ)) * G1 on CPU.
-    // This uses the same v_i(τ) scalars used in the SRS but committed to G1.
-    // In a full implementation, the SRS would include [v_i(τ)]_1 points too.
-    // For the toy demo, we compute the scalar and do one G1 scalar mul.
-    // r * B_scalar * G1 where B_scalar = β + Σ w_i * v_i(τ) + s*δ
-    // Actually, the correct Groth16 formula uses r times the G1 version of π_B.
-    // Since we don't have a G1 version of the v_i(τ) SRS, we'll compute
-    // r * (β + Σ w_i * v_i(τ) + s*δ) as a scalar, then multiply G1.
-
-    // For the toy demo, pre-compute the B scalar on CPU:
+    // r * B_g1: B_scalar = β + Σ w_i * v_i(τ) + s*δ, then r * B_scalar * G1
     // We already have u_tau, v_tau, w_tau from the SRS generation.
     // But those aren't stored in pk. Let's recompute B(τ) from scratch.
     // Actually, the simplest correct approach: compute B(τ) = Σ w_i * v_i(τ)
     // We have v_tau_g2[i] = v_i(τ) * G2. We need v_i(τ) as a scalar.
-    // But we don't store raw scalars in the pk.
-
-    // Simplification: skip the r * B_g1 term for the toy demo.
-    // This means we're computing a "simplified" π_C that's not fully Groth16-correct
-    // but demonstrates all the primitives. The cross-validation still works
-    // since both GPU and CPU use the same formula.
+    if (!pk.v_tau_scalars.empty()) {
+        FpRef b_scalar_val = to_ref_mont(pk.beta_scalar);
+        for (size_t i = 0; i < nv; ++i) {
+            FpRef w_m = to_ref_mont(witness[i]);
+            FpRef v_m = to_ref_mont(pk.v_tau_scalars[i]);
+            b_scalar_val = fp_add(b_scalar_val, fp_mul(w_m, v_m));
+        }
+        b_scalar_val = fp_add(b_scalar_val, fp_mul(s_rand, to_ref_mont(pk.delta_scalar)));
+        FpRef r_b = fp_mul(r_rand, b_scalar_val);
+        ref_to_scalar(r_b, sc);
+        pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(G1AffineRef::generator(), sc));
+    }
 
     // - r*s*[δ]_1
     FpRef rs = fp_mul(r_rand, s_rand);
@@ -224,7 +220,8 @@ static Groth16Proof assemble_proof(
 
 // ─── Trusted Setup ──────────────────────────────────────────────────────────
 
-ProvingKey generate_proving_key(const R1CS& r1cs, uint64_t tau_seed) {
+ProvingKey generate_proving_key(const R1CS& r1cs, uint64_t tau_seed,
+                                VerifyingKey* vk_out) {
     ProvingKey pk;
     size_t n = r1cs.domain_size;
     size_t nv = r1cs.num_variables;
@@ -234,7 +231,9 @@ ProvingKey generate_proving_key(const R1CS& r1cs, uint64_t tau_seed) {
     FpRef alpha = make_ref(tau_seed + 100);
     FpRef beta  = make_ref(tau_seed + 200);
     FpRef delta = make_ref(tau_seed + 300);
+    FpRef gamma = make_ref(tau_seed + 400);
     FpRef delta_inv = fp_inv(delta);
+    FpRef gamma_inv = fp_inv(gamma);
 
     G1AffineRef g1 = G1AffineRef::generator();
     G2AffineRef g2 = G2AffineRef::generator();
@@ -315,6 +314,33 @@ ProvingKey generate_proving_key(const R1CS& r1cs, uint64_t tau_seed) {
         l_val = fp_mul(l_val, delta_inv);
         ref_to_scalar(l_val, sc);
         pk.l_query[i] = ref_to_gpu_g1(g1_scalar_mul_ref(g1, sc));
+    }
+
+    // Store raw scalar values for r*B_g1 term in pi_C
+    pk.v_tau_scalars.resize(nv);
+    for (size_t i = 0; i < nv; ++i)
+        pk.v_tau_scalars[i] = from_ref_mont(v_tau[i]);
+    pk.beta_scalar = from_ref_mont(beta);
+    pk.delta_scalar = from_ref_mont(delta);
+
+    // Generate verifying key if requested
+    if (vk_out) {
+        vk_out->alpha_g1 = pk.alpha_g1;
+        vk_out->beta_g2 = pk.beta_g2;
+        ref_to_scalar(gamma, sc);
+        vk_out->gamma_g2 = ref_to_gpu_g2(g2_scalar_mul_ref(g2, sc));
+        vk_out->delta_g2 = pk.delta_g2;
+        vk_out->public_count = pk.public_count;
+        vk_out->ic.resize(pk.public_count);
+        for (size_t i = 0; i < pk.public_count; ++i) {
+            FpRef ic_val = fp_add(fp_add(
+                fp_mul(beta, u_tau[i]),
+                fp_mul(alpha, v_tau[i])),
+                w_tau[i]);
+            ic_val = fp_mul(ic_val, gamma_inv);
+            ref_to_scalar(ic_val, sc);
+            vk_out->ic[i] = ref_to_gpu_g1(g1_scalar_mul_ref(g1, sc));
+        }
     }
 
     return pk;
@@ -523,7 +549,8 @@ std::vector<FpElement> compute_fibonacci_witness(uint64_t a0, uint64_t a1,
 
 // ─── Sparse Trusted Setup (Lagrange basis) ───────────────────────────────────
 
-ProvingKey generate_proving_key_sparse(const SparseR1CS& r1cs, uint64_t tau_seed) {
+ProvingKey generate_proving_key_sparse(const SparseR1CS& r1cs, uint64_t tau_seed,
+                                       VerifyingKey* vk_out) {
     ProvingKey pk;
     size_t n = r1cs.domain_size;
     size_t nv = r1cs.num_variables;
@@ -533,7 +560,9 @@ ProvingKey generate_proving_key_sparse(const SparseR1CS& r1cs, uint64_t tau_seed
     FpRef alpha = make_ref(tau_seed + 100);
     FpRef beta  = make_ref(tau_seed + 200);
     FpRef delta = make_ref(tau_seed + 300);
+    FpRef gamma = make_ref(tau_seed + 400);
     FpRef delta_inv = fp_inv(delta);
+    FpRef gamma_inv = fp_inv(gamma);
 
     FpRef one_m;
     one_m.limbs = R_MOD;  // Montgomery(1)
@@ -653,6 +682,26 @@ ProvingKey generate_proving_key_sparse(const SparseR1CS& r1cs, uint64_t tau_seed
         l_val = fp_mul(l_val, delta_inv);
         ref_to_scalar(l_val, sc);
         pk.l_query[i] = ref_to_gpu_g1(g1_scalar_mul_ref(g1, sc));
+    }
+
+    // Generate verifying key if requested
+    if (vk_out) {
+        vk_out->alpha_g1 = pk.alpha_g1;
+        vk_out->beta_g2 = pk.beta_g2;
+        ref_to_scalar(gamma, sc);
+        vk_out->gamma_g2 = ref_to_gpu_g2(g2_scalar_mul_ref(g2, sc));
+        vk_out->delta_g2 = pk.delta_g2;
+        vk_out->public_count = pk.public_count;
+        vk_out->ic.resize(pk.public_count);
+        for (size_t i = 0; i < pk.public_count; ++i) {
+            FpRef ic_val = fp_add(fp_add(
+                fp_mul(beta, u_tau[i]),
+                fp_mul(alpha, v_tau[i])),
+                w_tau[i]);
+            ic_val = fp_mul(ic_val, gamma_inv);
+            ref_to_scalar(ic_val, sc);
+            vk_out->ic[i] = ref_to_gpu_g1(g1_scalar_mul_ref(g1, sc));
+        }
     }
 
     return pk;
@@ -851,6 +900,13 @@ Groth16Proof groth16_prove_sparse(const SparseR1CS& r1cs,
     // s * π_A
     ref_to_scalar(s_rand, sc_buf);
     pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(pi_a, sc_buf));
+
+    // r * B_g1
+    {
+        FpRef r_b = fp_mul(r_rand, b_scalar);
+        ref_to_scalar(r_b, sc_buf);
+        pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(G1AffineRef::generator(), sc_buf));
+    }
 
     // - r*s*[δ]_1
     FpRef rs = fp_mul(r_rand, s_rand);
@@ -1059,6 +1115,13 @@ std::vector<Groth16Proof> groth16_prove_batch_sparse(
         ref_to_scalar(s_rand, sc_buf);
         pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(pi_a, sc_buf));
 
+        // r * B_g1
+        {
+            FpRef r_b = fp_mul(r_rand, b_scalar);
+            ref_to_scalar(r_b, sc_buf);
+            pi_c = g1_add_ref(pi_c, g1_scalar_mul_ref(G1AffineRef::generator(), sc_buf));
+        }
+
         FpRef rs = fp_mul(r_rand, s_rand);
         ref_to_scalar(rs, sc_buf);
         G1AffineRef rs_delta = g1_scalar_mul_ref(gpu_to_ref_g1(pk.delta_g1), sc_buf);
@@ -1125,4 +1188,51 @@ Groth16Proof groth16_prove_cpu_sparse(const SparseR1CS& r1cs,
 
     // ── Step 4: CPU proof assembly (sequential scalar muls) ──
     return assemble_proof(pk, witness, h_coeffs, nv, r_seed, s_seed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Groth16 Verification (v3.0.0 Session 35)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Multi-Miller loop verification:
+// Check: e(π_A, π_B) · e(-α, β) · e(-L_pub, γ) · e(-π_C, δ) → final_exp → == 1
+
+bool groth16_verify(const VerifyingKey& vk,
+                    const Groth16Proof& proof,
+                    const std::vector<FpElement>& public_inputs) {
+    // 1. Compute L_pub = Σ pub_i * ic[i]
+    G1AffineRef l_pub = G1AffineRef::point_at_infinity();
+    size_t n_pub = vk.public_count;
+    if (public_inputs.size() < n_pub) n_pub = public_inputs.size();
+
+    for (size_t i = 0; i < n_pub; ++i) {
+        uint32_t sc[8];
+        for (int j = 0; j < 8; ++j) sc[j] = public_inputs[i].limbs[j];
+        G1AffineRef term = g1_scalar_mul_ref(gpu_to_ref_g1(vk.ic[i]), sc);
+        l_pub = g1_add_ref(l_pub, term);
+    }
+
+    // 2. Multi-Miller loop (4 pairings, combined before final exp)
+    G1AffineRef pi_a_ref = gpu_to_ref_g1(proof.pi_a);
+    G2AffineRef pi_b_ref = gpu_to_ref_g2(proof.pi_b);
+
+    G1AffineRef neg_alpha = g1_negate_ref(gpu_to_ref_g1(vk.alpha_g1));
+    G2AffineRef beta_ref = gpu_to_ref_g2(vk.beta_g2);
+
+    G1AffineRef neg_l_pub = g1_negate_ref(l_pub);
+    G2AffineRef gamma_ref = gpu_to_ref_g2(vk.gamma_g2);
+
+    G1AffineRef neg_pi_c = g1_negate_ref(gpu_to_ref_g1(proof.pi_c));
+    G2AffineRef delta_ref = gpu_to_ref_g2(vk.delta_g2);
+
+    Fq12Ref f = miller_loop_ref(pi_a_ref, pi_b_ref);
+    f = fq12_mul_ref(f, miller_loop_ref(neg_alpha, beta_ref));
+    f = fq12_mul_ref(f, miller_loop_ref(neg_l_pub, gamma_ref));
+    f = fq12_mul_ref(f, miller_loop_ref(neg_pi_c, delta_ref));
+
+    // 3. Single final exponentiation
+    Fq12Ref result = final_exponentiation_ref(f);
+
+    // 4. Check result == 1
+    return result == Fq12Ref::one_mont();
 }

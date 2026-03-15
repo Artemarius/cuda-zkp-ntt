@@ -1,11 +1,11 @@
 # NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v3.0.0-dev, Session 34)
+## Current State (v3.0.0, Session 35)
 
 **NTT (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
 **MSM (n=2^18):** 1.2s (35.8x vs v2.0.0), 247 pts/ms at n=2^20
-**v3.0.0-dev:** Pairing verification in progress — Fq6, Fq12, Miller loop, final exponentiation complete (S31-34). 986 tests.
+**v3.0.0:** Full prove→verify loop complete. Pairing + Groth16 verification. 1009 tests.
 **v2.2.0:** Fibonacci circuit + batch pipeline. GPU 55-139x over CPU. 870 tests.
 **v2.1.0:** Production MSM (signed-digit, parallel reduction, memory pools). 701 tests.
 **v2.0.0:** Groth16 GPU primitives (Fq/Fq2, G1/G2, MSM, poly ops, end-to-end prover). 621 tests.
@@ -1843,27 +1843,28 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 - Non-degeneracy: e(G1, G2) ≠ 1
 - GPU vs CPU bitwise match
 
-### Session 35 — Groth16 Verification + Release v3.0.0
+### Session 35 — Groth16 Verification + Release v3.0.0 ✅ COMPLETE
 
 **Objective:** Implement Groth16 verification equation, complete prove→verify loop.
 
 **Deliverables:**
-1. `VerifyingKey` struct: precomputed e(α,β), [γ]_2, [δ]_2, IC points
+1. `VerifyingKey` struct: [α]_1, [β]_2, [γ]_2, [δ]_2, IC points (public input commitments / γ)
 2. `groth16_verify(vk, proof, public_inputs)` → bool
    - Verification: e(π_A, π_B) = e(α,β) · e(L_pub, γ) · e(π_C, δ)
-   - Multi-pairing: product of Miller loops before single final exponentiation
-3. Fix simplified π_C (add r·B_g1 term) for correct verification
-4. End-to-end: prove → verify for toy circuit
-5. Benchmark + analysis + release
+   - Multi-Miller: 4 Miller loops + 1 final exponentiation, check result == 1
+3. Fixed π_C: added r·B_g1 term (B_scalar = β + Σ w_i·v_i(τ) + s·δ) in all prove paths
+4. End-to-end prove→verify for toy circuit (x=3,5,10,100) and Fibonacci (nc=8)
+5. VK generated via optional `vk_out` parameter on setup functions (backward-compatible)
 
-**Tests (~20 new, cumulative ~786):**
-- VK generation: all elements on correct curves
-- Valid proof: verify returns true
+**Tests (23 new, cumulative 1009):**
+- VK generation: all elements on correct curves (toy + sparse)
+- Valid proof: verify returns true (x=3, 5, 10, 100)
 - Corrupted π_A/π_B/π_C: verify returns false
 - Wrong public input: verify returns false
-- Multiple witnesses: x=3, 5, 10, 100
-- GPU vs CPU verify match
-- End-to-end roundtrip: setup → prove → verify
+- Different randomness: still verifies
+- CPU proof verifies (toy + Fibonacci)
+- Fibonacci GPU prove→verify
+- GPU vs CPU proofs both verify
 
 ---
 
@@ -1878,9 +1879,9 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 | 30 | v2.2.0 | 2-stream batch pipeline + release ✅ | 50 | 870 |
 | 31 | v3.0.0 | Fq6 arithmetic ✅ | 31 | 901 |
 | 32 | v3.0.0 | Fq12 arithmetic ✅ | 36 | 937 |
-| 33 | v3.0.0 | Miller loop | ~15 | ~952 |
-| 34 | v3.0.0 | Final exponentiation | ~15 | ~967 |
-| 35 | v3.0.0 | Groth16 verification + release | ~20 | ~987 |
+| 33 | v3.0.0 | Miller loop ✅ | 26 | 963 |
+| 34 | v3.0.0 | Final exponentiation ✅ | 23 | 986 |
+| 35 | v3.0.0 | Groth16 verification + release ✅ | 23 | 1009 |
 
 **Dependencies:**
 - Sessions 26→27→28 (linear, v2.1.0 MSM)
@@ -1893,7 +1894,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 > v2.0.0: "MSM is now the bottleneck (GPU=CPU at n=256, 42s at n=2^18)"
 > v2.1.0: "cuZK-style parallel MSM closes the gap (>20x speedup)"
 > v2.2.0: "Fibonacci shows GPU = 55-141x CPU — GPU wins decisively"
-> v3.0.0: "Full prove→verify loop with pairing verification"
+> v3.0.0: "Full prove→verify loop with pairing verification" ✅
 
 ---
 

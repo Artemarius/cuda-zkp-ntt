@@ -4,9 +4,9 @@
 
 GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
-polynomial operations, and end-to-end Groth16 toy prover.
+polynomial operations, end-to-end Groth16 prover, and pairing-based verification.
 
-- **v3.0.0** (in progress, S34): Pairing verification — Fq6 cubic extension over Fq2
+- **v3.0.0** (S31-S35 complete): Full pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
   Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
   complex-method sqr, inverse via norm, conjugate, sparse mul_by_014 for Miller loop,
@@ -16,7 +16,9 @@ polynomial operations, and end-to-end Groth16 toy prover.
   (Hayashida-Hayasaka-Teruya eprint 2020/875, easy part (q^6-1)(q^2+1) + hard part
   3+(x²+q²-1)(q+x)(x-1)², 4x exp_by_u + 2 Frobenius, FrobeniusCoeffs struct,
   GPU kernel with __noinline__ wrappers); Full pairing kernel e(P,Q) = final_exp(miller(P,Q)),
-  bilinearity verified: e(2P,Q) = e(P,Q)². 986 tests.
+  bilinearity verified: e(2P,Q) = e(P,Q)²; Groth16 verification via multi-Miller loop
+  e(π_A,π_B) = e(α,β)·e(L_pub,γ)·e(π_C,δ) with VerifyingKey (γ, IC points), pi_C fix
+  (r·B_g1 term), end-to-end prove→verify loop for toy circuit + Fibonacci. 1009 tests.
 - **v2.2.0**: Fibonacci circuit + batch pipeline — sparse R1CS (COO format),
   Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly, 2-stream batch
   pipeline with pre-allocated device memory. GPU wins 55-139x over CPU at n=256-1024.
@@ -168,6 +170,15 @@ CMake targets:
   - pairing_lib compiled without RDC (separate TU, like msm_lib)
   - CPU reference: `miller_loop_ref()`, `final_exponentiation_ref()`, `pairing_ref()`
   - Bilinearity verified: e(2P,Q) = e(P,Q)², e(P,2Q) = e(P,Q)², e(2P,Q) = e(P,2Q)
+- Groth16 verification: `groth16_verify()` in `src/groth16.cu`
+  - `VerifyingKey` struct: α_g1, β_g2, γ_g2, δ_g2, IC points (public input commitments / γ)
+  - Verification equation: e(π_A, π_B) = e(α,β) · e(L_pub, γ) · e(π_C, δ)
+  - Multi-Miller loop (4 pairings) + single final exponentiation for efficiency
+  - L_pub = Σ pub_i · IC[i] (MSM over public inputs)
+  - Setup generates VK via optional `vk_out` parameter: `generate_proving_key(r1cs, seed, &vk)`
+  - γ derived from tau_seed + 400, IC[i] = [(β·u_i(τ) + α·v_i(τ) + w_i(τ))/γ]_1
+  - Fixed pi_C: added r·B_g1 term (B_scalar = β + Σ w_i·v_i(τ) + s·δ) for correct Groth16
+  - End-to-end prove→verify for toy circuit (x=3,5,10,100) and Fibonacci (nc=8)
 
 ### NTT
 - BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -210,7 +221,7 @@ include/
   pairing.cuh         — BLS12-381 pairing types (LineCoeffs, FrobeniusCoeffs, BLS12_381_U_ABS)
   msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
   poly_ops.cuh        — Polynomial ops (coset NTT, pointwise mul/sub, scale)
-  groth16.cuh         — Groth16 prover API (R1CS, SparseR1CS, ProvingKey, Proof, Fibonacci)
+  groth16.cuh         — Groth16 prover + verifier API (R1CS, SparseR1CS, ProvingKey, VerifyingKey, Proof, verify)
   pipeline.cuh        — AsyncNTTPipeline class interface
   twiddle_otf.cuh     — On-the-fly twiddle pow functions (OTF — disabled for BLS12-381)
 
@@ -463,20 +474,16 @@ LICENSE                — MIT License
 ## Phase Status
 
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
-See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
+See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v3.0.0 complete).
 
-Phases 1-8 complete. Current version: **v3.0.0-dev** (Session 34 complete, 986 tests).
-
-### In Progress
-- **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
-  final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
-  Sessions 31-35. **Sessions 31-34 complete**: Fq6 cubic extension + Fq12 quadratic extension
-  (Karatsuba mul, complex-method sqr, inverse via norm, conjugate, sparse mul_by_014,
-  Frobenius map) + Miller loop (optimal Ate, affine G2, M-type twist line functions) +
-  Final exponentiation (easy part + hard part via Hayashida et al.) + Full pairing kernel
-  with bilinearity verified. 986 tests.
+Phases 1-8 complete. Current version: **v3.0.0** (Session 35 complete, 1009 tests).
 
 ### Completed Releases
+- **v3.0.0** — Full pairing verification + Groth16 prove→verify loop. Fq6/Fq12 tower
+  arithmetic, Miller loop (optimal Ate), final exponentiation, VerifyingKey with γ and IC
+  points, `groth16_verify()` via multi-Miller loop (4 pairings + 1 final exp), pi_C fix
+  (r·B_g1 term). End-to-end roundtrip: setup→prove→verify for toy circuit and Fibonacci.
+  Sessions 31-35. 1009 tests (139 new over v2.2.0).
 - **v2.2.0** — Fibonacci circuit + batch pipeline. Sparse R1CS (COO format), Lagrange basis
   trusted setup (O(n) batch inversion), GPU MSM proof assembly. 2-stream batch pipeline with
   pre-allocated device memory. GPU wins **55-139x** over CPU at n=256-1024. Batch pipeline

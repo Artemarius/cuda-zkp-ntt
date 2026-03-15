@@ -9924,6 +9924,273 @@ void test_pairing_gpu_determinism() {
     printf("  determinism: OK\n");
 }
 
+// ─── v3.0.0 Session 35: Groth16 Verification Tests ──────────────────────────
+
+static FpElement make_fp_test(uint64_t v) {
+    FpElement e;
+    for (int i = 0; i < 8; ++i) e.limbs[i] = 0;
+    e.limbs[0] = (uint32_t)(v & 0xFFFFFFFF);
+    e.limbs[1] = (uint32_t)(v >> 32);
+    return e;
+}
+
+void test_verify_vk_on_curve() {
+    using namespace ff_ref;
+    printf("test_verify_vk_on_curve...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    generate_proving_key(r1cs, 42, &vk);
+
+    // Check α_g1 on G1
+    G1AffineRef pa = {FqRef::from_u32(vk.alpha_g1.x.limbs),
+                       FqRef::from_u32(vk.alpha_g1.y.limbs), false};
+    TEST_ASSERT(g1_is_on_curve_ref(pa), "VK: alpha_g1 on G1");
+
+    // Check γ_g2 on G2
+    G2AffineRef pg = {
+        {FqRef::from_u32(vk.gamma_g2.x.c0.limbs), FqRef::from_u32(vk.gamma_g2.x.c1.limbs)},
+        {FqRef::from_u32(vk.gamma_g2.y.c0.limbs), FqRef::from_u32(vk.gamma_g2.y.c1.limbs)},
+        false};
+    TEST_ASSERT(g2_is_on_curve_ref(pg), "VK: gamma_g2 on G2");
+
+    // Check δ_g2 on G2
+    G2AffineRef pd = {
+        {FqRef::from_u32(vk.delta_g2.x.c0.limbs), FqRef::from_u32(vk.delta_g2.x.c1.limbs)},
+        {FqRef::from_u32(vk.delta_g2.y.c0.limbs), FqRef::from_u32(vk.delta_g2.y.c1.limbs)},
+        false};
+    TEST_ASSERT(g2_is_on_curve_ref(pd), "VK: delta_g2 on G2");
+
+    // Check IC[0] on G1
+    TEST_ASSERT(vk.ic.size() == 1, "VK: ic has public_count entries");
+    G1AffineRef ic0 = {FqRef::from_u32(vk.ic[0].x.limbs),
+                        FqRef::from_u32(vk.ic[0].y.limbs), false};
+    TEST_ASSERT(g1_is_on_curve_ref(ic0), "VK: ic[0] on G1");
+}
+
+void test_verify_toy_valid() {
+    printf("test_verify_toy_valid...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    // Public inputs: just w[0] = 1
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    bool ok = groth16_verify(vk, proof, pub);
+    TEST_ASSERT(ok, "verify(valid proof, x=3) = true");
+}
+
+void test_verify_toy_corrupt_pi_a() {
+    printf("test_verify_toy_corrupt_pi_a...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    // Corrupt pi_a by flipping a limb
+    proof.pi_a.x.limbs[0] ^= 0x1;
+    // pi_a may not be on curve now — verifier should reject
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    bool ok = groth16_verify(vk, proof, pub);
+    TEST_ASSERT(!ok, "verify(corrupt pi_a) = false");
+}
+
+void test_verify_toy_corrupt_pi_b() {
+    printf("test_verify_toy_corrupt_pi_b...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    proof.pi_b.x.c0.limbs[0] ^= 0x1;
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    bool ok = groth16_verify(vk, proof, pub);
+    TEST_ASSERT(!ok, "verify(corrupt pi_b) = false");
+}
+
+void test_verify_toy_corrupt_pi_c() {
+    printf("test_verify_toy_corrupt_pi_c...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    proof.pi_c.x.limbs[0] ^= 0x1;
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    bool ok = groth16_verify(vk, proof, pub);
+    TEST_ASSERT(!ok, "verify(corrupt pi_c) = false");
+}
+
+void test_verify_toy_wrong_public() {
+    printf("test_verify_toy_wrong_public...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    // Wrong public input (should be 1, give 2)
+    std::vector<FpElement> pub = {make_fp_test(2)};
+    bool ok = groth16_verify(vk, proof, pub);
+    TEST_ASSERT(!ok, "verify(wrong public input) = false");
+}
+
+void test_verify_toy_x5() {
+    printf("test_verify_toy_x5...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(5);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(x=5) = true");
+}
+
+void test_verify_toy_x10() {
+    printf("test_verify_toy_x10...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(10);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(x=10) = true");
+}
+
+void test_verify_toy_x100() {
+    printf("test_verify_toy_x100...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(100);
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 17, 23);
+
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(x=100) = true");
+}
+
+void test_verify_toy_different_randomness() {
+    printf("test_verify_toy_different_randomness...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+
+    // Different r, s — proof should still verify
+    Groth16Proof proof = groth16_prove(r1cs, pk, witness, 31, 37);
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(different r,s) = true");
+}
+
+void test_verify_cpu_proof_toy() {
+    printf("test_verify_cpu_proof_toy...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+
+    // CPU proof should also verify
+    Groth16Proof proof = groth16_prove_cpu(r1cs, pk, witness, 17, 23);
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(CPU proof) = true");
+}
+
+void test_verify_sparse_vk_on_curve() {
+    using namespace ff_ref;
+    printf("test_verify_sparse_vk_on_curve...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    VerifyingKey vk;
+    generate_proving_key_sparse(r1cs, 42, &vk);
+
+    G2AffineRef pg = {
+        {FqRef::from_u32(vk.gamma_g2.x.c0.limbs), FqRef::from_u32(vk.gamma_g2.x.c1.limbs)},
+        {FqRef::from_u32(vk.gamma_g2.y.c0.limbs), FqRef::from_u32(vk.gamma_g2.y.c1.limbs)},
+        false};
+    TEST_ASSERT(g2_is_on_curve_ref(pg), "sparse VK: gamma_g2 on G2");
+    TEST_ASSERT(vk.ic.size() == 1, "sparse VK: ic has 1 entry");
+
+    G1AffineRef ic0 = {FqRef::from_u32(vk.ic[0].x.limbs),
+                        FqRef::from_u32(vk.ic[0].y.limbs), false};
+    TEST_ASSERT(g1_is_on_curve_ref(ic0), "sparse VK: ic[0] on G1");
+}
+
+void test_verify_fibonacci_valid() {
+    printf("test_verify_fibonacci_valid...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42, &vk);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(Fibonacci nc=8) = true");
+}
+
+void test_verify_fibonacci_corrupt() {
+    printf("test_verify_fibonacci_corrupt...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42, &vk);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof proof = groth16_prove_sparse(r1cs, pk, witness, 17, 23);
+    proof.pi_a.x.limbs[0] ^= 0x1;
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(!groth16_verify(vk, proof, pub), "verify(corrupt Fibonacci) = false");
+}
+
+void test_verify_fibonacci_cpu() {
+    printf("test_verify_fibonacci_cpu...\n");
+
+    SparseR1CS r1cs = make_fibonacci_r1cs(8);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key_sparse(r1cs, 42, &vk);
+    auto witness = compute_fibonacci_witness(1, 1, 8);
+
+    Groth16Proof proof = groth16_prove_cpu_sparse(r1cs, pk, witness, 17, 23);
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    TEST_ASSERT(groth16_verify(vk, proof, pub), "verify(Fibonacci CPU proof) = true");
+}
+
+void test_verify_gpu_vs_cpu_both_valid() {
+    printf("test_verify_gpu_vs_cpu_both_valid...\n");
+
+    R1CS r1cs = make_toy_r1cs(256);
+    VerifyingKey vk;
+    ProvingKey pk = generate_proving_key(r1cs, 42, &vk);
+    auto witness = compute_witness(3);
+
+    Groth16Proof gpu_proof = groth16_prove(r1cs, pk, witness, 17, 23);
+    Groth16Proof cpu_proof = groth16_prove_cpu(r1cs, pk, witness, 17, 23);
+
+    std::vector<FpElement> pub = {make_fp_test(1)};
+    bool gpu_ok = groth16_verify(vk, gpu_proof, pub);
+    bool cpu_ok = groth16_verify(vk, cpu_proof, pub);
+    TEST_ASSERT(gpu_ok, "verify(GPU proof) = true");
+    TEST_ASSERT(cpu_ok, "verify(CPU proof) = true");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -10824,6 +11091,24 @@ int main() {
     test_pairing_gpu_identity();
     test_pairing_gpu_negation();
     test_pairing_gpu_determinism();
+
+    // v3.0.0 Session 35: Groth16 Verification
+    test_verify_vk_on_curve();
+    test_verify_toy_valid();
+    test_verify_toy_corrupt_pi_a();
+    test_verify_toy_corrupt_pi_b();
+    test_verify_toy_corrupt_pi_c();
+    test_verify_toy_wrong_public();
+    test_verify_toy_x5();
+    test_verify_toy_x10();
+    test_verify_toy_x100();
+    test_verify_toy_different_randomness();
+    test_verify_cpu_proof_toy();
+    test_verify_sparse_vk_on_curve();
+    test_verify_fibonacci_valid();
+    test_verify_fibonacci_corrupt();
+    test_verify_fibonacci_cpu();
+    test_verify_gpu_vs_cpu_both_valid();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
