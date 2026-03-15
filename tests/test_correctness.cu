@@ -88,6 +88,8 @@ extern __global__ void g2_is_on_curve_kernel(const G2Affine* __restrict__ pts, b
 
 // Pairing kernel declarations (defined in src/pairing_kernels.cu)
 extern __global__ void miller_loop_kernel(const G1Affine* __restrict__ P, const G2Affine* __restrict__ Q, Fq12Element* __restrict__ out, uint32_t n);
+extern __global__ void final_exp_kernel(const Fq12Element* __restrict__ in, Fq12Element* __restrict__ out, const FrobeniusCoeffs* __restrict__ coeffs, uint32_t n);
+extern __global__ void pairing_kernel(const G1Affine* __restrict__ P, const G2Affine* __restrict__ Q, Fq12Element* __restrict__ out, const FrobeniusCoeffs* __restrict__ coeffs, uint32_t n);
 
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
@@ -9541,6 +9543,387 @@ void test_miller_loop_double_vs_square() {
     printf("  double vs square: OK\n");
 }
 
+// =============================================================================
+// v3.0.0 Session 34: Final Exponentiation + Pairing Tests
+// =============================================================================
+
+// Helper: convert Fq2Ref to GPU Fq2Element
+static Fq2Element fq2_ref_to_gpu(const ff_ref::Fq2Ref& r) {
+    Fq2Element e;
+    r.c0.to_u32(e.c0.limbs);
+    r.c1.to_u32(e.c1.limbs);
+    return e;
+}
+
+// Helper: compute FrobeniusCoeffs in GPU format from CPU reference
+static FrobeniusCoeffs compute_frobenius_coeffs_gpu() {
+    using namespace ff_ref;
+    Fq2Ref fq6_c1[6], fq6_c2[6], fq12_w[12];
+    compute_fq6_frobenius_coefficients(fq6_c1, fq6_c2);
+    compute_fq12_frobenius_coefficients(fq12_w);
+
+    FrobeniusCoeffs coeffs;
+    for (int i = 0; i < 6; ++i) {
+        coeffs.fq6_c1[i] = fq2_ref_to_gpu(fq6_c1[i]);
+        coeffs.fq6_c2[i] = fq2_ref_to_gpu(fq6_c2[i]);
+    }
+    for (int i = 0; i < 12; ++i) {
+        coeffs.fq12_w[i] = fq2_ref_to_gpu(fq12_w[i]);
+    }
+    return coeffs;
+}
+
+// Helper: run final_exp_kernel on a single Fq12 element
+static Fq12Element final_exp_gpu_single(const Fq12Element& f, const FrobeniusCoeffs& h_coeffs) {
+    Fq12Element* d_in; Fq12Element* d_out; FrobeniusCoeffs* d_coeffs;
+    cudaMalloc(&d_in, sizeof(Fq12Element));
+    cudaMalloc(&d_out, sizeof(Fq12Element));
+    cudaMalloc(&d_coeffs, sizeof(FrobeniusCoeffs));
+    cudaMemcpy(d_in, &f, sizeof(Fq12Element), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_coeffs, &h_coeffs, sizeof(FrobeniusCoeffs), cudaMemcpyHostToDevice);
+    final_exp_kernel<<<1, 1>>>(d_in, d_out, d_coeffs, 1);
+    Fq12Element result;
+    cudaMemcpy(&result, d_out, sizeof(Fq12Element), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_coeffs);
+    return result;
+}
+
+// Helper: run pairing_kernel on a single (P, Q) pair
+static Fq12Element pairing_gpu_single(const G1Affine& P, const G2Affine& Q,
+                                       const FrobeniusCoeffs& h_coeffs) {
+    G1Affine* d_P; G2Affine* d_Q; Fq12Element* d_out; FrobeniusCoeffs* d_coeffs;
+    cudaMalloc(&d_P, sizeof(G1Affine));
+    cudaMalloc(&d_Q, sizeof(G2Affine));
+    cudaMalloc(&d_out, sizeof(Fq12Element));
+    cudaMalloc(&d_coeffs, sizeof(FrobeniusCoeffs));
+    cudaMemcpy(d_P, &P, sizeof(G1Affine), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Q, &Q, sizeof(G2Affine), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_coeffs, &h_coeffs, sizeof(FrobeniusCoeffs), cudaMemcpyHostToDevice);
+    pairing_kernel<<<1, 1>>>(d_P, d_Q, d_out, d_coeffs, 1);
+    Fq12Element result;
+    cudaMemcpy(&result, d_out, sizeof(Fq12Element), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    cudaFree(d_P); cudaFree(d_Q); cudaFree(d_out); cudaFree(d_coeffs);
+    return result;
+}
+
+// --- CPU tests ---
+
+void test_exp_by_u_cpu_identity() {
+    using namespace ff_ref;
+    printf("test_exp_by_u_cpu_identity...\n");
+    Fq12Ref one = Fq12Ref::one_mont();
+    Fq12Ref result = exp_by_u_ref(one);
+    TEST_ASSERT(result == one, "exp_by_u(1) = 1");
+    printf("  identity: OK\n");
+}
+
+void test_exp_by_u_cpu_nondegen() {
+    using namespace ff_ref;
+    printf("test_exp_by_u_cpu_nondegen...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    Fq12Ref result = exp_by_u_ref(f);
+    TEST_ASSERT(result != Fq12Ref::one_mont(), "exp_by_u(miller(G1,G2)) != 1");
+    TEST_ASSERT(result != f, "exp_by_u(f) != f");
+    printf("  non-degenerate: OK\n");
+}
+
+void test_final_exp_cpu_nondegen() {
+    using namespace ff_ref;
+    printf("test_final_exp_cpu_nondegen...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    Fq12Ref result = final_exponentiation_ref(f);
+    TEST_ASSERT(result != Fq12Ref::one_mont(), "final_exp(miller(G1,G2)) != 1");
+    TEST_ASSERT(result != Fq12Ref::zero(), "final_exp(miller(G1,G2)) != 0");
+    printf("  non-degenerate: OK\n");
+}
+
+void test_final_exp_cpu_identity() {
+    using namespace ff_ref;
+    printf("test_final_exp_cpu_identity...\n");
+    Fq12Ref one = Fq12Ref::one_mont();
+    Fq12Ref result = final_exponentiation_ref(one);
+    TEST_ASSERT(result == one, "final_exp(1) = 1");
+    printf("  identity: OK\n");
+}
+
+void test_final_exp_cpu_determinism() {
+    using namespace ff_ref;
+    printf("test_final_exp_cpu_determinism...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f = miller_loop_ref(P, Q);
+    Fq12Ref r1 = final_exponentiation_ref(f);
+    Fq12Ref r2 = final_exponentiation_ref(f);
+    TEST_ASSERT(r1 == r2, "final_exp deterministic");
+    printf("  determinism: OK\n");
+}
+
+void test_pairing_cpu_bilinearity_double_P() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_bilinearity_double_P...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G1AffineRef P2 = g1_double_ref(P);
+
+    Fq12Ref e_PQ = pairing_ref(P, Q);
+    Fq12Ref e_2PQ = pairing_ref(P2, Q);
+    Fq12Ref e_PQ_sq = fq12_sqr_ref(e_PQ);
+
+    // e(2P, Q) = e(P, Q)^2 (bilinearity in first argument)
+    TEST_ASSERT(e_2PQ == e_PQ_sq, "e(2P, Q) = e(P, Q)^2");
+    printf("  bilinearity 2P: OK\n");
+}
+
+void test_pairing_cpu_bilinearity_double_Q() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_bilinearity_double_Q...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G2AffineRef Q2 = g2_double_ref(Q);
+
+    Fq12Ref e_PQ = pairing_ref(P, Q);
+    Fq12Ref e_PQ2 = pairing_ref(P, Q2);
+    Fq12Ref e_PQ_sq = fq12_sqr_ref(e_PQ);
+
+    // e(P, 2Q) = e(P, Q)^2 (bilinearity in second argument)
+    TEST_ASSERT(e_PQ2 == e_PQ_sq, "e(P, 2Q) = e(P, Q)^2");
+    printf("  bilinearity 2Q: OK\n");
+}
+
+void test_pairing_cpu_bilinearity_equal() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_bilinearity_equal...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G1AffineRef P2 = g1_double_ref(P);
+    G2AffineRef Q2 = g2_double_ref(Q);
+
+    Fq12Ref e_2PQ = pairing_ref(P2, Q);
+    Fq12Ref e_PQ2 = pairing_ref(P, Q2);
+
+    // e(2P, Q) = e(P, 2Q) (both equal e(P, Q)^2)
+    TEST_ASSERT(e_2PQ == e_PQ2, "e(2P, Q) = e(P, 2Q)");
+    printf("  bilinearity equal: OK\n");
+}
+
+void test_pairing_cpu_identity_P() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_identity_P...\n");
+    G1AffineRef O = G1AffineRef::point_at_infinity();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref result = pairing_ref(O, Q);
+    TEST_ASSERT(result == Fq12Ref::one_mont(), "e(O, Q) = 1");
+    printf("  identity P: OK\n");
+}
+
+void test_pairing_cpu_identity_Q() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_identity_Q...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef O = G2AffineRef::point_at_infinity();
+    Fq12Ref result = pairing_ref(P, O);
+    TEST_ASSERT(result == Fq12Ref::one_mont(), "e(P, O) = 1");
+    printf("  identity Q: OK\n");
+}
+
+void test_pairing_cpu_negation_P() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_negation_P...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G1AffineRef negP = g1_negate_ref(P);
+    G2AffineRef Q = G2AffineRef::generator();
+
+    Fq12Ref e_PQ = pairing_ref(P, Q);
+    Fq12Ref e_nPQ = pairing_ref(negP, Q);
+    Fq12Ref product = fq12_mul_ref(e_PQ, e_nPQ);
+
+    // e(P, Q) * e(-P, Q) = e(P-P, Q) = e(O, Q) = 1
+    TEST_ASSERT(product == Fq12Ref::one_mont(), "e(P,Q) * e(-P,Q) = 1");
+    printf("  negation P: OK\n");
+}
+
+void test_pairing_cpu_negation_Q() {
+    using namespace ff_ref;
+    printf("test_pairing_cpu_negation_Q...\n");
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    G2AffineRef negQ = g2_negate_ref(Q);
+
+    Fq12Ref e_PQ = pairing_ref(P, Q);
+    Fq12Ref e_PnQ = pairing_ref(P, negQ);
+    Fq12Ref product = fq12_mul_ref(e_PQ, e_PnQ);
+
+    // e(P, Q) * e(P, -Q) = e(P, Q-Q) = e(P, O) = 1
+    TEST_ASSERT(product == Fq12Ref::one_mont(), "e(P,Q) * e(P,-Q) = 1");
+    printf("  negation Q: OK\n");
+}
+
+// --- GPU tests ---
+
+void test_final_exp_gpu_basic() {
+    printf("test_final_exp_gpu_basic...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    // Compute Miller loop output on CPU, feed to GPU final_exp
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f_ref = miller_loop_ref(P, Q);
+    Fq12Element f_gpu = fq12_ref_to_gpu(f_ref);
+
+    Fq12Element result = final_exp_gpu_single(f_gpu, h_coeffs);
+
+    // Check non-trivial
+    TEST_ASSERT(result != Fq12Element::one_mont(), "GPU final_exp != 1");
+    printf("  basic: OK\n");
+}
+
+void test_final_exp_gpu_vs_cpu() {
+    printf("test_final_exp_gpu_vs_cpu...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    G1AffineRef P = G1AffineRef::generator();
+    G2AffineRef Q = G2AffineRef::generator();
+    Fq12Ref f_ref = miller_loop_ref(P, Q);
+
+    // CPU final exp
+    Fq12Ref cpu_result = final_exponentiation_ref(f_ref);
+
+    // GPU final exp
+    Fq12Element f_gpu = fq12_ref_to_gpu(f_ref);
+    Fq12Element gpu_result = final_exp_gpu_single(f_gpu, h_coeffs);
+
+    TEST_ASSERT(fq12_eq(gpu_result, cpu_result), "GPU final_exp matches CPU");
+    printf("  GPU vs CPU: OK\n");
+}
+
+void test_pairing_gpu_basic() {
+    printf("test_pairing_gpu_basic...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    G1Affine P = g1_ref_to_gpu(G1AffineRef::generator());
+    G2Affine Q = g2_ref_to_gpu(G2AffineRef::generator());
+
+    Fq12Element result = pairing_gpu_single(P, Q, h_coeffs);
+    TEST_ASSERT(result != Fq12Element::one_mont(), "GPU pairing(G1,G2) != 1");
+    printf("  basic: OK\n");
+}
+
+void test_pairing_gpu_vs_cpu() {
+    printf("test_pairing_gpu_vs_cpu...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+    Fq12Ref cpu = pairing_ref(G1AffineRef::generator(), G2AffineRef::generator());
+
+    G1Affine P = g1_ref_to_gpu(G1AffineRef::generator());
+    G2Affine Q = g2_ref_to_gpu(G2AffineRef::generator());
+    Fq12Element gpu = pairing_gpu_single(P, Q, h_coeffs);
+
+    TEST_ASSERT(fq12_eq(gpu, cpu), "GPU pairing matches CPU");
+    printf("  GPU vs CPU: OK\n");
+}
+
+void test_pairing_gpu_bilinearity() {
+    printf("test_pairing_gpu_bilinearity...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    G1AffineRef P_ref = G1AffineRef::generator();
+    G1AffineRef P2_ref = g1_double_ref(P_ref);
+    G2AffineRef Q_ref = G2AffineRef::generator();
+    G2AffineRef Q2_ref = g2_double_ref(Q_ref);
+
+    G1Affine P2 = g1_ref_to_gpu(P2_ref);
+    G2Affine Q = g2_ref_to_gpu(Q_ref);
+    G1Affine P = g1_ref_to_gpu(P_ref);
+    G2Affine Q2 = g2_ref_to_gpu(Q2_ref);
+
+    Fq12Element e_2PQ = pairing_gpu_single(P2, Q, h_coeffs);
+    Fq12Element e_PQ2 = pairing_gpu_single(P, Q2, h_coeffs);
+
+    // e(2P, Q) = e(P, 2Q)
+    Fq12Ref r1 = fq12_gpu_to_ref(e_2PQ);
+    Fq12Ref r2 = fq12_gpu_to_ref(e_PQ2);
+    TEST_ASSERT(r1 == r2, "GPU: e(2P,Q) = e(P,2Q)");
+    printf("  bilinearity: OK\n");
+}
+
+void test_pairing_gpu_identity() {
+    printf("test_pairing_gpu_identity...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    // e(O, Q) = 1
+    G1Affine O1; O1.x = FqElement::zero(); O1.y = FqElement::zero(); O1.infinity = true;
+    G2Affine Q = g2_ref_to_gpu(G2AffineRef::generator());
+    Fq12Element r1 = pairing_gpu_single(O1, Q, h_coeffs);
+    TEST_ASSERT(r1 == Fq12Element::one_mont(), "GPU: e(O, Q) = 1");
+
+    // e(P, O) = 1
+    G1Affine P = g1_ref_to_gpu(G1AffineRef::generator());
+    G2Affine O2; O2.x = Fq2Element::zero(); O2.y = Fq2Element::zero(); O2.infinity = true;
+    Fq12Element r2 = pairing_gpu_single(P, O2, h_coeffs);
+    TEST_ASSERT(r2 == Fq12Element::one_mont(), "GPU: e(P, O) = 1");
+    printf("  identity: OK\n");
+}
+
+void test_pairing_gpu_negation() {
+    printf("test_pairing_gpu_negation...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    G1AffineRef P_ref = G1AffineRef::generator();
+    G2AffineRef Q_ref = G2AffineRef::generator();
+    G2AffineRef negQ_ref = g2_negate_ref(Q_ref);
+
+    G1Affine P = g1_ref_to_gpu(P_ref);
+    G2Affine Q = g2_ref_to_gpu(Q_ref);
+    G2Affine negQ = g2_ref_to_gpu(negQ_ref);
+
+    Fq12Element e_PQ = pairing_gpu_single(P, Q, h_coeffs);
+    Fq12Element e_PnQ = pairing_gpu_single(P, negQ, h_coeffs);
+
+    // e(P,Q) * e(P,-Q) = 1 — check via CPU Fq12 mul
+    Fq12Ref r1 = fq12_gpu_to_ref(e_PQ);
+    Fq12Ref r2 = fq12_gpu_to_ref(e_PnQ);
+    Fq12Ref product = fq12_mul_ref(r1, r2);
+    TEST_ASSERT(product == Fq12Ref::one_mont(), "GPU: e(P,Q)*e(P,-Q) = 1");
+    printf("  negation: OK\n");
+}
+
+void test_pairing_gpu_determinism() {
+    printf("test_pairing_gpu_determinism...\n");
+    using namespace ff_ref;
+
+    FrobeniusCoeffs h_coeffs = compute_frobenius_coeffs_gpu();
+
+    G1Affine P = g1_ref_to_gpu(G1AffineRef::generator());
+    G2Affine Q = g2_ref_to_gpu(G2AffineRef::generator());
+
+    Fq12Element r1 = pairing_gpu_single(P, Q, h_coeffs);
+    Fq12Element r2 = pairing_gpu_single(P, Q, h_coeffs);
+
+    Fq12Ref ref1 = fq12_gpu_to_ref(r1);
+    Fq12Ref ref2 = fq12_gpu_to_ref(r2);
+    TEST_ASSERT(ref1 == ref2, "GPU pairing deterministic");
+    printf("  determinism: OK\n");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -10418,6 +10801,29 @@ int main() {
     test_miller_loop_negation_P();
     test_miller_loop_negation_Q();
     test_miller_loop_double_vs_square();
+
+    // ─── v3.0.0 Session 34: Final Exponentiation + Pairing Tests ──────────
+    printf("\n--- v3.0.0 Session 34: Final Exponentiation + Pairing ---\n");
+    test_exp_by_u_cpu_identity();
+    test_exp_by_u_cpu_nondegen();
+    test_final_exp_cpu_nondegen();
+    test_final_exp_cpu_identity();
+    test_final_exp_cpu_determinism();
+    test_pairing_cpu_bilinearity_double_P();
+    test_pairing_cpu_bilinearity_double_Q();
+    test_pairing_cpu_bilinearity_equal();
+    test_pairing_cpu_identity_P();
+    test_pairing_cpu_identity_Q();
+    test_pairing_cpu_negation_P();
+    test_pairing_cpu_negation_Q();
+    test_final_exp_gpu_basic();
+    test_final_exp_gpu_vs_cpu();
+    test_pairing_gpu_basic();
+    test_pairing_gpu_vs_cpu();
+    test_pairing_gpu_bilinearity();
+    test_pairing_gpu_identity();
+    test_pairing_gpu_negation();
+    test_pairing_gpu_determinism();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

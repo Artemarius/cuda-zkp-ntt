@@ -1,10 +1,10 @@
 // src/pairing_kernels.cu
-// BLS12-381 optimal Ate pairing — Miller loop device functions + test kernel.
+// BLS12-381 optimal Ate pairing — Miller loop + final exponentiation.
 // Compiled WITHOUT RDC (separate TU, no cross-TU device linkage needed).
 //
-// NOTE: fq12_sqr, fq12_mul_by_034, fq2_inv, and fq_inv are wrapped with
-// __noinline__ to prevent cicc crash. The forceinlined Fq12/Fq operations
-// generate too much IR when composed in the 63-iteration Miller loop body.
+// NOTE: Heavy Fq12 operations are wrapped with __noinline__ to prevent cicc
+// crash from explosive IR inlining in the 63-iteration Miller loop and the
+// 4x exp_by_u calls in the final exponentiation hard part.
 
 #include "pairing.cuh"
 
@@ -30,11 +30,27 @@ static Fq12Element fq12_sqr_noinline(const Fq12Element& a) {
 }
 
 __device__ __noinline__
-static Fq12Element fq12_mul_by_034_noinline(const Fq12Element& a,
+static Fq12Element fq12_mul_noinline(const Fq12Element& a, const Fq12Element& b) {
+    return fq12_mul(a, b);
+}
+
+__device__ __noinline__
+static Fq12Element fq12_inv_noinline(const Fq12Element& a) {
+    return fq12_inv(a);
+}
+
+__device__ __noinline__
+static Fq12Element fq12_mul_by_014_noinline(const Fq12Element& a,
                                              const Fq2Element& d0,
-                                             const Fq2Element& d3,
+                                             const Fq2Element& d1,
                                              const Fq2Element& d4) {
-    return fq12_mul_by_034(a, d0, d3, d4);
+    return fq12_mul_by_014(a, d0, d1, d4);
+}
+
+__device__ __noinline__
+static Fq12Element fq12_frobenius_noinline(const Fq12Element& a, int power,
+                                            const FrobeniusCoeffs& coeffs) {
+    return fq12_frobenius_map(a, power, coeffs.fq6_c1, coeffs.fq6_c2, coeffs.fq12_w);
 }
 
 // ─── fq2_mul_by_fq: scale Fq2 element by Fq scalar ────────────────────────
@@ -45,8 +61,10 @@ static Fq2Element fq2_mul_by_fq(const Fq2Element& a, const FqElement& s) {
 }
 
 // ─── Doubling Step (affine T, affine P) ─────────────────────────────────────
-// Line coefficients from tangent at T evaluated at P via D-type twist:
-//   c0 = 2·yt · yP,  c3 = -3·xt² · xP,  c4 = 3·xt³ - 2·yt²
+// M-type twist: E': y² = x³ + 4(1+u).  Line at positions (0, 1, 4).
+// d0 = 3·b'- yt²  where b' = 4(1+u), so 3·b' = 12(1+u)
+// d1 = 3xt² · xP
+// d4 = -2yt · yP
 
 __device__ __noinline__
 static LineCoeffs miller_double_step(G2Affine& T, const G1Affine& P) {
@@ -62,21 +80,28 @@ static LineCoeffs miller_double_step(G2Affine& T, const G1Affine& P) {
     T.x = xr;
     T.y = yr;
 
-    LineCoeffs line;
-    line.c0 = fq2_mul_by_fq(two_yt, P.y);
-    line.c3 = fq2_neg(fq2_mul_by_fq(three_xt2, P.x));
-    Fq2Element xt3 = fq2_mul(xt2, xt);
-    Fq2Element three_xt3 = fq2_add(xt3, fq2_add(xt3, xt3));
+    // 12(1+u) in Montgomery form: {12_mont, 12_mont}
+    FqElement one = FqElement::one_mont();
+    FqElement two = fq_add(one, one);
+    FqElement four = fq_add(two, two);
+    FqElement twelve = fq_add(fq_add(four, four), four);
+    Fq2Element twelve_beta = {twelve, twelve};  // 12·(1+u)
+
     Fq2Element yt2 = fq2_sqr(yt);
-    Fq2Element two_yt2 = fq2_add(yt2, yt2);
-    line.c4 = fq2_sub(three_xt3, two_yt2);
+
+    LineCoeffs line;
+    line.d0 = fq2_sub(twelve_beta, yt2);               // 12(1+u) - yt²
+    line.d1 = fq2_mul_by_fq(three_xt2, P.x);           // 3xt² · xP
+    line.d4 = fq2_neg(fq2_mul_by_fq(two_yt, P.y));     // -2yt · yP
 
     return line;
 }
 
 // ─── Addition Step (affine T + affine Q, affine P) ──────────────────────────
-// Line coefficients from chord through T,Q evaluated at P via D-type twist:
-//   c0 = (xq-xt)·yP,  c3 = -(yq-yt)·xP,  c4 = (yq-yt)·xt - (xq-xt)·yt
+// M-type twist: line at positions (0, 1, 4).
+// d0 = xq·yt - yq·xt
+// d1 = (yq - yt) · xP
+// d4 = (xt - xq) · yP
 
 __device__ __noinline__
 static LineCoeffs miller_add_step(G2Affine& T, const G2Affine& Q, const G1Affine& P) {
@@ -93,9 +118,9 @@ static LineCoeffs miller_add_step(G2Affine& T, const G2Affine& Q, const G1Affine
     T.y = yr;
 
     LineCoeffs line;
-    line.c0 = fq2_mul_by_fq(dx, P.y);
-    line.c3 = fq2_neg(fq2_mul_by_fq(dy, P.x));
-    line.c4 = fq2_sub(fq2_mul(dy, xt), fq2_mul(dx, yt));
+    line.d0 = fq2_sub(fq2_mul(xq, yt), fq2_mul(yq, xt));  // xq·yt - yq·xt
+    line.d1 = fq2_mul_by_fq(dy, P.x);                       // (yq-yt)·xP
+    line.d4 = fq2_mul_by_fq(fq2_sub(xt, xq), P.y);         // (xt-xq)·yP
 
     return line;
 }
@@ -113,16 +138,72 @@ static Fq12Element miller_loop(const G1Affine& P, const G2Affine& Q) {
         f = fq12_sqr_noinline(f);
 
         LineCoeffs ld = miller_double_step(T, P);
-        f = fq12_mul_by_034_noinline(f, ld.c0, ld.c3, ld.c4);
+        f = fq12_mul_by_014_noinline(f, ld.d0, ld.d1, ld.d4);
 
         if ((BLS12_381_U_ABS >> i) & 1) {
             LineCoeffs la = miller_add_step(T, Q, P);
-            f = fq12_mul_by_034_noinline(f, la.c0, la.c3, la.c4);
+            f = fq12_mul_by_014_noinline(f, la.d0, la.d1, la.d4);
         }
     }
 
     f = fq12_conjugate(f);
     return f;
+}
+
+// ─── exp_by_u: f^u via square-and-multiply ──────────────────────────────────
+// u = -0xd201000000010000, |u| has Hamming weight 5.
+// 63 squarings + 4 multiplications, then conjugate (u < 0).
+
+__device__ __noinline__
+static Fq12Element exp_by_u(const Fq12Element& f) {
+    Fq12Element result = f;  // f^1 (bit 63 is MSB)
+    for (int i = 62; i >= 0; --i) {
+        result = fq12_sqr_noinline(result);
+        if ((BLS12_381_U_ABS >> i) & 1) {
+            result = fq12_mul_noinline(result, f);
+        }
+    }
+    return fq12_conjugate(result);  // u < 0
+}
+
+// ─── Final Exponentiation ────────────────────────────────────────────────────
+// Raises Miller loop output f to (q^12 - 1)/r.
+// Easy part: f^((q^6 - 1)(q^2 + 1)) — conjugate, inverse, Frobenius
+// Hard part: Hayashida-Hayasaka-Teruya (eprint 2020/875), gnark decomposition
+//   exponent = 3 + (x²+q²-1)(q+x)(x-1)² where x = u
+
+__device__ __noinline__
+static Fq12Element final_exponentiation(const Fq12Element& f,
+                                         const FrobeniusCoeffs& coeffs) {
+    // ─── Easy part: f^((q^6 - 1)(q^2 + 1)) ─────────────────────────────
+    Fq12Element t0 = fq12_conjugate(f);           // f^(q^6)
+    Fq12Element f_inv = fq12_inv_noinline(f);     // f^(-1)
+    t0 = fq12_mul_noinline(t0, f_inv);            // f^(q^6 - 1)
+
+    Fq12Element t1 = fq12_frobenius_noinline(t0, 2, coeffs);
+    Fq12Element result = fq12_mul_noinline(t1, t0);  // f^((q^6-1)(q^2+1))
+
+    // ─── Hard part ──────────────────────────────────────────────────────
+    t0 = fq12_sqr_noinline(result);               // result²
+    t1 = exp_by_u(result);                         // result^x
+    Fq12Element t2 = fq12_conjugate(result);       // result^(-1)
+    t1 = fq12_mul_noinline(t1, t2);                // result^(x-1)
+    t2 = exp_by_u(t1);                             // result^(x²-x)
+    t1 = fq12_conjugate(t1);                       // result^(1-x)
+    t1 = fq12_mul_noinline(t1, t2);                // result^((x-1)²)
+    t2 = exp_by_u(t1);                             // result^(x(x-1)²)
+    t1 = fq12_frobenius_noinline(t1, 1, coeffs);   // result^(q(x-1)²)
+    t1 = fq12_mul_noinline(t1, t2);                // result^((q+x)(x-1)²)
+    result = fq12_mul_noinline(result, t0);         // result³
+    t0 = exp_by_u(t1);                             // ^(x(q+x)(x-1)²)
+    t2 = exp_by_u(t0);                             // ^(x²(q+x)(x-1)²)
+    t0 = fq12_frobenius_noinline(t1, 2, coeffs);   // ^(q²(q+x)(x-1)²)
+    t1 = fq12_conjugate(t1);                       // ^(-(q+x)(x-1)²)
+    t1 = fq12_mul_noinline(t1, t2);                // ^((x²-1)(q+x)(x-1)²)
+    t1 = fq12_mul_noinline(t1, t0);                // ^((x²+q²-1)(q+x)(x-1)²)
+    result = fq12_mul_noinline(result, t1);         // 3 + (x²+q²-1)(q+x)(x-1)²
+
+    return result;
 }
 
 // ─── Miller Loop Test Kernel ────────────────────────────────────────────────
@@ -133,4 +214,28 @@ __global__ void miller_loop_kernel(const G1Affine* __restrict__ P,
                                     uint32_t n) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) out[idx] = miller_loop(P[idx], Q[idx]);
+}
+
+// ─── Final Exponentiation Kernel ────────────────────────────────────────────
+
+__global__ void final_exp_kernel(const Fq12Element* __restrict__ in,
+                                  Fq12Element* __restrict__ out,
+                                  const FrobeniusCoeffs* __restrict__ coeffs,
+                                  uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = final_exponentiation(in[idx], *coeffs);
+}
+
+// ─── Full Pairing Kernel (Miller Loop + Final Exponentiation) ───────────────
+
+__global__ void pairing_kernel(const G1Affine* __restrict__ P,
+                                const G2Affine* __restrict__ Q,
+                                Fq12Element* __restrict__ out,
+                                const FrobeniusCoeffs* __restrict__ coeffs,
+                                uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        Fq12Element f = miller_loop(P[idx], Q[idx]);
+        out[idx] = final_exponentiation(f, *coeffs);
+    }
 }

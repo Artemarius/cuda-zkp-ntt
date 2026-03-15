@@ -6,13 +6,17 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, and end-to-end Groth16 toy prover.
 
-- **v3.0.0** (in progress, S33): Pairing verification — Fq6 cubic extension over Fq2
+- **v3.0.0** (in progress, S34): Pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
   Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
-  complex-method sqr, inverse via norm, conjugate, sparse mul_by_034 for Miller loop,
+  complex-method sqr, inverse via norm, conjugate, sparse mul_by_014 for Miller loop,
   Frobenius map with γ_w[k] coefficients); Miller loop (optimal Ate, |u|=0xd201000000010000,
-  63 iterations, affine G2 line functions, D-type twist → sparse Fq12 via mul_by_034,
-  GPU kernel with __noinline__ wrappers for cicc crash workaround). 963 tests.
+  63 iterations, affine G2 line functions, M-type twist → sparse Fq12 via mul_by_014,
+  GPU kernel with __noinline__ wrappers for cicc crash workaround); Final exponentiation
+  (Hayashida-Hayasaka-Teruya eprint 2020/875, easy part (q^6-1)(q^2+1) + hard part
+  3+(x²+q²-1)(q+x)(x-1)², 4x exp_by_u + 2 Frobenius, FrobeniusCoeffs struct,
+  GPU kernel with __noinline__ wrappers); Full pairing kernel e(P,Q) = final_exp(miller(P,Q)),
+  bilinearity verified: e(2P,Q) = e(P,Q)². 986 tests.
 - **v2.2.0**: Fibonacci circuit + batch pipeline — sparse R1CS (COO format),
   Lagrange basis trusted setup (batch inversion), GPU MSM proof assembly, 2-stream batch
   pipeline with pre-allocated device memory. GPU wins 55-139x over CPU at n=256-1024.
@@ -115,7 +119,7 @@ CMake targets:
     sparse mul_by_01/mul_by_1 for Miller loop, Frobenius map)
   - Fq12 quadratic extension: `include/ff_fq12.cuh` (Fq12 = Fq6[w]/(w²−v), 576 bytes,
     Karatsuba 3 Fq6 muls per mul = 54 Fq muls, complex-method sqr = 36 Fq muls,
-    inverse via norm to Fq6, conjugate a0−a1·w, sparse mul_by_034 for Miller loop
+    inverse via norm to Fq6, conjugate a0−a1·w, sparse mul_by_014 for Miller loop
     line functions = 13 Fq2 muls, Frobenius map with γ_w[k] = β^((q^k-1)/6) period 12)
 - Elliptic curve G1/G2: `include/ec_g1.cuh`, `include/ec_g2.cuh`
   - Jacobian projective coordinates, affine conversion, on-curve check, scalar_mul
@@ -146,18 +150,24 @@ CMake targets:
     Batch reference: `groth16_prove_batch_sequential_sparse()` (loop baseline).
     Measured speedup: 1.03x at nc=256, 1.02x at nc=1024 (cooperative NTT blocks all SMs,
     MSM internal sync prevents CPU-GPU overlap — true overlap needs async MSM)
-- BLS12-381 optimal Ate pairing — Miller loop: `include/pairing.cuh`, `src/pairing_kernels.cu`
-  - Parameter: u = -0xd201000000010000 (64-bit, Hamming weight 5)
-  - 63 Miller loop iterations (bit 62 down to 0), plus sign correction (conjugate for u<0)
+- BLS12-381 optimal Ate pairing: `include/pairing.cuh`, `src/pairing_kernels.cu`
+  - Parameter: u = -0xd201000000010000 (64-bit, Hamming weight 6)
+  - Miller loop: 63 iterations (bit 62 down to 0), plus sign correction (conjugate for u<0)
   - Affine G2 coordinates for running point T (requires Fq2 inversion per step)
-  - D-type sextic twist: line evaluations produce sparse Fq12 at positions (0, 3, 4)
-  - Doubling step: c0=2·yt·yP, c3=-3·xt²·xP, c4=3·xt³-2·yt² → fq12_mul_by_034
-  - Addition step: c0=(xq-xt)·yP, c3=-(yq-yt)·xP, c4=yq·xt-yt·xq → fq12_mul_by_034
-  - GPU: __noinline__ wrappers for fq12_sqr, fq12_mul_by_034, fq2_inv, fq_inv
-    (prevents nvcc cicc ACCESS_VIOLATION from explosive IR inlining in 63-iteration loop)
-  - Device functions in .cu file (not header) to avoid duplicate symbol linker errors
+  - M-type sextic twist (E': y²=x³+4(1+u)): line evaluations at positions (0, 1, 4)
+  - Doubling step: d0=12(1+u)-yt², d1=3xt²·xP, d4=-2yt·yP → fq12_mul_by_014
+  - Addition step: d0=xq·yt-yq·xt, d1=(yq-yt)·xP, d4=(xt-xq)·yP → fq12_mul_by_014
+  - Final exponentiation: f^((q^12-1)/r), Hayashida-Hayasaka-Teruya (eprint 2020/875)
+    - Easy part: f^((q^6-1)(q^2+1)) via conjugate + inverse + Frobenius
+    - Hard part: 3+(x²+q²-1)(q+x)(x-1)² via 4× exp_by_u + 2 Frobenius maps
+    - exp_by_u: 63 cyclotomic squarings + 4 multiplications, then conjugate (u<0)
+    - FrobeniusCoeffs struct: γ₁[6], γ₂[6] (Fq6) + γ_w[12] (Fq12), precomputed on host
+  - GPU: __noinline__ wrappers for fq12_sqr, fq12_mul, fq12_mul_by_014, fq12_inv,
+    fq12_frobenius, fq2_inv, fq_inv, exp_by_u, final_exponentiation
+  - Kernels: miller_loop_kernel, final_exp_kernel, pairing_kernel (Miller+final_exp)
   - pairing_lib compiled without RDC (separate TU, like msm_lib)
-  - CPU reference: `miller_loop_ref()` in `tests/ff_reference.h`
+  - CPU reference: `miller_loop_ref()`, `final_exponentiation_ref()`, `pairing_ref()`
+  - Bilinearity verified: e(2P,Q) = e(P,Q)², e(P,2Q) = e(P,Q)², e(2P,Q) = e(P,2Q)
 
 ### NTT
 - BLS12-381 NTT: `ntt.cuh` (NTTMode: NAIVE, OPTIMIZED, BARRETT, ASYNC, FOUR_STEP)
@@ -194,10 +204,10 @@ include/
   ff_fq.cuh           — BLS12-381 base field Fq (381-bit, 12×uint32 Montgomery)
   ff_fq2.cuh          — Fq2 quadratic extension (Karatsuba, 3 Fq muls)
   ff_fq6.cuh          — Fq6 cubic extension (Fq2[v]/(v³−β), Karatsuba 6 Fq2 muls, CH-SQR2, inverse via norm, sparse mul, Frobenius)
-  ff_fq12.cuh         — Fq12 quadratic extension (Fq6[w]/(w²−v), Karatsuba 3 Fq6 muls, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034, Frobenius)
+  ff_fq12.cuh         — Fq12 quadratic extension (Fq6[w]/(w²−v), Karatsuba 3 Fq6 muls, complex-method sqr, inverse via norm, conjugate, sparse mul_by_014/mul_by_034, Frobenius)
   ec_g1.cuh           — G1 elliptic curve ops (Jacobian, affine, scalar_mul)
   ec_g2.cuh           — G2 elliptic curve ops (over Fq2)
-  pairing.cuh         — BLS12-381 pairing types (LineCoeffs, BLS12_381_U_ABS)
+  pairing.cuh         — BLS12-381 pairing types (LineCoeffs, FrobeniusCoeffs, BLS12_381_U_ABS)
   msm.cuh             — GPU MSM (Pippenger's bucket method, G1)
   poly_ops.cuh        — Polynomial ops (coset NTT, pointwise mul/sub, scale)
   groth16.cuh         — Groth16 prover API (R1CS, SparseR1CS, ProvingKey, Proof, Fibonacci)
@@ -455,14 +465,16 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v2.0.0 complete, v2.1.0-v3.0.0 planned).
 
-Phases 1-8 complete. Current version: **v3.0.0-dev** (Session 33 complete, 963 tests).
+Phases 1-8 complete. Current version: **v3.0.0-dev** (Session 34 complete, 986 tests).
 
 ### In Progress
 - **v3.0.0** — Pairing verification: Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate),
   final exponentiation, Groth16 verify equation. End-to-end prove→verify loop.
-  Sessions 31-35. **Sessions 31-33 complete**: Fq6 cubic extension + Fq12 quadratic extension
-  (Karatsuba mul, complex-method sqr, inverse via norm, conjugate, sparse mul_by_034,
-  Frobenius map) + Miller loop (optimal Ate, affine G2, D-type twist line functions). 963 tests.
+  Sessions 31-35. **Sessions 31-34 complete**: Fq6 cubic extension + Fq12 quadratic extension
+  (Karatsuba mul, complex-method sqr, inverse via norm, conjugate, sparse mul_by_014,
+  Frobenius map) + Miller loop (optimal Ate, affine G2, M-type twist line functions) +
+  Final exponentiation (easy part + hard part via Hayashida et al.) + Full pairing kernel
+  with bilinearity verified. 986 tests.
 
 ### Completed Releases
 - **v2.2.0** — Fibonacci circuit + batch pipeline. Sparse R1CS (COO format), Lagrange basis

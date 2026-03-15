@@ -149,6 +149,36 @@ Fq12Element fq12_mul_by_034(const Fq12Element& a,
     return {c0, c1};
 }
 
+// ─── fq12_mul_by_014: sparse multiply for M-type twist line functions ───────
+// Multiplies by a sparse Fq12 element with structure (positions 0, 1, 4):
+//   b.c0 = (d0, d1, 0)  — Fq6 with c0=d0, c1=d1, c2=0
+//   b.c1 = (0, d4, 0)   — Fq6 with c0=0, c1=d4, c2=0
+//
+// Karatsuba decomposition:
+//   v0 = a.c0 · b.c0 = fq6_mul_by_01(a.c0, d0, d1)             [5 Fq2 muls]
+//   v1 = a.c1 · b.c1 = fq6_mul_by_1(a.c1, d4)                  [3 Fq2 muls]
+//   c0 = v0 + v·v1
+//   c1 = fq6_mul_by_01(a.c0+a.c1, d0, d1+d4) - v0 - v1         [5 Fq2 muls]
+// Cost: 13 Fq2 muls = 39 Fq muls (same as mul_by_034).
+
+__device__ __forceinline__
+Fq12Element fq12_mul_by_014(const Fq12Element& a,
+                             const Fq2Element& d0,
+                             const Fq2Element& d1,
+                             const Fq2Element& d4) {
+    Fq6Element v0 = fq6_mul_by_01(a.c0, d0, d1);
+    Fq6Element v1 = fq6_mul_by_1(a.c1, d4);
+
+    Fq6Element c0 = fq6_add(v0, fq6_mul_by_nonresidue(v1));
+
+    Fq6Element sum_a = fq6_add(a.c0, a.c1);
+    Fq2Element sum_d14 = fq2_add(d1, d4);
+    Fq6Element c1 = fq6_sub(fq6_sub(
+        fq6_mul_by_01(sum_a, d0, sum_d14), v0), v1);
+
+    return {c0, c1};
+}
+
 // ─── fq12_frobenius_map: apply Frobenius endomorphism φ^power ───────────────
 // φ^k(a0 + a1·w) = φ^k(a0) + φ^k(a1) · γ_w[k] · w
 // where φ^k on Fq6 uses fq6_frobenius_map with power (k % 6),

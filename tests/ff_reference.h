@@ -1574,6 +1574,24 @@ inline Fq12Ref fq12_mul_by_034_ref(const Fq12Ref& a,
     return {c0, c1};
 }
 
+// Sparse mul_by_014: 13 Fq2 muls = 39 Fq muls (M-type twist, positions 0,1,4)
+inline Fq12Ref fq12_mul_by_014_ref(const Fq12Ref& a,
+                                     const Fq2Ref& d0,
+                                     const Fq2Ref& d1,
+                                     const Fq2Ref& d4) {
+    Fq6Ref v0 = fq6_mul_by_01_ref(a.c0, d0, d1);
+    Fq6Ref v1 = fq6_mul_by_1_ref(a.c1, d4);
+
+    Fq6Ref c0 = fq6_add_ref(v0, fq6_mul_by_nonresidue_ref(v1));
+
+    Fq6Ref sum_a = fq6_add_ref(a.c0, a.c1);
+    Fq2Ref sum_d14 = fq2_add_ref(d1, d4);
+    Fq6Ref c1 = fq6_sub_ref(fq6_sub_ref(
+        fq6_mul_by_01_ref(sum_a, d0, sum_d14), v0), v1);
+
+    return {c0, c1};
+}
+
 // ─── Fq12 Frobenius Coefficient Computation ────────────────────────────────
 // γ_w[k] = β^((q^k-1)/6) where β = (1+u).
 // γ_w[k] = product_{i=0}^{k-1} φ^i(γ_w[1])
@@ -1932,21 +1950,18 @@ inline void pointwise_mul_sub_ref(std::vector<FpRef>& out,
 // The optimal Ate pairing for BLS12-381:
 //   e: G1 x G2 -> GT (subgroup of Fq12*)
 //
-// Miller loop parameter: u = -0xd201000000010000 (64-bit, Hamming weight 5)
+// Miller loop parameter: u = -0xd201000000010000 (64-bit, Hamming weight 6)
 // |u| = 0xd201000000010000
 //
 // Uses affine coordinates for the running G2 point T throughout.
 // Requires one Fq2 inversion per step, but correct and simple.
 //
-// For BLS12-381 D-type sextic twist with ξ = (1+u):
-//   ψ(x', y') = (x'·v, y'·v·w) maps E'(Fq2) → E(Fq12)
-//   where v is the Fq6 generator and w is the Fq12 generator.
-//
-// The line evaluation at P∈G1 produces sparse Fq12 at positions (0, 3, 4),
-// matching our fq12_mul_by_034.
+// BLS12-381 M-type sextic twist: E': y² = x³ + 4(1+u).
+// Line evaluation at P∈G1 produces sparse Fq12 at positions (0, 1, 4),
+// matching fq12_mul_by_014.
 
 struct MillerLineCoeffs {
-    Fq2Ref c0, c3, c4;  // sparse Fq12 coefficients at positions 0, 3, 4
+    Fq2Ref d0, d1, d4;  // sparse Fq12 coefficients at positions 0, 1, 4
 };
 
 // BLS12-381 Miller loop parameter (absolute value)
@@ -1958,11 +1973,8 @@ inline Fq2Ref fq2_mul_by_fq_ref(const Fq2Ref& a, const FqRef& s) {
 }
 
 // Miller loop doubling step (affine T, affine P).
-// T = (xt, yt) on E'(Fq2), P = (xP, yP) on E(Fq)
-// Returns sparse line coefficients (d0, d3, d4), updates T to 2T.
-//
-// Derivation: tangent line at T on untwisted curve evaluated at P:
-//   d0 = 2·yt · yP,  d3 = -3·xt² · xP,  d4 = 3·xt³ - 2·yt²
+// M-type twist: E': y² = x³ + 4(1+u).  Line at positions (0, 1, 4).
+// d0 = 12(1+u) - yt²,  d1 = 3xt²·xP,  d4 = -2yt·yP
 inline MillerLineCoeffs miller_double_step_ref(G2AffineRef& T, const G1AffineRef& P) {
     Fq2Ref xt = T.x, yt = T.y;
 
@@ -1977,25 +1989,23 @@ inline MillerLineCoeffs miller_double_step_ref(G2AffineRef& T, const G1AffineRef
     T.x = xr;
     T.y = yr;
 
-    // Line coefficients
-    MillerLineCoeffs line;
-    line.c0 = fq2_mul_by_fq_ref(two_yt, P.y);
-    line.c3 = fq2_neg_ref(fq2_mul_by_fq_ref(three_xt2, P.x));
-    Fq2Ref xt3 = fq2_mul_ref(xt2, xt);
-    Fq2Ref three_xt3 = fq2_add_ref(xt3, fq2_add_ref(xt3, xt3));
+    // 12(1+u) in Montgomery form: 3 * b_twist where b_twist = 4(1+u)
+    FqRef twelve = fq_to_montgomery_ref(FqRef::from_u64(12));
+    Fq2Ref twelve_beta = {twelve, twelve};  // 12·(1+u)
+
     Fq2Ref yt2 = fq2_sqr_ref(yt);
-    Fq2Ref two_yt2 = fq2_add_ref(yt2, yt2);
-    line.c4 = fq2_sub_ref(three_xt3, two_yt2);
+
+    MillerLineCoeffs line;
+    line.d0 = fq2_sub_ref(twelve_beta, yt2);                  // 12(1+u) - yt²
+    line.d1 = fq2_mul_by_fq_ref(three_xt2, P.x);              // 3xt²·xP
+    line.d4 = fq2_neg_ref(fq2_mul_by_fq_ref(two_yt, P.y));    // -2yt·yP
 
     return line;
 }
 
 // Miller loop addition step (affine T + affine Q, affine P).
-// T = (xt, yt), Q = (xq, yq) on E'(Fq2), P on E(Fq).
-// Returns sparse line coefficients, updates T to T+Q.
-//
-// Derivation: chord line through T,Q on untwisted curve evaluated at P:
-//   d0 = (xq-xt)·yP,  d3 = -(yq-yt)·xP,  d4 = (yq-yt)·xt - (xq-xt)·yt
+// M-type twist: line at positions (0, 1, 4).
+// d0 = xq·yt - yq·xt,  d1 = (yq-yt)·xP,  d4 = (xt-xq)·yP
 inline MillerLineCoeffs miller_add_step_ref(G2AffineRef& T, const G2AffineRef& Q,
                                               const G1AffineRef& P) {
     Fq2Ref xt = T.x, yt = T.y;
@@ -2011,11 +2021,10 @@ inline MillerLineCoeffs miller_add_step_ref(G2AffineRef& T, const G2AffineRef& Q
     T.x = xr;
     T.y = yr;
 
-    // Line coefficients
     MillerLineCoeffs line;
-    line.c0 = fq2_mul_by_fq_ref(dx, P.y);
-    line.c3 = fq2_neg_ref(fq2_mul_by_fq_ref(dy, P.x));
-    line.c4 = fq2_sub_ref(fq2_mul_ref(dy, xt), fq2_mul_ref(dx, yt));
+    line.d0 = fq2_sub_ref(fq2_mul_ref(xq, yt), fq2_mul_ref(yq, xt));  // xq·yt - yq·xt
+    line.d1 = fq2_mul_by_fq_ref(dy, P.x);                               // (yq-yt)·xP
+    line.d4 = fq2_mul_by_fq_ref(fq2_sub_ref(xt, xq), P.y);             // (xt-xq)·yP
 
     return line;
 }
@@ -2037,11 +2046,11 @@ inline Fq12Ref miller_loop_ref(const G1AffineRef& P, const G2AffineRef& Q) {
         f = fq12_sqr_ref(f);
 
         MillerLineCoeffs ld = miller_double_step_ref(T, P);
-        f = fq12_mul_by_034_ref(f, ld.c0, ld.c3, ld.c4);
+        f = fq12_mul_by_014_ref(f, ld.d0, ld.d1, ld.d4);
 
         if ((u_abs >> i) & 1) {
             MillerLineCoeffs la = miller_add_step_ref(T, Q, P);
-            f = fq12_mul_by_034_ref(f, la.c0, la.c3, la.c4);
+            f = fq12_mul_by_014_ref(f, la.d0, la.d1, la.d4);
         }
     }
 
@@ -2049,6 +2058,80 @@ inline Fq12Ref miller_loop_ref(const G1AffineRef& P, const G2AffineRef& Q) {
     f = fq12_conjugate_ref(f);
 
     return f;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Final Exponentiation: f^((q^12 - 1) / r)
+// Decomposition: (q^12 - 1)/r = (q^6 - 1)(q^2 + 1) · (q^4 - q^2 + 1)/r
+// Easy part: conjugate + inverse + Frobenius
+// Hard part: Hayashida-Hayasaka-Teruya (eprint 2020/875), gnark decomposition
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// exp_by_u: compute f^u where u = -0xd201000000010000 (BLS12-381 parameter).
+// Square-and-multiply with |u| (63 squarings, 4 multiplications), then
+// conjugate since u < 0. Input must be unitary (cyclotomic subgroup).
+inline Fq12Ref exp_by_u_ref(const Fq12Ref& f) {
+    uint64_t u_abs = BLS12_381_U;  // 0xd201000000010000
+
+    // MSB-first binary exponentiation — bit 63 is the MSB
+    Fq12Ref result = f;
+    for (int i = 62; i >= 0; --i) {
+        result = fq12_sqr_ref(result);
+        if ((u_abs >> i) & 1) {
+            result = fq12_mul_ref(result, f);
+        }
+    }
+
+    // u < 0: conjugate (= unitary inverse for cyclotomic elements)
+    return fq12_conjugate_ref(result);
+}
+
+// Full final exponentiation: f^((q^12 - 1)/r).
+// Algorithm: gnark-crypto BLS12-381 decomposition following
+// Hayashida-Hayasaka-Teruya (eprint 2020/875).
+// Hard part exponent: 3 + (x²+q²-1)(q+x)(x-1)² where x = u.
+inline Fq12Ref final_exponentiation_ref(const Fq12Ref& f) {
+    // Precompute Frobenius coefficients
+    Fq2Ref fq6_c1[6], fq6_c2[6], fq12_w[12];
+    compute_fq6_frobenius_coefficients(fq6_c1, fq6_c2);
+    compute_fq12_frobenius_coefficients(fq12_w);
+
+    // ─── Easy part: f^((q^6 - 1)(q^2 + 1)) ──────────────────────────────
+    Fq12Ref t0 = fq12_conjugate_ref(f);         // f^(q^6)
+    Fq12Ref f_inv = fq12_inv_ref(f);             // f^(-1)
+    t0 = fq12_mul_ref(t0, f_inv);                // f^(q^6 - 1)
+
+    Fq12Ref t1 = fq12_frobenius_map_ref(t0, 2, fq6_c1, fq6_c2, fq12_w);
+    Fq12Ref result = fq12_mul_ref(t1, t0);       // f^((q^6-1)(q^2+1))
+
+    // ─── Hard part: result^((q^4 - q^2 + 1)/r) ──────────────────────────
+    // gnark variable mapping: t[0], t[1], t[2]
+    t0 = fq12_sqr_ref(result);                    // result²
+    t1 = exp_by_u_ref(result);                    // result^x
+    Fq12Ref t2 = fq12_conjugate_ref(result);      // result^(-1)
+    t1 = fq12_mul_ref(t1, t2);                    // result^(x-1)
+    t2 = exp_by_u_ref(t1);                        // result^(x²-x)
+    t1 = fq12_conjugate_ref(t1);                  // result^(1-x)
+    t1 = fq12_mul_ref(t1, t2);                    // result^((x-1)²)
+    t2 = exp_by_u_ref(t1);                        // result^(x(x-1)²)
+    t1 = fq12_frobenius_map_ref(t1, 1, fq6_c1, fq6_c2, fq12_w);  // result^(q(x-1)²)
+    t1 = fq12_mul_ref(t1, t2);                    // result^((q+x)(x-1)²)
+    result = fq12_mul_ref(result, t0);             // result³
+    t0 = exp_by_u_ref(t1);                        // ^(x(q+x)(x-1)²)
+    t2 = exp_by_u_ref(t0);                        // ^(x²(q+x)(x-1)²)
+    t0 = fq12_frobenius_map_ref(t1, 2, fq6_c1, fq6_c2, fq12_w);  // ^(q²(q+x)(x-1)²)
+    t1 = fq12_conjugate_ref(t1);                  // ^(-(q+x)(x-1)²)
+    t1 = fq12_mul_ref(t1, t2);                    // ^((x²-1)(q+x)(x-1)²)
+    t1 = fq12_mul_ref(t1, t0);                    // ^((x²+q²-1)(q+x)(x-1)²)
+    result = fq12_mul_ref(result, t1);             // 3 + (x²+q²-1)(q+x)(x-1)²
+
+    return result;
+}
+
+// Full pairing: e(P, Q) = final_exp(miller_loop(P, Q))
+inline Fq12Ref pairing_ref(const G1AffineRef& P, const G2AffineRef& Q) {
+    Fq12Ref f = miller_loop_ref(P, Q);
+    return final_exponentiation_ref(f);
 }
 
 } // namespace ff_ref
