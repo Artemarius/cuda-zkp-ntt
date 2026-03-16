@@ -759,19 +759,37 @@ Groth16Proof groth16_prove_sparse(const SparseR1CS& r1cs,
         eval_C[k] = from_ref_mont(eval_C_ref[k]);
     }
 
-    // ── Step 2: GPU INTT → polynomial coefficients ──
+    // ── Step 2: GPU INTT → polynomial coefficients (multi-stream H2D overlap) ──
+    // Use async transfers so H2D(B) and H2D(C) overlap with INTT(A) computation.
+    // Note: cooperative NTT kernels occupy all SMs, so NTTs can't overlap each
+    // other. But DMA engine transfers CAN overlap with cooperative compute.
     FpElement *d_A, *d_B, *d_C;
     CUDA_CHECK(cudaMalloc(&d_A, n * sizeof(FpElement)));
     CUDA_CHECK(cudaMalloc(&d_B, n * sizeof(FpElement)));
     CUDA_CHECK(cudaMalloc(&d_C, n * sizeof(FpElement)));
 
-    CUDA_CHECK(cudaMemcpy(d_A, eval_A.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, eval_B.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_C, eval_C.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+    cudaStream_t stream_xfer;
+    CUDA_CHECK(cudaStreamCreate(&stream_xfer));
+
+    // H2D(A) on main stream, then start INTT(A)
+    // H2D(B) and H2D(C) on transfer stream — overlap with INTT(A) computation
+    CUDA_CHECK(cudaMemcpyAsync(d_A, eval_A.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B, eval_B.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice, stream_xfer));
+    CUDA_CHECK(cudaMemcpyAsync(d_C, eval_C.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice, stream_xfer));
 
     ntt_inverse(d_A, n, NTTMode::OPTIMIZED, stream);
+
+    // Wait for B/C transfers before INTT(B), INTT(C)
+    cudaEvent_t xfer_done;
+    CUDA_CHECK(cudaEventCreate(&xfer_done));
+    CUDA_CHECK(cudaEventRecord(xfer_done, stream_xfer));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, xfer_done, 0));
+
     ntt_inverse(d_B, n, NTTMode::OPTIMIZED, stream);
     ntt_inverse(d_C, n, NTTMode::OPTIMIZED, stream);
+
+    CUDA_CHECK(cudaEventDestroy(xfer_done));
+    CUDA_CHECK(cudaStreamDestroy(stream_xfer));
 
     // ── Step 3: H(x) via coset NTT pipeline (GPU) ──
     FpElement coset_gen = make_fp(7);
