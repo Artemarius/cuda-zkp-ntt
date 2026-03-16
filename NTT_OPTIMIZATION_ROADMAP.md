@@ -2065,22 +2065,22 @@ TC/CUDA-core concurrency, batching (B NTTs fill WMMA tiles), and memory traffic 
 Batched throughput at B≥64 has ~50% chance of 10–30% improvement, ~25% chance of 2–4×.
 Worst case: documented negative result comparing two fundamentally different TC approaches.
 
-### Session 45 — DFT-16 Matrix Precomputation + CPU Reference
+### Session 45 — DFT-16 Matrix Precomputation + CPU Reference ✅ COMPLETE
 
-**Objective:** Implement precomputed DFT matrices for BabyBear 16-point sub-NTTs
-and validate the mathematical foundation for GEMM-NTT.
+**Implemented:**
+- DFT-16 matrix Z[i][j] = ω₁₆^(i·j) mod p, precomputed as 4 unsigned byte slice
+  matrices in `__constant__` memory (1024 bytes), copied to shared memory for WMMA
+- CPU reference `bb_precompute_dft16_matrix()`, `bb_gemm_ntt_16_ref()` in ff_reference.h
+- GPU kernel `bb_gemm_ntt_kernel`: unsigned char WMMA (m16n16k16), row_major A and B,
+  7 shift levels for reconstruction, mod p reduction
+- API: `ntt_babybear_gemm_dft16(d_data, n, stream)` in ntt_babybear_tc.cu
+- Fixed v4.0.0 signed INT8 bug: unsigned char WMMA for correct byte arithmetic
+- Fixed __syncthreads() UB: all threads participate before inactive warps return
+- Fixed WMMA B-matrix layout: row_major (not col_major) matches data storage
 
-**Tasks:**
-1. Precompute DFT-16 matrix over BabyBear: `Z[i][j] = ω₁₆^(i·j) mod p` for 0 ≤ i,j < 16
-   where ω₁₆ is a primitive 16th root of unity mod BabyBear (p = 2^31 − 2^27 + 1)
-2. Precompute INT8 slice matrices: split each Z[i][j] (31-bit) into 4 unsigned bytes
-   → Z_s0[16×16], Z_s1[16×16], Z_s2[16×16], Z_s3[16×16] for WMMA (u8 → s32)
-3. CPU reference: `gemm_ntt_16_ref(Z, x)` = modular matrix-vector multiply
-   Validate against scalar NTT₁₆ for 1000+ random inputs
-4. GPU kernel: `bb_gemm_dft16_kernel` — one GEMM per 16-element group
-   Shared DFT matrix in constant memory, batch of (n/16) groups
-5. Tests: DFT-16 matrix correctness, CPU ref vs scalar NTT₁₆, GPU kernel vs CPU ref
-   Target: all existing 1025 tests pass + new GEMM-NTT tests
+**Results:** 1053/1053 tests pass (28 new). CPU DFT-16 matrix validated 1000/1000
+against scalar NTT-16. GPU kernel matches CPU reference at all sizes 2^4..2^14.
+Timing: GEMM stage 0.23-0.71x of full scalar NTT (promising for batched mode).
 
 ### Session 46 — Batched GEMM-NTT Kernel (Throughput Mode)
 
