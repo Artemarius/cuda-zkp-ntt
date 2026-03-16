@@ -6,6 +6,11 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, end-to-end Groth16 prover, and pairing-based verification.
 
+- **v4.0.0** (S36+ in progress): Hardware-accelerated sprint — L2 cache residency controls
+  for twiddle factor persistence (Ampere accessPolicyWindow API, up to 3 MB pinned in 4 MB L2,
+  streaming hints for NTT data), integrated into all OPTIMIZED/BARRETT NTT dispatch paths
+  (forward/inverse/batch), CUDA Graph capture compatible (auto-skip during capture).
+  1013 tests (4 new L2 persistence tests).
 - **v3.0.0** (S31-S35 complete): Full pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
   Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
@@ -476,7 +481,7 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v3.0.0 complete).
 
-Phases 1-8 complete. Current version: **v3.0.0** (Session 35 complete, 1009 tests).
+Phases 1-8 complete. Current version: **v4.0.0-dev** (Session 36 complete, 1013 tests).
 
 ### Completed Releases
 - **v3.0.0** — Full pairing verification + Groth16 prove→verify loop. Fq6/Fq12 tower

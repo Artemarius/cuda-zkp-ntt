@@ -594,6 +594,63 @@ static void ntt_inverse_naive_montgomery(
     ntt_scale_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, n_inv, N);
 }
 
+// ─── L2 Cache Residency Controls (Ampere+, sm_80+) ─────────────────────────
+// Pin twiddle factor table in L2 cache for the duration of NTT outer stages.
+// Twiddles are read-only and reused across all butterfly stages; pinning them
+// reduces L2 eviction pressure from the much larger NTT data array.
+//
+// RTX 3060: 4 MB L2. Twiddle table at n=2^22: 64 MB (n/2 × 32B).
+// We pin up to L2_PERSIST_MAX_BYTES (3 MB = 75% of L2) starting from base.
+// Low-index twiddles are accessed by ALL stages → highest reuse.
+
+static constexpr size_t L2_PERSIST_MAX_BYTES = 3u * 1024u * 1024u; // 3 MB
+
+// Track whether we have an active L2 policy on the stream (avoid double-set)
+static bool s_l2_policy_active = false;
+
+static void ntt_l2_persist_twiddles(
+    const FpElement* d_twiddles, size_t n, cudaStream_t stream
+) {
+    // L2 persistence requires Ampere+ (sm_80). Check at runtime.
+    int device = 0;
+    cudaGetDevice(&device);
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (major < 8) return;  // Pre-Ampere: no L2 persistence support
+
+    // Don't set during CUDA Graph capture (cudaStreamSetAttribute not allowed)
+    cudaStreamCaptureStatus captureStatus;
+    cudaStreamIsCapturing(stream, &captureStatus);
+    if (captureStatus == cudaStreamCaptureStatusActive) return;
+
+    size_t twiddle_bytes = (n / 2) * sizeof(FpElement);
+    size_t pin_bytes = (twiddle_bytes < L2_PERSIST_MAX_BYTES)
+                     ? twiddle_bytes : L2_PERSIST_MAX_BYTES;
+
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = (void*)d_twiddles;
+    attr.accessPolicyWindow.num_bytes = pin_bytes;
+    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+    cudaError_t err = cudaStreamSetAttribute(
+        stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    if (err == cudaSuccess) {
+        s_l2_policy_active = true;
+    }
+    // Silently ignore errors (unsupported driver, etc.) — L2 hint is best-effort
+}
+
+static void ntt_l2_reset(cudaStream_t stream) {
+    if (!s_l2_policy_active) return;
+
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.num_bytes = 0;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    s_l2_policy_active = false;
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream) {
@@ -621,9 +678,11 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
+            ntt_l2_persist_twiddles(s_d_fwd_twiddles, n, stream);
             ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             ntt_forward_optimized_montgomery(d_data, n, s_d_fwd_twiddles, stream);
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::BARRETT: {
@@ -631,7 +690,9 @@ void ntt_forward(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ensure_twiddles_barrett(n);
             upload_otf_barrett_fwd(n);
             // No Montgomery conversion — Barrett operates in standard form
+            ntt_l2_persist_twiddles(s_d_fwd_twiddles_barrett, n, stream);
             ntt_forward_optimized_barrett(d_data, n, s_d_fwd_twiddles_barrett, stream);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::FOUR_STEP: {
@@ -682,9 +743,11 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             uint32_t N = static_cast<uint32_t>(n);
             uint32_t grid = (N + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
+            ntt_l2_persist_twiddles(s_d_inv_twiddles, n, stream);
             ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
             ntt_inverse_optimized_montgomery(d_data, n, s_d_inv_twiddles, s_n_inv, stream);
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, N);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::BARRETT: {
@@ -692,7 +755,9 @@ void ntt_inverse(FpElement* d_data, size_t n, NTTMode mode, cudaStream_t stream)
             ensure_twiddles_barrett(n);
             upload_otf_barrett_inv(n);
             // No Montgomery conversion — Barrett operates in standard form
+            ntt_l2_persist_twiddles(s_d_inv_twiddles_barrett, n, stream);
             ntt_inverse_optimized_barrett(d_data, n, s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::FOUR_STEP: {
@@ -731,6 +796,7 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             uint32_t total = static_cast<uint32_t>(batch_size) * N;
             uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
+            ntt_l2_persist_twiddles(s_d_fwd_twiddles, n, stream);
             // Convert all elements to Montgomery form
             ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
 
@@ -739,13 +805,16 @@ void ntt_forward_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
 
             // Convert back to standard form
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
             upload_otf_barrett_fwd(n);
+            ntt_l2_persist_twiddles(s_d_fwd_twiddles_barrett, n, stream);
             ntt_forward_batch_barrett(d_data, batch_size, n, s_d_fwd_twiddles_barrett, stream);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::FOUR_STEP: {
@@ -782,17 +851,21 @@ void ntt_inverse_batch(FpElement* d_data, int batch_size, size_t n, NTTMode mode
             uint32_t total = static_cast<uint32_t>(batch_size) * N;
             uint32_t grid = (total + NTT_BLOCK_SIZE - 1) / NTT_BLOCK_SIZE;
 
+            ntt_l2_persist_twiddles(s_d_inv_twiddles, n, stream);
             ntt_to_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
             ntt_inverse_batch_montgomery(d_data, batch_size, n, s_d_inv_twiddles, s_n_inv, stream);
             ntt_from_montgomery_kernel<<<grid, NTT_BLOCK_SIZE, 0, stream>>>(d_data, total);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::BARRETT: {
             assert(n >= 2 && (n & (n - 1)) == 0);
             ensure_twiddles_barrett(n);
             upload_otf_barrett_inv(n);
+            ntt_l2_persist_twiddles(s_d_inv_twiddles_barrett, n, stream);
             ntt_inverse_batch_barrett(d_data, batch_size, n,
                 s_d_inv_twiddles_barrett, s_n_inv_barrett, stream);
+            ntt_l2_reset(stream);
             break;
         }
         case NTTMode::FOUR_STEP: {

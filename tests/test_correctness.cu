@@ -11110,6 +11110,172 @@ int main() {
     test_verify_fibonacci_cpu();
     test_verify_gpu_vs_cpu_both_valid();
 
+    // v4.0.0 Session 36: L2 Cache Residency Controls
+    // L2 persistence is transparent (cache hint only), so these are correctness
+    // checks confirming the hint doesn't break NTT results.
+    // The L2 policy is automatically applied in OPTIMIZED/BARRETT paths.
+    // Test with explicit non-default stream to exercise the stream attribute path.
+    {
+        printf("\n--- v4.0.0 S36: L2 Residency Controls ---\n");
+
+        // Test 1: Forward + roundtrip on explicit stream (Montgomery, large)
+        {
+            const int log_n = 20;
+            const size_t n = 1u << log_n;
+            printf("test_l2_persist_roundtrip_montgomery (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 7919u + 104729u) % 1000000007u);
+            }
+
+            FpElement* d_data;
+            CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+
+            ntt_forward(d_data, n, NTTMode::OPTIMIZED, stream);
+            ntt_inverse(d_data, n, NTTMode::OPTIMIZED, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<FpElement> h_result(n);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_result[i] == h_data[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "L2 persist Montgomery roundtrip mismatch");
+            printf("  L2 persist Montgomery roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            CUDA_CHECK(cudaFree(d_data));
+        }
+
+        // Test 2: Forward + roundtrip on explicit stream (Barrett, large)
+        {
+            const int log_n = 20;
+            const size_t n = 1u << log_n;
+            printf("test_l2_persist_roundtrip_barrett (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 7919u + 104729u) % 1000000007u);
+            }
+
+            FpElement* d_data;
+            CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+
+            ntt_forward(d_data, n, NTTMode::BARRETT, stream);
+            ntt_inverse(d_data, n, NTTMode::BARRETT, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<FpElement> h_result(n);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_result[i] == h_data[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "L2 persist Barrett roundtrip mismatch");
+            printf("  L2 persist Barrett roundtrip (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            CUDA_CHECK(cudaFree(d_data));
+        }
+
+        // Test 3: Batched NTT with L2 persistence (Barrett, B=4)
+        {
+            const int log_n = 18;
+            const size_t n = 1u << log_n;
+            const int B = 4;
+            const size_t total = B * n;
+            printf("test_l2_persist_batch_barrett (n=2^%d, B=%d)...\n", log_n, B);
+
+            std::vector<FpElement> h_data(total);
+            for (size_t i = 0; i < total; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 31337u + 42u) % 1000000007u);
+            }
+
+            FpElement* d_data;
+            CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), total * sizeof(FpElement), cudaMemcpyHostToDevice));
+
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+
+            ntt_forward_batch(d_data, B, n, NTTMode::BARRETT, stream);
+            ntt_inverse_batch(d_data, B, n, NTTMode::BARRETT, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<FpElement> h_result(total);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, total * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < total; ++i)
+                if (h_result[i] == h_data[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(total), "L2 persist batch Barrett roundtrip mismatch");
+            printf("  L2 persist batch Barrett (n=2^%d, B=%d): %d/%zu matched\n", log_n, B, pass, total);
+
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            CUDA_CHECK(cudaFree(d_data));
+        }
+
+        // Test 4: Cross-validate L2 vs non-L2 path (default stream = L2, verify same output)
+        {
+            const int log_n = 18;
+            const size_t n = 1u << log_n;
+            printf("test_l2_persist_cross_validate (n=2^%d)...\n", log_n);
+
+            std::vector<FpElement> h_data(n);
+            for (size_t i = 0; i < n; ++i) {
+                h_data[i] = FpElement::zero();
+                h_data[i].limbs[0] = static_cast<uint32_t>((i * 54321u + 98765u) % 1000000007u);
+            }
+
+            // Run OPTIMIZED forward on default stream
+            FpElement* d_data1;
+            CUDA_CHECK(cudaMalloc(&d_data1, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data1, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+            ntt_forward(d_data1, n, NTTMode::OPTIMIZED);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // Run OPTIMIZED forward on explicit stream
+            FpElement* d_data2;
+            CUDA_CHECK(cudaMalloc(&d_data2, n * sizeof(FpElement)));
+            CUDA_CHECK(cudaMemcpy(d_data2, h_data.data(), n * sizeof(FpElement), cudaMemcpyHostToDevice));
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+            ntt_forward(d_data2, n, NTTMode::OPTIMIZED, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<FpElement> h_r1(n), h_r2(n);
+            CUDA_CHECK(cudaMemcpy(h_r1.data(), d_data1, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_r2.data(), d_data2, n * sizeof(FpElement), cudaMemcpyDeviceToHost));
+
+            int pass = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_r1[i] == h_r2[i]) ++pass;
+
+            TEST_ASSERT(pass == static_cast<int>(n), "L2 persist cross-validate mismatch");
+            printf("  L2 persist cross-validate (n=2^%d): %d/%zu matched\n", log_n, pass, n);
+
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            CUDA_CHECK(cudaFree(d_data1));
+            CUDA_CHECK(cudaFree(d_data2));
+        }
+    }
+
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }

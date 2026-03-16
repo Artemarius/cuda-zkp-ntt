@@ -1895,6 +1895,129 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 > v2.1.0: "cuZK-style parallel MSM closes the gap (>20x speedup)"
 > v2.2.0: "Fibonacci shows GPU = 55-141x CPU — GPU wins decisively"
 > v3.0.0: "Full prove→verify loop with pairing verification" ✅
+> v4.0.0: "Exploit every hardware unit — Tensor Cores, cp.async, L2 persistence, multi-stream"
+
+---
+
+## v4.0.0 — Hardware-Accelerated Sprint (Sessions 36–44)
+
+**Goal:** Exploit every underutilized hardware unit on RTX 3060 (Tensor Cores, cp.async,
+L2 residency controls, multi-stream overlap) to accelerate the Groth16 pipeline.
+
+**Note:** BabyBear field + CUDA-core NTT (plan Sessions 39-40) already complete in v1.6.0.
+Warp shuffle + Plantard (plan Session 46) already complete in v1.1.0 + v1.7.0.
+Renumbered from 12 to 9 sessions.
+
+### Phase 1: Async Pipeline + L2 Residency (Sessions 36–38)
+
+**Rationale:** Outer NTT stages consume 58% of runtime and are DRAM-latency-bound.
+RTX 3060 has only 4 MB L2 vs 128+ MB working set at n=2^22. Ampere `cp.async` enables
+global→shared copies bypassing registers; L2 residency controls can pin twiddle factors.
+
+### Session 36 — cp.async Infrastructure + L2 Residency Controls
+
+**Objective:** Add L2 cache persistence for twiddle factors and async prefetch infrastructure.
+
+**Tasks:**
+- L2 cache persistence for twiddle table via `cudaStreamAttrValue`/`accessPolicyWindow`
+  - Pin twiddle subset in L2 (up to 3 MB of 4 MB), hitRatio=1.0, persisting
+  - Mark NTT data as `cudaAccessPropertyStreaming` (don't pollute L2)
+- Software prefetch hints for outer-stage data loads
+- Benchmark: NTT at n=2^22, 2^20, 2^18 — measure L2 hit rate improvement
+- Correctness: all existing NTT tests must pass unchanged
+
+### Session 37 — Multi-Stage Pipeline + Prefetch Tuning
+
+**Objective:** Tune L2 residency parameters and evaluate deeper async pipeline.
+
+**Tasks:**
+- Tune `accessPolicyWindow` parameters (hitRatio, num_bytes, various twiddle subsets)
+- Profile with Nsight Compute: L2 hit rate before/after for twiddle accesses
+- Evaluate `cp.async` for small twiddle tiles into shared memory
+- Target: 15–30% outer stage latency reduction vs v3.0.0 baseline
+
+### Session 38 — Async Prefetch for MSM Bucket Accumulation
+
+**Objective:** Apply async prefetch to MSM point loads during bucket accumulation.
+
+**Tasks:**
+- Profile MSM bucket accumulation (v2.1.0) with Nsight Compute
+- Software prefetch for EC point data during bucket scan
+- Evaluate interaction with stream-ordered memory pools
+- Target: 10–20% MSM latency improvement at n=2^18
+
+### Phase 2: Tensor Core BabyBear NTT (Sessions 39–40)
+
+**Rationale:** BabyBear (31-bit) elements fit natively in INT8 Tensor Core operands.
+CUDA-core BabyBear NTT already runs at 2.4ms (v1.6.0, 6.2x vs BLS12-381).
+INT8 Tensor Cores provide 102 TOPS on RTX 3060 — completely idle during ZKP workloads.
+
+### Session 39 — INT8 Tensor Core BabyBear NTT via WMMA
+
+**Objective:** Accelerate BabyBear NTT butterfly using INT8 WMMA.
+
+**Tasks:**
+- Decompose 31-bit BabyBear elements into 4 × INT8 slices (8+8+8+7 bits)
+- Group 16+ butterflies into matrix multiply form (NTT-as-GEMM, TensorFHE approach)
+- Use `wmma::mma_sync` (m16n16k16 INT8) for partial products
+- Accumulate in INT32, Barrett reduce mod BabyBear prime
+- New file: `src/ntt_babybear_tc.cu`
+- Cross-validate against existing CUDA-core BabyBear NTT at all sizes
+
+### Session 40 — Tensor Core NTT Benchmark + Comparison
+
+**Objective:** Benchmark and profile Tensor Core NTT.
+
+**Tasks:**
+- Profile: `sm__inst_executed_pipe_tensor` utilization in Nsight Compute
+- Benchmark at n = {2^16, 2^18, 2^20, 2^22, 2^24}
+- Compare: CUDA-core vs TC BabyBear vs BLS12-381 NTT
+- Generate comparison charts
+- Expected: 2–5× over CUDA-core BabyBear baseline
+
+### Phase 3: End-to-End Pipeline Overlap (Sessions 41–42)
+
+**Rationale:** Groth16 executes NTT→INTT→coset-NTT→pointwise→coset-INTT→MSM sequentially.
+With 3 polynomials (A, B, C), stages can overlap across CUDA streams.
+
+### Session 41 — Multi-Stream Groth16 Pipeline
+
+**Objective:** Overlap A/B/C polynomial processing across CUDA streams.
+
+**Tasks:**
+- Profile current pipeline with Nsight Systems (identify serialization + idle time)
+- 3 CUDA streams for A, B, C: NTT_A || NTT_B || NTT_C, then cross-stream sync for pointwise
+- Overlap H→D transfer of trusted setup with NTT computation
+- Benchmark at n = 2^10 → 2^16
+
+### Session 42 — Pipelined MSM with Transfer Overlap
+
+**Objective:** Overlap scalar transfer with MSM bucket accumulation.
+
+**Tasks:**
+- Double-buffer scalar transfer with bucket accumulation (2 streams)
+- Double-buffer EC point data between host and device
+- CUDA Graph capture for repeated Groth16 invocations
+
+### Phase 4: RT Core Evaluation (Session 43)
+
+### Session 43 — RT Core Feasibility Study
+
+**Objective:** Evaluate RT Core acceleration for ZKP-adjacent operations.
+
+Candidates: (1) Twiddle factor BVH lookup, (2) MSM bucket assignment via ray search,
+(3) Pairing point membership. Expected: all negative results — BVH construction overhead
+exceeds direct compute for these non-spatial workloads. Written evaluation with profiling.
+
+### Phase 5: Release (Session 44)
+
+### Session 44 — Comprehensive Benchmark Suite + v4.0.0 Release
+
+**Tasks:**
+- Full benchmark matrix: {BLS12-381, BabyBear, Goldilocks} × {NTT, MSM, Groth16}
+- Publication-quality charts (matplotlib)
+- Update CLAUDE.md with v4.0.0 summary
+- Version bump, tag v4.0.0
 
 ---
 
