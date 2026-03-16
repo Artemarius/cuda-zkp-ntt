@@ -180,6 +180,14 @@ __global__ void bucket_accumulate_kernel(
         uint32_t pt_idx = val & 0x7FFFFFFFu;
         bool negate = (val >> 31) != 0;
 
+        // Prefetch next iteration's point to L1 while EC add computes (~400 cycles)
+        if (i + 1 < end) {
+            uint32_t next_val = d_sorted_packed_values[i + 1];
+            uint32_t next_idx = next_val & 0x7FFFFFFFu;
+            const void* next_ptr = &d_bases[next_idx];
+            asm volatile("prefetch.global.L1 [%0];" : : "l"(next_ptr));
+        }
+
         G1Affine base = d_bases[pt_idx];
         if (negate) {
             base.y = fq_neg(base.y);
@@ -367,6 +375,27 @@ void msm_g1(G1Affine* result,
     int total_windows = num_windows + 1;  // +1 for carry overflow window
     uint32_t num_buckets = (1u << (c - 1)) + 1;  // signed: buckets 0..2^(c-1)
 
+    // ─── L2 cache persistence for base points (Ampere+) ────────────────────
+    // Base points are accessed across ALL windows — pin in L2 for reuse.
+    {
+        int device = 0;
+        cudaGetDevice(&device);
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        if (major >= 8) {
+            size_t base_bytes = n * sizeof(G1Affine);
+            size_t pin_bytes = (base_bytes < 3u * 1024u * 1024u)
+                             ? base_bytes : 3u * 1024u * 1024u;
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr  = (void*)d_bases;
+            attr.accessPolicyWindow.num_bytes = pin_bytes;
+            attr.accessPolicyWindow.hitRatio  = 1.0f;
+            attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+        }
+    }
+
     // ─── Allocate working memory (stream-ordered pool) ────────────────────
     // Using cudaMallocAsync/cudaFreeAsync for automatic allocation caching.
     // The CUDA memory pool reuses allocations across repeated MSM calls,
@@ -511,6 +540,13 @@ void msm_g1(G1Affine* result,
 
     CUDA_CHECK(cudaMemcpyAsync(result, d_result_aff, sizeof(G1Affine), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Reset L2 persistence
+    {
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.num_bytes = 0;
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
 
     // Cleanup (stream-ordered: CUDA memory pool caches for reuse)
     CUDA_CHECK(cudaFreeAsync(d_bucket_ids, stream));
