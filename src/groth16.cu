@@ -825,17 +825,17 @@ Groth16Proof groth16_prove_sparse(const SparseR1CS& r1cs,
     G1Affine* d_bases;
     uint32_t* d_scalars;
 
-    // Upload bases and scalars for π_A MSM
+    // Upload bases asynchronously — overlap H2D with CPU scalar preparation
     CUDA_CHECK(cudaMalloc(&d_bases, nv * sizeof(G1Affine)));
     CUDA_CHECK(cudaMalloc(&d_scalars, nv * 8 * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemcpy(d_bases, pk.u_tau_g1.data(), nv * sizeof(G1Affine), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_bases, pk.u_tau_g1.data(), nv * sizeof(G1Affine), cudaMemcpyHostToDevice, stream));
 
-    // Witness values as scalars (already in standard form)
+    // Witness values as scalars (CPU work overlaps with H2D of bases above)
     std::vector<uint32_t> w_scalars(nv * 8);
     for (size_t i = 0; i < nv; ++i)
         for (int j = 0; j < 8; ++j)
             w_scalars[i * 8 + j] = witness[i].limbs[j];
-    CUDA_CHECK(cudaMemcpy(d_scalars, w_scalars.data(), nv * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_scalars, w_scalars.data(), nv * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
     G1Affine pi_a_msm;
     msm_g1(&pi_a_msm, d_bases, d_scalars, nv, stream);
