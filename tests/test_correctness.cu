@@ -11396,6 +11396,284 @@ int main() {
         }
     }
 
+    // v5.0.0 Session 45: GEMM-NTT DFT-16 via matrix multiply (ConvKyber approach)
+    // Note: CPU reference tests use inline host arithmetic (uint32_t) to avoid
+    // nvcc symbol resolution issues with large compilation units.
+    {
+        printf("\n--- v5.0.0 S45: GEMM-NTT DFT-16 Matrix Multiply ---\n");
+
+        // Host-only helpers for CPU reference (avoid ff_reference.h symbol issues at EOF)
+        constexpr uint32_t bbp = 0x78000001u;
+        auto hbb_mul = [&](uint32_t a, uint32_t b) -> uint32_t {
+            return static_cast<uint32_t>(
+                (static_cast<uint64_t>(a) * b) % bbp);
+        };
+        auto hbb_add = [&](uint32_t a, uint32_t b) -> uint32_t {
+            uint32_t s = a + b;
+            return (s >= bbp) ? s - bbp : s;
+        };
+        auto hbb_sub = [&](uint32_t a, uint32_t b) -> uint32_t {
+            return (a >= b) ? a - b : a + bbp - b;
+        };
+        auto hbb_pow = [&](uint32_t base, uint32_t exp) -> uint32_t {
+            uint64_t r = 1, bb = base;
+            while (exp > 0) {
+                if (exp & 1) r = (r * bb) % bbp;
+                bb = (bb * bb) % bbp;
+                exp >>= 1;
+            }
+            return static_cast<uint32_t>(r);
+        };
+
+        // Compute omega_16 = g^((p-1)/16) where g=31
+        uint32_t omega_16 = hbb_pow(31u, (1u << 23) * 15u);
+
+        // Precompute DFT-16 matrix: Z[i][j] = omega_16^(i*j) mod p
+        uint32_t Zmat[16][16];
+        for (int i = 0; i < 16; ++i)
+            for (int j = 0; j < 16; ++j)
+                Zmat[i][j] = hbb_pow(omega_16, static_cast<uint32_t>((i * j) % 16));
+
+        // CPU NTT-16 reference (Cooley-Tukey, radix-2)
+        auto cpu_ntt16 = [&](uint32_t x[16]) {
+            // Bit-reverse permutation for n=16
+            for (int i = 1, j = 0; i < 16; ++i) {
+                int bit = 8;
+                for (; j & bit; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j) std::swap(x[i], x[j]);
+            }
+            for (int len = 2; len <= 16; len <<= 1) {
+                uint32_t w = hbb_pow(omega_16, 16u / len);
+                for (int i = 0; i < 16; i += len) {
+                    uint32_t wj = 1;
+                    for (int jj = 0; jj < len / 2; ++jj) {
+                        uint32_t u = x[i + jj];
+                        uint32_t v = hbb_mul(x[i + jj + len / 2], wj);
+                        x[i + jj]           = hbb_add(u, v);
+                        x[i + jj + len / 2] = hbb_sub(u, v);
+                        wj = hbb_mul(wj, w);
+                    }
+                }
+            }
+        };
+
+        // Test 1: CPU DFT-16 matrix correctness — Z × x == NTT₁₆(x)
+        {
+            printf("test_gemm_dft16_matrix_vs_scalar_ntt16...\n");
+            int match = 0;
+            const int trials = 1000;
+            for (int trial = 0; trial < trials; ++trial) {
+                uint32_t x[16], x2[16];
+                for (int i = 0; i < 16; ++i) {
+                    x[i] = static_cast<uint32_t>(
+                        (trial * 104729ull + i * 7919ull + 31337ull) % bbp);
+                    x2[i] = x[i];
+                }
+
+                // Method A: matrix multiply Y = Z × X
+                uint32_t y_gemm[16];
+                for (int i = 0; i < 16; ++i) {
+                    uint64_t acc = 0;
+                    for (int j = 0; j < 16; ++j)
+                        acc += static_cast<uint64_t>(Zmat[i][j]) * x[j];
+                    y_gemm[i] = static_cast<uint32_t>(acc % bbp);
+                }
+
+                // Method B: scalar NTT-16
+                cpu_ntt16(x2);
+
+                bool ok = true;
+                for (int i = 0; i < 16; ++i)
+                    if (y_gemm[i] != x2[i]) { ok = false; break; }
+                if (ok) ++match;
+            }
+            TEST_ASSERT(match == trials, "DFT-16 matrix != scalar NTT-16");
+            printf("  DFT-16 matrix vs scalar NTT-16: %d/%d matched\n", match, trials);
+        }
+
+        // Test 2: GPU GEMM-NTT kernel produces valid field elements
+        {
+            printf("test_gemm_ntt_kernel_valid_elements...\n");
+            extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
+
+            const size_t n = 256;
+            std::vector<BabyBearElement> h_data(n);
+            for (size_t i = 0; i < n; ++i)
+                h_data[i] = {static_cast<uint32_t>((i * 7919u + 104729u) % BABYBEAR_P)};
+
+            BabyBearElement* d_data;
+            CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement),
+                                  cudaMemcpyHostToDevice));
+
+            uint32_t processed = ntt_babybear_gemm_dft16(d_data, n, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            std::vector<BabyBearElement> h_result(n);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, n * sizeof(BabyBearElement),
+                                  cudaMemcpyDeviceToHost));
+
+            int valid = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (h_result[i].val < BABYBEAR_P) ++valid;
+
+            TEST_ASSERT(processed == n, "GEMM-NTT kernel failed to process");
+            TEST_ASSERT(valid == static_cast<int>(n), "GEMM-NTT produced out-of-range values");
+            printf("  GEMM-NTT valid elements: %d/%zu (processed=%u)\n", valid, n, processed);
+
+            CUDA_CHECK(cudaFree(d_data));
+        }
+
+        // Test 3: GPU GEMM-NTT kernel correctness vs CPU matrix multiply reference
+        {
+            printf("test_gemm_ntt_kernel_vs_cpu_ref...\n");
+            extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
+
+            for (int log_n = 4; log_n <= 14; ++log_n) {
+                size_t n = 1u << log_n;
+
+                // CPU reference: apply DFT-16 matrix to each group of 16
+                std::vector<uint32_t> cpu_data(n);
+                for (size_t i = 0; i < n; ++i)
+                    cpu_data[i] = static_cast<uint32_t>(
+                        (i * 31337ull + log_n * 42ull) % bbp);
+                for (size_t g = 0; g < n; g += 16) {
+                    uint32_t out[16];
+                    for (int r = 0; r < 16; ++r) {
+                        uint64_t acc = 0;
+                        for (int c = 0; c < 16; ++c)
+                            acc += static_cast<uint64_t>(Zmat[r][c]) * cpu_data[g + c];
+                        out[r] = static_cast<uint32_t>(acc % bbp);
+                    }
+                    for (int r = 0; r < 16; ++r)
+                        cpu_data[g + r] = out[r];
+                }
+
+                // GPU kernel
+                std::vector<BabyBearElement> h_data(n);
+                for (size_t i = 0; i < n; ++i)
+                    h_data[i] = {static_cast<uint32_t>(
+                        (i * 31337ull + log_n * 42ull) % BABYBEAR_P)};
+
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(),
+                    n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+
+                ntt_babybear_gemm_dft16(d_data, n, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                CUDA_CHECK(cudaMemcpy(h_data.data(), d_data,
+                    n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+                int match = 0;
+                for (size_t i = 0; i < n; ++i)
+                    if (h_data[i].val == cpu_data[i]) ++match;
+
+                TEST_ASSERT(match == static_cast<int>(n),
+                    "GEMM-NTT GPU != CPU ref");
+                printf("  GEMM-NTT GPU vs CPU n=2^%d: %d/%zu matched\n",
+                    log_n, match, n);
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
+        }
+
+        // Test 4: GPU GEMM-NTT at various sizes (launch correctness)
+        {
+            printf("test_gemm_ntt_sizes...\n");
+            extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
+
+            for (int log_n = 4; log_n <= 16; ++log_n) {
+                size_t n = 1u << log_n;
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemset(d_data, 0, n * sizeof(BabyBearElement)));
+
+                uint32_t processed = ntt_babybear_gemm_dft16(d_data, n, 0);
+                cudaError_t err = cudaDeviceSynchronize();
+
+                bool ok = (err == cudaSuccess && processed == n);
+                TEST_ASSERT(ok, "GEMM-NTT error at size");
+                printf("  GEMM-NTT n=2^%d: %s\n", log_n, ok ? "OK" : "FAIL");
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
+        }
+
+        // Test 5: GEMM-NTT timing comparison vs v4.0.0 TC and scalar
+        {
+            printf("test_gemm_ntt_timing...\n");
+            extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
+            extern uint32_t ntt_babybear_tc_dft16_stage(BabyBearElement*, size_t, cudaStream_t);
+
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+
+            int sizes[] = {12, 14, 16, 18, 20};
+            for (int si = 0; si < 5; ++si) {
+                int log_n = sizes[si];
+                size_t n = 1u << log_n;
+
+                std::vector<BabyBearElement> h_data(n);
+                for (size_t i = 0; i < n; ++i)
+                    h_data[i] = {static_cast<uint32_t>((i * 31337u + 42u) % BABYBEAR_P)};
+
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+
+                // Warm up
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement),
+                                      cudaMemcpyHostToDevice));
+                ntt_babybear_gemm_dft16(d_data, n, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                // Time GEMM-NTT DFT-16 stage
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement),
+                                      cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_babybear_gemm_dft16(d_data, n, 0);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float gemm_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&gemm_ms, start, stop));
+
+                // Time v4.0.0 TC DFT-16 stage
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement),
+                                      cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_babybear_tc_dft16_stage(d_data, n, 0);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float v4_tc_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&v4_tc_ms, start, stop));
+
+                // Time scalar BabyBear NTT
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement),
+                                      cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_forward_babybear(d_data, n);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float scalar_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&scalar_ms, start, stop));
+
+                float gemm_full_ms = gemm_ms * (log_n / 4.0f);
+                printf("  n=2^%-2d: GEMM=%.3fms (full~%.3fms) | v4TC=%.3fms | Scalar=%.3fms | GEMM/Scalar=%.2fx\n",
+                       log_n, gemm_ms, gemm_full_ms, v4_tc_ms, scalar_ms,
+                       gemm_full_ms / (scalar_ms > 0 ? scalar_ms : 1.0f));
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
+            tests_run++; tests_passed++;  // informational benchmark test
+
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+        }
+    }
+
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }

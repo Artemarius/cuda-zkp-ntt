@@ -858,6 +858,62 @@ inline void bb_ntt_inverse_reference(std::vector<BbRef>& data, size_t n) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GEMM-NTT: DFT-16 via Matrix Multiply for BabyBear (v5.0.0)
+// ConvKyber/TensorFHE approach: replace 4 NTT butterfly stages with a single
+// dense 16×16 matrix multiply. Z[i][j] = ω₁₆^(i·j) mod p where ω₁₆ is the
+// primitive 16th root of unity.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Precompute DFT-16 matrix: Z[i][j] = omega_16^(i*j) mod p
+// Returns 16×16 = 256 BbRef elements in row-major order.
+inline std::vector<BbRef> bb_precompute_dft16_matrix() {
+    BbRef omega_16 = bb_get_root_of_unity(16);
+    std::vector<BbRef> Z(256);
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uint32_t exp = static_cast<uint32_t>((i * j) % 16);
+            Z[i * 16 + j] = bb_pow(omega_16, exp);
+        }
+    }
+    return Z;
+}
+
+// CPU reference: compute Y = Z × X mod p (16-point DFT via matrix multiply).
+// x: input vector of 16 BabyBear elements
+// Returns: output vector of 16 elements = DFT-16(x)
+inline std::vector<BbRef> bb_gemm_ntt_16_ref(
+    const std::vector<BbRef>& Z,
+    const std::vector<BbRef>& x
+) {
+    assert(Z.size() == 256 && x.size() == 16);
+    std::vector<BbRef> y(16, BbRef::zero());
+    for (int i = 0; i < 16; ++i) {
+        BbRef acc = BbRef::zero();
+        for (int j = 0; j < 16; ++j) {
+            acc = bb_add(acc, bb_mul(Z[i * 16 + j], x[j]));
+        }
+        y[i] = acc;
+    }
+    return y;
+}
+
+// CPU reference: batched GEMM-NTT-16. Applies DFT-16 to each consecutive
+// group of 16 elements in data[0..n-1]. n must be a multiple of 16.
+inline void bb_gemm_ntt_16_groups_ref(
+    const std::vector<BbRef>& Z,
+    std::vector<BbRef>& data,
+    size_t n
+) {
+    assert(n % 16 == 0);
+    for (size_t g = 0; g < n; g += 16) {
+        std::vector<BbRef> x(data.begin() + g, data.begin() + g + 16);
+        std::vector<BbRef> y = bb_gemm_ntt_16_ref(Z, x);
+        for (int i = 0; i < 16; ++i)
+            data[g + i] = y[i];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Plantard Modular Arithmetic for BLS12-381
 // NEGATIVE RESULT: 264 MADs vs Montgomery CIOS 136 MADs for 256-bit modulus.
 // Plantard's advantage (eliminating one big-int multiply) only applies to

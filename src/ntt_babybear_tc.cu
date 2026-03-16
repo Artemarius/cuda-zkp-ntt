@@ -1,19 +1,23 @@
 // src/ntt_babybear_tc.cu
-// Tensor Core BabyBear NTT — INT8 WMMA evaluation for modular butterfly operations.
+// Tensor Core BabyBear NTT — INT8 WMMA for modular operations.
 //
-// Approach: Use INT8 WMMA (m16n16k16) to compute batched modular multiplies
-// in the NTT butterfly stage. Each 31-bit BabyBear element is decomposed into
-// 4 INT8 slices. A 16×16 DFT twiddle matrix times 16×16 data matrix computes
-// 16 independent DFT-16 stages via Tensor Cores.
+// Two approaches implemented:
 //
-// Expected result: EVALUATION — BabyBear bb_mul is only 3-5 CUDA core
-// instructions (32×32→64 + constant division), so INT8 slice decomposition
-// overhead likely exceeds the Tensor Core throughput gain. The implementation
-// demonstrates the methodology (TensorFHE/ConvKyber approach).
+// === v4.0.0 (Sessions 39-40): Element-wise DFT-16 via WMMA ===
+// Each 16-element group gets a DFT-16 via 16×16 matrix multiply.
+// Result: NEGATIVE for BabyBear (TC 2-12x slower than CUDA cores).
+// Root cause: bb_mul is only 3-5 instructions; INT8 slice overhead dominates.
+//
+// === v5.0.0 (Sessions 45-49): ConvKyber GEMM-NTT ===
+// Replace entire NTT butterfly stages with batched GEMM on Tensor Cores.
+// Key insight: DFT-16 matrix Z[i][j] = ω₁₆^(i·j) encodes 4 butterfly stages.
+// For B concurrent NTTs: one GEMM Z[16×16] × X[16×(B*n/16)] processes ALL
+// inner DFT-16 stages across all NTTs. Constant-memory DFT matrix avoids
+// per-call allocation. Batched throughput mode for STARK workloads.
 //
 // References:
-// - TensorFHE (arXiv:2212.14191): NTT-as-GEMM on Tensor Cores
-// - ConvKyber (TCHES 2024/095): INT8 WMMA NTT decomposition
+// - ConvKyber (TCHES 2024/095): NTT-as-GEMM, 2-phase batch scheme, 6.47× via batching
+// - TensorFHE (arXiv:2212.14191): NTT on Tensor Cores for FHE
 // - Dissecting Tensor Cores (arXiv:2206.02874): WMMA microbenchmarks
 
 #include "ntt_babybear.cuh"
@@ -283,6 +287,195 @@ uint32_t ntt_babybear_tc_dft16_stage(
         d_data, d_W_slices, static_cast<uint32_t>(n), num_groups);
 
     CUDA_CHECK(cudaFreeAsync(d_W_slices, stream));
+
+    return static_cast<uint32_t>(n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v5.0.0: ConvKyber GEMM-NTT — DFT-16 via batched matrix multiply
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Constant memory for DFT-16 slice matrices ─────────────────────────────
+// 4 slices × 16×16 = 1024 bytes. Shared across all kernel launches.
+// Initialized once on first call via ensure_gemm_dft16_matrix().
+
+static __device__ __constant__ unsigned char c_Z_slices[4 * 256];
+
+static bool s_gemm_dft16_initialized = false;
+
+// Host: compute DFT-16 matrix and upload INT8 slices to constant memory.
+static void ensure_gemm_dft16_matrix() {
+    if (s_gemm_dft16_initialized) return;
+
+    uint32_t omega_16 = get_bb_omega16();
+
+    // Compute Z[i][j] = omega_16^(i*j) mod p, then decompose into 4 UNSIGNED byte slices
+    unsigned char h_Z_slices[4 * 256];
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uint32_t exp = static_cast<uint32_t>((i * j) % 16);
+            uint32_t w = bb_pow_host(omega_16, exp);
+
+            int idx = i * 16 + j;
+            h_Z_slices[0 * 256 + idx] = static_cast<unsigned char>(w & 0xFF);
+            h_Z_slices[1 * 256 + idx] = static_cast<unsigned char>((w >> 8) & 0xFF);
+            h_Z_slices[2 * 256 + idx] = static_cast<unsigned char>((w >> 16) & 0xFF);
+            h_Z_slices[3 * 256 + idx] = static_cast<unsigned char>((w >> 24) & 0x7F);
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyToSymbol(c_Z_slices, h_Z_slices, sizeof(h_Z_slices)));
+    s_gemm_dft16_initialized = true;
+}
+
+// ─── GEMM-NTT kernel: batched DFT-16 via Tensor Core matrix multiply ───────
+// Processes num_groups independent 16-element DFT-16 transforms.
+// Each warp handles 16 consecutive groups (256 elements) via one set of WMMA ops.
+//
+// Layout:
+//   Input:  d_data[group * 16 + row] for group in [0, num_groups), row in [0, 16)
+//   DFT:    Z[16×16] in constant memory (4 INT8 slice matrices)
+//   Output: d_data[group * 16 + row] = sum_j Z[row][j] * X[j] mod p
+//
+// WMMA tiles: A=Z_slice[16×16], B=X_slice[16×16] (16 groups at a time)
+// 16 WMMA calls (4 Z-slices × 4 X-slices), reconstruction via 7 shift levels.
+
+// Shared memory layout per block:
+//   Z_slices (shared across all warps): 4 × 256 bytes = 1024 B — DFT-16 matrix slices
+//   Per warp (9 KB):
+//     X_slices:  4 × 256 bytes (int8_t)  = 1024 B — input data INT8 slices
+//     wmma_tmp:  256 × 4 bytes (int32_t)  = 1024 B — WMMA store buffer
+//     partials:  7 × 256 × 4 bytes (int32_t) = 7168 B — shift level accumulators
+// Total: 1024 + 4 × 9216 = 37888 bytes ≈ 37 KB (fits in 48 KB).
+static constexpr int GEMM_WARPS_PER_BLOCK = 4;
+static constexpr int GEMM_SHMEM_Z_SLICES  = 4 * 256;           // bytes (shared)
+static constexpr int GEMM_SHMEM_X_SLICES  = 4 * 256;           // bytes (per warp)
+static constexpr int GEMM_SHMEM_WMMA_TMP  = 256 * sizeof(int32_t);  // bytes (per warp)
+static constexpr int GEMM_SHMEM_PARTIALS  = 7 * 256 * sizeof(int32_t); // bytes (per warp)
+static constexpr int GEMM_SHMEM_PER_WARP  = GEMM_SHMEM_X_SLICES + GEMM_SHMEM_WMMA_TMP + GEMM_SHMEM_PARTIALS;
+
+__global__ void bb_gemm_ntt_kernel(
+    BabyBearElement* __restrict__ d_data,
+    uint32_t n,
+    uint32_t num_groups
+) {
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t local_warp = threadIdx.x / 32;
+
+    if (warp_id * 16 >= num_groups) return;
+
+    uint32_t group_base = warp_id * 16;
+
+    // Shared memory: Z slices (block-wide) + per-warp regions
+    extern __shared__ char s_raw[];
+    unsigned char* s_Z_slices = reinterpret_cast<unsigned char*>(s_raw);  // 4 × 256 bytes
+    char* warp_base = s_raw + GEMM_SHMEM_Z_SLICES + local_warp * GEMM_SHMEM_PER_WARP;
+    unsigned char* s_X_slices = reinterpret_cast<unsigned char*>(warp_base);
+    int32_t* s_wmma_tmp = reinterpret_cast<int32_t*>(warp_base + GEMM_SHMEM_X_SLICES);
+    int32_t* s_partial  = reinterpret_cast<int32_t*>(warp_base + GEMM_SHMEM_X_SLICES + GEMM_SHMEM_WMMA_TMP);
+
+    // Copy DFT-16 matrix slices from constant memory to shared memory
+    // (WMMA load_matrix_sync requires global or shared memory, not constant)
+    for (uint32_t t = threadIdx.x; t < 4 * 256; t += blockDim.x)
+        s_Z_slices[t] = c_Z_slices[t];
+    __syncthreads();  // All warps must see Z slices before proceeding
+
+    // Load data into shared memory as unsigned byte slices
+    // X[row][col] where row = element within group (0..15), col = which group (0..15)
+    for (uint32_t t = lane; t < 256; t += 32) {
+        uint32_t row = t / 16;
+        uint32_t col = t % 16;
+        uint32_t global_idx = (group_base + col) * 16 + row;
+        uint32_t val = (global_idx < n) ? d_data[global_idx].val : 0;
+
+        s_X_slices[0 * 256 + row * 16 + col] = static_cast<unsigned char>(val & 0xFF);
+        s_X_slices[1 * 256 + row * 16 + col] = static_cast<unsigned char>((val >> 8) & 0xFF);
+        s_X_slices[2 * 256 + row * 16 + col] = static_cast<unsigned char>((val >> 16) & 0xFF);
+        s_X_slices[3 * 256 + row * 16 + col] = static_cast<unsigned char>((val >> 24) & 0x7F);
+    }
+    __syncwarp();
+
+    // Zero partial products (7 shift levels × 256 entries)
+    for (uint32_t t = lane; t < 7 * 256; t += 32)
+        s_partial[t] = 0;
+    __syncwarp();
+
+    // 16 WMMA calls: C_st = Z_slice_s × X_slice_t → shift level (s+t)
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, unsigned char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, unsigned char, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> c_frag;
+
+    for (int s = 0; s < 4; ++s) {
+        // Load Z slice s from shared memory (DFT-16 matrix)
+        wmma::load_matrix_sync(a_frag, s_Z_slices + s * 256, 16);
+
+        for (int t = 0; t < 4; ++t) {
+            int shift_level = s + t;
+
+            // Load X slice t from shared memory
+            wmma::load_matrix_sync(b_frag, s_X_slices + t * 256, 16);
+
+            // C = Z_s × X_t (INT8 → INT32)
+            wmma::fill_fragment(c_frag, 0);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+            // Store WMMA result to temp buffer, then accumulate into partials
+            wmma::store_matrix_sync(s_wmma_tmp, c_frag, 16, wmma::mem_row_major);
+            __syncwarp();
+
+            for (uint32_t idx = lane; idx < 256; idx += 32)
+                s_partial[shift_level * 256 + idx] += s_wmma_tmp[idx];
+            __syncwarp();
+        }
+    }
+
+    // Reconstruction: combine 7 shift levels into full product, reduce mod p
+    for (uint32_t t = lane; t < 256; t += 32) {
+        uint32_t row = t / 16;
+        uint32_t col = t % 16;
+
+        // Reconstruct from 7 shifted partial sums (all non-negative with unsigned WMMA)
+        uint64_t full = 0;
+        for (int level = 0; level < 7; ++level) {
+            // Partial products from unsigned WMMA are non-negative int32
+            uint64_t partial = static_cast<uint64_t>(
+                static_cast<uint32_t>(s_partial[level * 256 + t]));
+            full += partial << (8 * level);
+        }
+
+        // Reduce mod p
+        uint32_t result = static_cast<uint32_t>(full % BABYBEAR_P);
+
+        uint32_t global_idx = (group_base + col) * 16 + row;
+        if (global_idx < n)
+            d_data[global_idx] = {result};
+    }
+}
+
+// ─── Public API: GEMM-NTT DFT-16 stage (v5.0.0) ────────────────────────────
+// Applies DFT-16 to each consecutive group of 16 elements in d_data.
+// Uses constant-memory DFT matrix (allocated once, reused across calls).
+// Returns: number of elements processed, or 0 on failure.
+
+uint32_t ntt_babybear_gemm_dft16(
+    BabyBearElement* d_data, size_t n, cudaStream_t stream
+) {
+    if (n < 16 || (n % 16) != 0) return 0;
+
+    ensure_gemm_dft16_matrix();
+
+    uint32_t num_groups = static_cast<uint32_t>(n) / 16;
+
+    // Each warp handles 16 groups. GEMM_WARPS_PER_BLOCK warps per block.
+    uint32_t num_warps = (num_groups + 15) / 16;
+    uint32_t threads_per_block = GEMM_WARPS_PER_BLOCK * 32;
+    uint32_t num_blocks = (num_warps + GEMM_WARPS_PER_BLOCK - 1) / GEMM_WARPS_PER_BLOCK;
+
+    size_t shmem = GEMM_SHMEM_Z_SLICES + GEMM_WARPS_PER_BLOCK * GEMM_SHMEM_PER_WARP;
+
+    bb_gemm_ntt_kernel<<<num_blocks, threads_per_block, shmem, stream>>>(
+        d_data, static_cast<uint32_t>(n), num_groups);
 
     return static_cast<uint32_t>(n);
 }
