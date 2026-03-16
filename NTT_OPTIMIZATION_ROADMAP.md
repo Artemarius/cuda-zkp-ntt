@@ -1,10 +1,11 @@
 # NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v4.0.0, Session 44)
+## Current State (v4.0.0, Session 44 — v5.0.0 in progress)
 
 **NTT (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
 **MSM (n=2^18):** 1.2s (35.8x vs v2.0.0), 247 pts/ms at n=2^20
+**v5.0.0 (in progress):** GEMM-NTT sprint — ConvKyber approach, DFT-as-matrix-multiply on Tensor Cores.
 **v4.0.0:** Hardware-accelerated sprint: L2 persistence, fp_ldg, prefetch, WMMA eval, multi-stream. 1025 tests.
 **v3.0.0:** Full prove→verify loop complete. Pairing + Groth16 verification. 1009 tests.
 **v2.2.0:** Fibonacci circuit + batch pipeline. GPU 55-139x over CPU. 870 tests.
@@ -2047,6 +2048,102 @@ this is a fundamental mismatch, not an implementation gap.
 
 ---
 
+## v5.0.0 — GEMM-NTT Sprint: ConvKyber Approach (Sessions 45–49)
+
+**Goal:** Replace entire NTT butterfly stages with dense matrix multiplication (GEMM)
+on Tensor Cores, following the ConvKyber/TensorFHE approach. Unlike v4.0.0's element-wise
+WMMA (which replaced individual modular multiplies), GEMM-NTT replaces **entire NTT stages**
+with a single precomputed DFT matrix multiply: Y = Z × X where Z encodes 4 butterfly stages.
+
+**Key difference from v4.0.0:** v4.0.0 decomposed each `w_i × b_i` into 16 WMMA calls
+(~50 instructions replacing 3–5 scalar). GEMM-NTT amortizes WMMA overhead across 16
+elements simultaneously — one GEMM replaces 32 butterfly operations. The win comes from
+TC/CUDA-core concurrency, batching (B NTTs fill WMMA tiles), and memory traffic reduction
+(one GEMM read/write replaces 4 kernel launches). Target: batched BabyBear NTT for STARKs.
+
+**Risk assessment:** Single-NTT latency likely break-even or slower (high confidence).
+Batched throughput at B≥64 has ~50% chance of 10–30% improvement, ~25% chance of 2–4×.
+Worst case: documented negative result comparing two fundamentally different TC approaches.
+
+### Session 45 — DFT-16 Matrix Precomputation + CPU Reference
+
+**Objective:** Implement precomputed DFT matrices for BabyBear 16-point sub-NTTs
+and validate the mathematical foundation for GEMM-NTT.
+
+**Tasks:**
+1. Precompute DFT-16 matrix over BabyBear: `Z[i][j] = ω₁₆^(i·j) mod p` for 0 ≤ i,j < 16
+   where ω₁₆ is a primitive 16th root of unity mod BabyBear (p = 2^31 − 2^27 + 1)
+2. Precompute INT8 slice matrices: split each Z[i][j] (31-bit) into 4 unsigned bytes
+   → Z_s0[16×16], Z_s1[16×16], Z_s2[16×16], Z_s3[16×16] for WMMA (u8 → s32)
+3. CPU reference: `gemm_ntt_16_ref(Z, x)` = modular matrix-vector multiply
+   Validate against scalar NTT₁₆ for 1000+ random inputs
+4. GPU kernel: `bb_gemm_dft16_kernel` — one GEMM per 16-element group
+   Shared DFT matrix in constant memory, batch of (n/16) groups
+5. Tests: DFT-16 matrix correctness, CPU ref vs scalar NTT₁₆, GPU kernel vs CPU ref
+   Target: all existing 1025 tests pass + new GEMM-NTT tests
+
+### Session 46 — Batched GEMM-NTT Kernel (Throughput Mode)
+
+**Objective:** Implement and benchmark batched GEMM-NTT for B simultaneous NTTs.
+This is the **critical experiment** — if GEMM-NTT beats scalar at B≥64, it's a win
+for STARK workloads.
+
+**Tasks:**
+1. Batch layout for WMMA: X[16][B] columns, Z[16×16] shared, Y = Z × X mod p
+   INT8 slice decomposition: Z_s[4][16×16], X_s[4][16×B], partial products P[i][j],
+   reconstruction via 7 shift levels, modular reduction
+2. WMMA kernel: each warp processes 16×16 WMMA tiles across B columns
+   B must be multiple of 16 (WMMA tile width). Minimum batch: B=16
+3. Benchmark batched GEMM-NTT vs scalar batched BabyBear NTT:
+   - Batch sizes: B = {16, 64, 256, 1024, 4096}
+   - Metric: time per NTT element (throughput, ns/element)
+4. Profile: verify TC utilization (sm__inst_executed_pipe_tensor > 0)
+
+### Session 47 — Full NTT via Hierarchical GEMM Decomposition
+
+**Objective:** Implement full n-point NTT using GEMM-NTT for inner stages + existing
+scalar kernels for outer stages. Benchmark for realistic sizes.
+
+**Tasks:**
+1. Hierarchical decomposition: n = 16 × m
+   - Step 1: m independent 16-point sub-NTTs via GEMM (batch B=m)
+   - Step 2: twiddle multiply (element-wise, CUDA cores)
+   - Step 3: 16 independent m-point sub-NTTs via scalar BabyBear NTT
+2. Alternative: deeper GEMM hierarchy (n = 16^k × remainder)
+   - Multiple GEMM levels with twiddle multiplies between levels
+   - Find optimal depth (more GEMM levels vs more twiddle overhead)
+3. Benchmark at n = {2^16, 2^18, 2^20, 2^22}:
+   - Single NTT (latency): GEMM-NTT vs scalar
+   - 8× batched: GEMM-NTT vs scalar
+   - 64× batched: GEMM-NTT vs scalar
+   - Key: find break-even batch size
+
+### Session 48 — cuBLAS INT8 GEMM Comparison + Optimization
+
+**Objective:** Compare hand-written WMMA kernel against cuBLAS INT8 GEMM for the
+sub-NTT GEMM step. cuBLAS may outperform for large B due to better tiling.
+
+**Tasks:**
+1. cuBLAS INT8 GEMM baseline: `cublasGemmEx(CUDA_R_8I, CUDA_R_32I)` for each
+   slice pair, compare against hand-written WMMA
+2. Profile: hand-written WMMA vs cuBLAS for B = {16, 256, 4096}
+3. Optimize winner: shared memory staging, slice decomposition pipelining
+4. Final benchmark table: all approaches at all batch sizes
+
+### Session 49 — Documentation + Release v5.0.0
+
+**Tasks:**
+1. Comprehensive benchmark table comparing:
+   - BabyBear scalar (v4.0.0), element-wise TC (v4.0.0), GEMM-NTT (v5.0.0)
+   - Single, 8× batch, 64× batch at n=2^20
+2. Document ConvKyber adaptation: mathematical derivation, INT8 scheme,
+   batching strategy, when GEMM-NTT wins vs loses
+3. README update: add GEMM-NTT section with results
+4. Update CLAUDE.md with v5.0.0 summary
+5. Tag v5.0.0, release notes
+
+---
+
 ## References
 
 - **MoMA**: Zhang & Franchetti, "Code Generation for Cryptographic Kernels using Multi-word
@@ -2079,5 +2176,9 @@ this is a fundamental mismatch, not an implementation gap.
   — Stockham GPU benchmarks
 - **Plantard**: "Efficient Word Size Modular Arithmetic", IEEE TETC 2021.
   [PDF](https://thomas-plantard.github.io/pdf/Plantard21.pdf)
+- **ConvKyber**: Zhou, Zheng et al., TCHES 2024 — NTT-as-GEMM, 2-phase batch scheme,
+  INT8 WMMA for Kyber NTT. 6.47× throughput via batched matrix multiply
+- **TensorFHE**: Fan et al., arXiv:2212.14191, 2023 — NTT on Tensor Cores for FHE,
+  GEMM-TCU workflow for polynomial arithmetic
 - NVIDIA CUDA Programming Guide — §3.2.11 CUDA Graphs, §5.2 Memory Hierarchy
 - Nsight Compute Documentation — L2 cache metrics, roofline analysis
