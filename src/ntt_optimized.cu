@@ -169,7 +169,7 @@ __global__ void ntt_outer_radix4_kernel(
             // Load + stage s: two radix-2 butterflies with same twiddle
             FpElement a0 = data[base];
             FpElement a1 = data[base + half];
-            FpElement w1 = twiddles[j * stride];
+            FpElement w1 = fp_ldg(&twiddles[j * stride]);
 
             FpElement t1 = ff_mul_ptx(a1, w1);
             FpElement a0p = ff_add_v2(a0, t1);
@@ -183,12 +183,12 @@ __global__ void ntt_outer_radix4_kernel(
             FpElement a3p = ff_sub_v2(a2, t2);
 
             // Stage s+1: two radix-2 butterflies with different twiddles
-            FpElement w2 = twiddles[j * stride2];
+            FpElement w2 = fp_ldg(&twiddles[j * stride2]);
             FpElement t3 = ff_mul_ptx(a2p, w2);
             data[base]              = ff_add_v2(a0p, t3);
             data[base + (half << 1)] = ff_sub_v2(a0p, t3);
 
-            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement w3 = fp_ldg(&twiddles[(j + half) * stride2]);
             FpElement t4 = ff_mul_ptx(a3p, w3);
             data[base + half]              = ff_add_v2(a1p, t4);
             data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
@@ -660,7 +660,7 @@ __global__ void ntt_outer_radix4_barrett_kernel(
 
             FpElement a0 = data[base];
             FpElement a1 = data[base + half];
-            FpElement w1 = twiddles[j * stride];
+            FpElement w1 = fp_ldg(&twiddles[j * stride]);
 
             FpElement t1 = ff_mul_barrett_v2(a1, w1);
             FpElement a0p = ff_add_v2(a0, t1);
@@ -673,12 +673,12 @@ __global__ void ntt_outer_radix4_barrett_kernel(
             FpElement a2p = ff_add_v2(a2, t2);
             FpElement a3p = ff_sub_v2(a2, t2);
 
-            FpElement w2 = twiddles[j * stride2];
+            FpElement w2 = fp_ldg(&twiddles[j * stride2]);
             FpElement t3 = ff_mul_barrett_v2(a2p, w2);
             data[base]              = ff_add_v2(a0p, t3);
             data[base + (half << 1)] = ff_sub_v2(a0p, t3);
 
-            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement w3 = fp_ldg(&twiddles[(j + half) * stride2]);
             FpElement t4 = ff_mul_barrett_v2(a3p, w3);
             data[base + half]              = ff_add_v2(a1p, t4);
             data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
@@ -1045,7 +1045,7 @@ __global__ void ntt_outer_radix4_batch_kernel(
 
             FpElement a0 = data[base];
             FpElement a1 = data[base + half];
-            FpElement w1 = twiddles[j * stride];
+            FpElement w1 = fp_ldg(&twiddles[j * stride]);
 
             FpElement t1 = ff_mul_ptx(a1, w1);
             FpElement a0p = ff_add_v2(a0, t1);
@@ -1058,12 +1058,12 @@ __global__ void ntt_outer_radix4_batch_kernel(
             FpElement a2p = ff_add_v2(a2, t2);
             FpElement a3p = ff_sub_v2(a2, t2);
 
-            FpElement w2 = twiddles[j * stride2];
+            FpElement w2 = fp_ldg(&twiddles[j * stride2]);
             FpElement t3 = ff_mul_ptx(a2p, w2);
             data[base]              = ff_add_v2(a0p, t3);
             data[base + (half << 1)] = ff_sub_v2(a0p, t3);
 
-            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement w3 = fp_ldg(&twiddles[(j + half) * stride2]);
             FpElement t4 = ff_mul_ptx(a3p, w3);
             data[base + half]              = ff_add_v2(a1p, t4);
             data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
@@ -1103,7 +1103,7 @@ __global__ void ntt_outer_radix4_batch_barrett_kernel(
 
             FpElement a0 = data[base];
             FpElement a1 = data[base + half];
-            FpElement w1 = twiddles[j * stride];
+            FpElement w1 = fp_ldg(&twiddles[j * stride]);
 
             FpElement t1 = ff_mul_barrett_v2(a1, w1);
             FpElement a0p = ff_add_v2(a0, t1);
@@ -1116,12 +1116,12 @@ __global__ void ntt_outer_radix4_batch_barrett_kernel(
             FpElement a2p = ff_add_v2(a2, t2);
             FpElement a3p = ff_sub_v2(a2, t2);
 
-            FpElement w2 = twiddles[j * stride2];
+            FpElement w2 = fp_ldg(&twiddles[j * stride2]);
             FpElement t3 = ff_mul_barrett_v2(a2p, w2);
             data[base]              = ff_add_v2(a0p, t3);
             data[base + (half << 1)] = ff_sub_v2(a0p, t3);
 
-            FpElement w3 = twiddles[(j + half) * stride2];
+            FpElement w3 = fp_ldg(&twiddles[(j + half) * stride2]);
             FpElement t4 = ff_mul_barrett_v2(a3p, w3);
             data[base + half]              = ff_add_v2(a1p, t4);
             data[base + (half << 1) + half] = ff_sub_v2(a1p, t4);
@@ -1180,7 +1180,7 @@ __global__ void ntt_outer_radix8_kernel(
             FpElement a7 = data[base + (h << 2) + (h << 1) + h];
 
             // Stage s: 4 radix-2 butterflies with w1 — pairs h apart
-            FpElement w1 = twiddles[j * stride_s];
+            FpElement w1 = fp_ldg(&twiddles[j * stride_s]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1190,8 +1190,8 @@ __global__ void ntt_outer_radix8_kernel(
             }
 
             // Stage s+1: 4 radix-2 butterflies — pairs 2h apart
-            FpElement w2 = twiddles[j * stride_s1];
-            FpElement w3 = twiddles[(j + h) * stride_s1];
+            FpElement w2 = fp_ldg(&twiddles[j * stride_s1]);
+            FpElement w3 = fp_ldg(&twiddles[(j + h) * stride_s1]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1201,10 +1201,10 @@ __global__ void ntt_outer_radix8_kernel(
             }
 
             // Stage s+2: 4 radix-2 butterflies — pairs 4h apart
-            FpElement w4 = twiddles[j * stride_s2];
-            FpElement w5 = twiddles[(j + h) * stride_s2];
-            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
-            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            FpElement w4 = fp_ldg(&twiddles[j * stride_s2]);
+            FpElement w5 = fp_ldg(&twiddles[(j + h) * stride_s2]);
+            FpElement w6 = fp_ldg(&twiddles[(j + (h << 1)) * stride_s2]);
+            FpElement w7 = fp_ldg(&twiddles[(j + (h << 1) + h) * stride_s2]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
@@ -1257,7 +1257,7 @@ __global__ void ntt_outer_radix8_barrett_kernel(
             FpElement a7 = data[base + (h << 2) + (h << 1) + h];
 
             // Stage s
-            FpElement w1 = twiddles[j * stride_s];
+            FpElement w1 = fp_ldg(&twiddles[j * stride_s]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1267,8 +1267,8 @@ __global__ void ntt_outer_radix8_barrett_kernel(
             }
 
             // Stage s+1
-            FpElement w2 = twiddles[j * stride_s1];
-            FpElement w3 = twiddles[(j + h) * stride_s1];
+            FpElement w2 = fp_ldg(&twiddles[j * stride_s1]);
+            FpElement w3 = fp_ldg(&twiddles[(j + h) * stride_s1]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1278,10 +1278,10 @@ __global__ void ntt_outer_radix8_barrett_kernel(
             }
 
             // Stage s+2
-            FpElement w4 = twiddles[j * stride_s2];
-            FpElement w5 = twiddles[(j + h) * stride_s2];
-            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
-            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            FpElement w4 = fp_ldg(&twiddles[j * stride_s2]);
+            FpElement w5 = fp_ldg(&twiddles[(j + h) * stride_s2]);
+            FpElement w6 = fp_ldg(&twiddles[(j + (h << 1)) * stride_s2]);
+            FpElement w7 = fp_ldg(&twiddles[(j + (h << 1) + h) * stride_s2]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
@@ -1334,7 +1334,7 @@ __global__ void ntt_outer_radix8_batch_kernel(
             FpElement a7 = data[base + (h << 2) + (h << 1) + h];
 
             // Stage s
-            FpElement w1 = twiddles[j * stride_s];
+            FpElement w1 = fp_ldg(&twiddles[j * stride_s]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1344,8 +1344,8 @@ __global__ void ntt_outer_radix8_batch_kernel(
             }
 
             // Stage s+1
-            FpElement w2 = twiddles[j * stride_s1];
-            FpElement w3 = twiddles[(j + h) * stride_s1];
+            FpElement w2 = fp_ldg(&twiddles[j * stride_s1]);
+            FpElement w3 = fp_ldg(&twiddles[(j + h) * stride_s1]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1355,10 +1355,10 @@ __global__ void ntt_outer_radix8_batch_kernel(
             }
 
             // Stage s+2
-            FpElement w4 = twiddles[j * stride_s2];
-            FpElement w5 = twiddles[(j + h) * stride_s2];
-            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
-            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            FpElement w4 = fp_ldg(&twiddles[j * stride_s2]);
+            FpElement w5 = fp_ldg(&twiddles[(j + h) * stride_s2]);
+            FpElement w6 = fp_ldg(&twiddles[(j + (h << 1)) * stride_s2]);
+            FpElement w7 = fp_ldg(&twiddles[(j + (h << 1) + h) * stride_s2]);
             {
                 FpElement t;
                 t = ff_mul_ptx(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);
@@ -1411,7 +1411,7 @@ __global__ void ntt_outer_radix8_batch_barrett_kernel(
             FpElement a7 = data[base + (h << 2) + (h << 1) + h];
 
             // Stage s
-            FpElement w1 = twiddles[j * stride_s];
+            FpElement w1 = fp_ldg(&twiddles[j * stride_s]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a1, w1); { FpElement tmp = ff_add_v2(a0, t); a1 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1421,8 +1421,8 @@ __global__ void ntt_outer_radix8_batch_barrett_kernel(
             }
 
             // Stage s+1
-            FpElement w2 = twiddles[j * stride_s1];
-            FpElement w3 = twiddles[(j + h) * stride_s1];
+            FpElement w2 = fp_ldg(&twiddles[j * stride_s1]);
+            FpElement w3 = fp_ldg(&twiddles[(j + h) * stride_s1]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a2, w2); { FpElement tmp = ff_add_v2(a0, t); a2 = ff_sub_v2(a0, t); a0 = tmp; }
@@ -1432,10 +1432,10 @@ __global__ void ntt_outer_radix8_batch_barrett_kernel(
             }
 
             // Stage s+2
-            FpElement w4 = twiddles[j * stride_s2];
-            FpElement w5 = twiddles[(j + h) * stride_s2];
-            FpElement w6 = twiddles[(j + (h << 1)) * stride_s2];
-            FpElement w7 = twiddles[(j + (h << 1) + h) * stride_s2];
+            FpElement w4 = fp_ldg(&twiddles[j * stride_s2]);
+            FpElement w5 = fp_ldg(&twiddles[(j + h) * stride_s2]);
+            FpElement w6 = fp_ldg(&twiddles[(j + (h << 1)) * stride_s2]);
+            FpElement w7 = fp_ldg(&twiddles[(j + (h << 1) + h) * stride_s2]);
             {
                 FpElement t;
                 t = ff_mul_barrett_v2(a4, w4); data[base]                                   = ff_add_v2(a0, t); data[base + (h << 2)]                    = ff_sub_v2(a0, t);

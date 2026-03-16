@@ -60,6 +60,20 @@ struct __align__(32) FpElement {
     }
 };
 
+// ─── Read-Only Cache Load (Ampere+) ─────────────────────────────────────────
+// Load FpElement via the read-only data cache (__ldg), bypassing L1 for
+// read-only data like twiddle factors. On Ampere (sm_80+) this maps to
+// ld.global.nc instructions which use a separate cache path from normal loads.
+
+__device__ __forceinline__
+FpElement fp_ldg(const FpElement* __restrict__ ptr) {
+    FpElement r;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+        r.limbs[i] = __ldg(&ptr->limbs[i]);
+    return r;
+}
+
 // ─── Device Inline Functions ─────────────────────────────────────────────────
 // Phase 2: real implementations of finite-field arithmetic.
 // All operations assume inputs are in Montgomery form and produce
