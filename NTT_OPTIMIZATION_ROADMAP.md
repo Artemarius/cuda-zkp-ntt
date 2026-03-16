@@ -1,10 +1,11 @@
 # NTT Optimization Roadmap & Groth16 Primitives
 
-## Current State (v3.0.0, Session 35)
+## Current State (v4.0.0, Session 44)
 
 **NTT (RTX 3060 Laptop, n=2^22):** 15.1 ms Montgomery / 17.5 ms Barrett (single NTT, compute only)
 **Multi-field (n=2^22):** Goldilocks 3.6 ms (4.2x vs BLS), BabyBear 2.4 ms (6.2x vs BLS)
 **MSM (n=2^18):** 1.2s (35.8x vs v2.0.0), 247 pts/ms at n=2^20
+**v4.0.0:** Hardware-accelerated sprint: L2 persistence, fp_ldg, prefetch, WMMA eval, multi-stream. 1025 tests.
 **v3.0.0:** Full prove→verify loop complete. Pairing + Groth16 verification. 1009 tests.
 **v2.2.0:** Fibonacci circuit + batch pipeline. GPU 55-139x over CPU. 870 tests.
 **v2.1.0:** Production MSM (signed-digit, parallel reduction, memory pools). 701 tests.
@@ -1895,7 +1896,7 @@ Complete the prove→verify loop. Mathematical capstone of the project.
 > v2.1.0: "cuZK-style parallel MSM closes the gap (>20x speedup)"
 > v2.2.0: "Fibonacci shows GPU = 55-141x CPU — GPU wins decisively"
 > v3.0.0: "Full prove→verify loop with pairing verification" ✅
-> v4.0.0: "Exploit every hardware unit — Tensor Cores, cp.async, L2 persistence, multi-stream"
+> v4.0.0: "Systematic hardware evaluation — L2/prefetch wins, Tensor/RT Cores don't help for ZKP" ✅
 
 ---
 
@@ -1914,9 +1915,7 @@ Renumbered from 12 to 9 sessions.
 RTX 3060 has only 4 MB L2 vs 128+ MB working set at n=2^22. Ampere `cp.async` enables
 global→shared copies bypassing registers; L2 residency controls can pin twiddle factors.
 
-### Session 36 — cp.async Infrastructure + L2 Residency Controls
-
-**Objective:** Add L2 cache persistence for twiddle factors and async prefetch infrastructure.
+### Session 36 — cp.async Infrastructure + L2 Residency Controls ✅ COMPLETE
 
 **Tasks:**
 - L2 cache persistence for twiddle table via `cudaStreamAttrValue`/`accessPolicyWindow`
@@ -1926,9 +1925,7 @@ global→shared copies bypassing registers; L2 residency controls can pin twiddl
 - Benchmark: NTT at n=2^22, 2^20, 2^18 — measure L2 hit rate improvement
 - Correctness: all existing NTT tests must pass unchanged
 
-### Session 37 — Multi-Stage Pipeline + Prefetch Tuning
-
-**Objective:** Tune L2 residency parameters and evaluate deeper async pipeline.
+### Session 37 — Multi-Stage Pipeline + Prefetch Tuning ✅ COMPLETE
 
 **Tasks:**
 - Tune `accessPolicyWindow` parameters (hitRatio, num_bytes, various twiddle subsets)
@@ -1936,9 +1933,7 @@ global→shared copies bypassing registers; L2 residency controls can pin twiddl
 - Evaluate `cp.async` for small twiddle tiles into shared memory
 - Target: 15–30% outer stage latency reduction vs v3.0.0 baseline
 
-### Session 38 — Async Prefetch for MSM Bucket Accumulation
-
-**Objective:** Apply async prefetch to MSM point loads during bucket accumulation.
+### Session 38 — Async Prefetch for MSM Bucket Accumulation ✅ COMPLETE
 
 **Tasks:**
 - Profile MSM bucket accumulation (v2.1.0) with Nsight Compute
@@ -1992,9 +1987,7 @@ the slice overhead, which requires multiply cost >> reconstruction cost.
 **Rationale:** Groth16 executes NTT→INTT→coset-NTT→pointwise→coset-INTT→MSM sequentially.
 With 3 polynomials (A, B, C), stages can overlap across CUDA streams.
 
-### Session 41 — Multi-Stream Groth16 Pipeline
-
-**Objective:** Overlap A/B/C polynomial processing across CUDA streams.
+### Session 41 — Multi-Stream Groth16 Pipeline ✅ COMPLETE
 
 **Tasks:**
 - Profile current pipeline with Nsight Systems (identify serialization + idle time)
@@ -2002,9 +1995,7 @@ With 3 polynomials (A, B, C), stages can overlap across CUDA streams.
 - Overlap H→D transfer of trusted setup with NTT computation
 - Benchmark at n = 2^10 → 2^16
 
-### Session 42 — Pipelined MSM with Transfer Overlap
-
-**Objective:** Overlap scalar transfer with MSM bucket accumulation.
+### Session 42 — Pipelined MSM with Transfer Overlap ✅ COMPLETE
 
 **Tasks:**
 - Double-buffer scalar transfer with bucket accumulation (2 streams)
@@ -2045,13 +2036,14 @@ this is a fundamental mismatch, not an implementation gap.
 
 ### Phase 5: Release (Session 44)
 
-### Session 44 — Comprehensive Benchmark Suite + v4.0.0 Release
+### Session 44 — Comprehensive Benchmark Suite + v4.0.0 Release ✅ COMPLETE
 
-**Tasks:**
-- Full benchmark matrix: {BLS12-381, BabyBear, Goldilocks} × {NTT, MSM, Groth16}
-- Publication-quality charts (matplotlib)
-- Update CLAUDE.md with v4.0.0 summary
-- Version bump, tag v4.0.0
+**Summary:** All sessions S36-S44 complete. 1025 tests. Key findings:
+- L2 persistence + fp_ldg(): transparent cache optimizations for NTT twiddles
+- Software prefetch: hides DRAM latency in MSM bucket accumulation
+- INT8 Tensor Core NTT: **evaluation negative** for BabyBear (31-bit field too small)
+- Multi-stream Groth16: H2D overlap with cooperative NTT (limited by SM blocking)
+- RT Core evaluation: **all candidates negative** (no spatial structure in ZKP ops)
 
 ---
 

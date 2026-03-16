@@ -6,11 +6,14 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, end-to-end Groth16 prover, and pairing-based verification.
 
-- **v4.0.0** (S36+ in progress): Hardware-accelerated sprint — L2 cache residency controls
-  for twiddle factor persistence (Ampere accessPolicyWindow API, up to 3 MB pinned in 4 MB L2,
-  streaming hints for NTT data), integrated into all OPTIMIZED/BARRETT NTT dispatch paths
-  (forward/inverse/batch), CUDA Graph capture compatible (auto-skip during capture).
-  1013 tests (4 new L2 persistence tests).
+- **v4.0.0** (S36-S44 complete): Hardware-accelerated sprint — L2 cache residency controls
+  for twiddle persistence (Ampere accessPolicyWindow, 3 MB pinned), fp_ldg() read-only cache
+  for all outer-stage twiddle loads, software prefetch (prefetch.global.L1) for MSM bucket
+  accumulation point loads, INT8 Tensor Core BabyBear NTT via WMMA DFT-16 (evaluation:
+  TC 2-12x slower than CUDA cores for 31-bit field — slice overhead exceeds trivial multiply),
+  multi-stream H2D overlap in Groth16 prover (transfer stream overlaps with cooperative NTT),
+  async H2D for MSM bases, RT Core feasibility study (all negative — algebraic ops have no
+  spatial structure). 1025 tests.
 - **v3.0.0** (S31-S35 complete): Full pairing verification — Fq6 cubic extension over Fq2
   (Karatsuba 6 Fq2 muls, CH-SQR2 sqr, inverse via norm, sparse mul_by_01/mul_by_1 for
   Miller loop, Frobenius map); Fq12 quadratic extension over Fq6 (Karatsuba 3 Fq6 muls,
@@ -241,6 +244,7 @@ src/
   ntt_async.cu        — Double-buffered async pipeline NTT
   ntt_goldilocks.cu   — Goldilocks NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
   ntt_babybear.cu     — BabyBear NTT: fused K=8-11 + cooperative radix-8/4/2 outer + batched
+  ntt_babybear_tc.cu  — Tensor Core BabyBear NTT: INT8 WMMA DFT-16 (evaluation, slower than CUDA cores)
   ec_kernels.cu       — G1/G2 GPU test kernels
   pairing_kernels.cu  — Miller loop GPU kernel + device functions (NO RDC, __noinline__ wrappers)
   msm.cu              — Pippenger MSM (separate TU, no RDC — CUB compatibility)
@@ -481,9 +485,14 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v3.0.0 complete).
 
-Phases 1-8 complete. Current version: **v4.0.0-dev** (Session 36 complete, 1013 tests).
+Phases 1-8 complete. Current version: **v4.0.0** (Session 44 complete, 1025 tests).
 
 ### Completed Releases
+- **v4.0.0** — Hardware-accelerated sprint. L2 cache persistence for twiddle factors
+  (Ampere accessPolicyWindow), fp_ldg() read-only cache for outer-stage twiddle loads,
+  software prefetch for MSM bucket accumulation, INT8 Tensor Core BabyBear NTT (WMMA
+  DFT-16 evaluation — TC slower for 31-bit field), multi-stream H2D overlap in Groth16,
+  RT Core feasibility study (all negative). Sessions 36-44. 1025 tests (16 new over v3.0.0).
 - **v3.0.0** — Full pairing verification + Groth16 prove→verify loop. Fq6/Fq12 tower
   arithmetic, Miller loop (optimal Ate), final exponentiation, VerifyingKey with γ and IC
   points, `groth16_verify()` via multi-Miller loop (4 pairings + 1 final exp), pi_C fix
