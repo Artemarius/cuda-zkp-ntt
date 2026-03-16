@@ -78,6 +78,16 @@ set_target_properties(pairing_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
+# ─── BabyBear Tensor Core NTT (NO RDC) ──────────────────────────────────────
+# WMMA templates create large fatbin entries. Compiled without RDC to avoid
+# device-link step issues. All device functions inlined from headers.
+add_library(bb_tc_lib STATIC
+    src/ntt_babybear_tc.cu
+)
+set_target_properties(bb_tc_lib PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
 # ─── Core Library ─────────────────────────────────────────────────────────────
 # Finite-field arithmetic and NTT kernels compiled as a static library
 add_library(zkp_ntt_core STATIC
@@ -98,7 +108,7 @@ set_target_properties(zkp_ntt_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 # Link fused kernel library, MSM library, and pairing library (all compiled without RDC)
-target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib msm_lib pairing_lib)
+target_link_libraries(zkp_ntt_core PUBLIC ntt_fused_lib msm_lib pairing_lib bb_tc_lib)
 # ntt_naive.cu uses ff_reference.h for CPU-side twiddle computation
 target_include_directories(zkp_ntt_core PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
