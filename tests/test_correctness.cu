@@ -11602,9 +11602,9 @@ int main() {
             }
         }
 
-        // Test 5: GEMM-NTT timing comparison vs v4.0.0 TC and scalar
+        // Test 5: GEMM-NTT timing comparison vs v4.0.0 TC and scalar (single NTT)
         {
-            printf("test_gemm_ntt_timing...\n");
+            printf("test_gemm_ntt_timing_single...\n");
             extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
             extern uint32_t ntt_babybear_tc_dft16_stage(BabyBearElement*, size_t, cudaStream_t);
 
@@ -11668,6 +11668,122 @@ int main() {
                 CUDA_CHECK(cudaFree(d_data));
             }
             tests_run++; tests_passed++;  // informational benchmark test
+
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+        }
+
+        // v5.0.0 Session 46: Batched GEMM-NTT throughput benchmark
+        {
+            printf("\n--- v5.0.0 S46: Batched GEMM-NTT Throughput ---\n");
+            extern uint32_t ntt_babybear_gemm_dft16(BabyBearElement*, size_t, cudaStream_t);
+
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+
+            // Test batched GEMM-NTT DFT-16 vs batched scalar NTT
+            // Batch sizes: B = {8, 16, 64, 256}
+            // NTT sizes: n = {2^12, 2^14, 2^16, 2^18}
+            int batch_sizes[] = {8, 16, 64, 256};
+            int ntt_sizes[] = {12, 14, 16, 18};
+
+            printf("  Batched DFT-16 stage throughput (GEMM vs Scalar):\n");
+            printf("  %-6s %-6s %12s %12s %12s %10s\n",
+                   "B", "n", "GEMM(ms)", "Scalar(ms)", "ns/elem", "Ratio");
+
+            for (int bi = 0; bi < 4; ++bi) {
+                int B = batch_sizes[bi];
+                for (int ni = 0; ni < 4; ++ni) {
+                    int log_n = ntt_sizes[ni];
+                    size_t n = 1u << log_n;
+                    size_t total = B * n;
+
+                    // Skip if allocation would exceed 512 MB
+                    if (total * sizeof(BabyBearElement) > 512ull * 1024 * 1024) continue;
+
+                    BabyBearElement* d_data;
+                    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(BabyBearElement)));
+                    CUDA_CHECK(cudaMemset(d_data, 1, total * sizeof(BabyBearElement)));
+
+                    // Warm up
+                    ntt_babybear_gemm_dft16(d_data, total, 0);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+
+                    // Time batched GEMM-NTT DFT-16 stage
+                    CUDA_CHECK(cudaEventRecord(start));
+                    ntt_babybear_gemm_dft16(d_data, total, 0);
+                    CUDA_CHECK(cudaEventRecord(stop));
+                    CUDA_CHECK(cudaEventSynchronize(stop));
+                    float gemm_ms = 0;
+                    CUDA_CHECK(cudaEventElapsedTime(&gemm_ms, start, stop));
+
+                    // Time batched scalar NTT
+                    CUDA_CHECK(cudaMemset(d_data, 1, total * sizeof(BabyBearElement)));
+                    CUDA_CHECK(cudaEventRecord(start));
+                    ntt_forward_batch_babybear(d_data, B, n, 0);
+                    CUDA_CHECK(cudaEventRecord(stop));
+                    CUDA_CHECK(cudaEventSynchronize(stop));
+                    float scalar_ms = 0;
+                    CUDA_CHECK(cudaEventElapsedTime(&scalar_ms, start, stop));
+
+                    float ns_per_elem = gemm_ms * 1e6f / total;
+                    float ratio = gemm_ms / (scalar_ms > 0 ? scalar_ms : 1.0f);
+
+                    printf("  B=%-4d 2^%-4d %10.3fms %10.3fms %10.1f %8.3fx\n",
+                           B, log_n, gemm_ms, scalar_ms, ns_per_elem, ratio);
+
+                    CUDA_CHECK(cudaFree(d_data));
+                }
+            }
+            tests_run++; tests_passed++;  // informational benchmark
+
+            // Test: batched GEMM-NTT correctness (B=8, n=2^12)
+            {
+                printf("test_gemm_ntt_batched_correctness...\n");
+                int B = 8;
+                size_t n = 1u << 12;
+                size_t total = B * n;
+
+                // CPU reference: apply DFT-16 to each group of 16
+                std::vector<uint32_t> cpu_data(total);
+                for (size_t i = 0; i < total; ++i)
+                    cpu_data[i] = static_cast<uint32_t>((i * 31337ull + 42ull) % bbp);
+                for (size_t g = 0; g < total; g += 16) {
+                    uint32_t out[16];
+                    for (int r = 0; r < 16; ++r) {
+                        uint64_t acc = 0;
+                        for (int c = 0; c < 16; ++c)
+                            acc += static_cast<uint64_t>(Zmat[r][c]) * cpu_data[g + c];
+                        out[r] = static_cast<uint32_t>(acc % bbp);
+                    }
+                    for (int r = 0; r < 16; ++r) cpu_data[g + r] = out[r];
+                }
+
+                // GPU
+                std::vector<BabyBearElement> h_data(total);
+                for (size_t i = 0; i < total; ++i)
+                    h_data[i] = {static_cast<uint32_t>((i * 31337ull + 42ull) % BABYBEAR_P)};
+
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(),
+                    total * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                ntt_babybear_gemm_dft16(d_data, total, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(h_data.data(), d_data,
+                    total * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+                int match = 0;
+                for (size_t i = 0; i < total; ++i)
+                    if (h_data[i].val == cpu_data[i]) ++match;
+                TEST_ASSERT(match == static_cast<int>(total),
+                    "Batched GEMM-NTT GPU != CPU ref");
+                printf("  Batched GEMM-NTT B=%d n=2^12: %d/%zu matched\n",
+                    B, match, total);
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
 
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
