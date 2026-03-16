@@ -1,6 +1,6 @@
 # cuda-zkp-ntt
 
-**GPU-Accelerated Number-Theoretic Transform for Zero-Knowledge Proofs**
+**GPU-Accelerated Zero-Knowledge Proof Primitives for BLS12-381**
 
 [![CUDA Build](https://github.com/Artemarius/cuda-zkp-ntt/actions/workflows/build.yml/badge.svg)](https://github.com/Artemarius/cuda-zkp-ntt/actions/workflows/build.yml)
 [![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
@@ -11,21 +11,20 @@
 
 ## Highlights
 
+- **v4.0.0: Hardware-accelerated sprint** — L2 cache residency for NTT twiddles (Ampere accessPolicyWindow), fp_ldg() read-only cache loads, software prefetch for MSM bucket accumulation, INT8 Tensor Core BabyBear NTT evaluation (TC 2-12x slower — slice overhead exceeds 31-bit multiply), multi-stream H2D overlap in Groth16 prover, RT Core feasibility study (all negative — no spatial structure in ZKP algebra)
+- **v3.0.0: Full pairing verification + Groth16 prove-verify loop** — Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate), final exponentiation (Hayashida-Hayasaka-Teruya), `groth16_verify()` via multi-Miller loop (4 pairings + 1 final exp). End-to-end setup-prove-verify for toy circuit and Fibonacci.
+- **v2.2.0: Fibonacci circuit + batch pipeline** — sparse R1CS (COO format), Lagrange basis trusted setup (O(n) batch inversion), GPU MSM proof assembly. GPU wins **55-139x** over CPU at n=256-1024.
 - **v2.1.0: Production MSM** — signed-digit recoding, CUB radix sort, parallel bucket reduction (Hillis-Steele), stream-ordered memory pools. **35.8x speedup** at n=2^18 (42.7s to 1.2s), 247 pts/ms at n=2^20.
 - **v2.0.0: End-to-end Groth16 prover** — Fq/Fq2 field arithmetic, G1/G2 elliptic curve ops, MSM (Pippenger), polynomial operations, toy circuit x^3+x+5=y. GPU proof matches CPU proof bitwise.
 - **v1.6.0: 3-field NTT** — BLS12-381 (15.1 ms), Goldilocks (3.6 ms, 4.2x faster), BabyBear (2.4 ms, 6.2x faster) at n=2^22
-- **Multi-field comparison** demonstrates memory-bound convergence: speedup shrinks at large sizes as DRAM traffic dominates
 - **15.5 ms at n=2^22** — 38% faster than v1.1.0 via radix-8 outer stages (Montgomery)
-- **CUDA Graph API**: captures NTT kernel sequence for graph replay in larger workflows
 - **Barrett + Montgomery dual arithmetic**: Barrett NTT eliminates 12% Montgomery conversion overhead
 - **Batched NTT**: process 8 independent NTTs in 3-4 kernel launches (vs 32 sequential); **1.52x throughput** at 2^15
 - **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
-- **Memory-bound to compute-bound transformation**: fused kernel shifts bottleneck from 92% DRAM to 69% compute, IPC 1.56 to 2.41
-- **57% SASS instruction reduction** in `ff_add` via branchless PTX with `lop3.b32` MUX
-- **701 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **1025 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - 3 fields: BLS12-381 (256-bit), Goldilocks (64-bit, Plonky2/3), BabyBear (31-bit, RISC Zero)
-- **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%)
+- **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%), Tensor Core NTT (2-12x slower), RT Core (no spatial structure)
 
 ---
 
@@ -180,6 +179,45 @@ See [`results/analysis.md`](results/analysis.md) for the full annotated NTT anal
 
 ---
 
+## v4.0.0 — Hardware-Accelerated Sprint
+
+Systematic evaluation of hardware-specific acceleration paths on Ampere (RTX 3060):
+
+- **L2 cache residency controls**: Ampere `accessPolicyWindow` pins 3 MB of NTT twiddle factors in L2, preventing eviction by data traffic
+- **Read-only cache loads**: `fp_ldg()` (PTX `ld.global.nc`) for all outer-stage twiddle accesses — bypasses L1 write-allocate overhead
+- **Software prefetch**: `prefetch.global.L1` for MSM bucket accumulation point loads — hides memory latency in scatter-gather pattern
+- **INT8 Tensor Core BabyBear NTT**: WMMA DFT-16 butterfly via `wmma::mma_sync` with INT8 inputs. **Evaluation result: TC 2-12x slower** than CUDA cores for 31-bit field — slice overhead (4 INT8 slices per 31-bit multiply) exceeds the trivial single-instruction scalar multiply
+- **Multi-stream H2D overlap**: transfer stream overlaps base point H2D with cooperative NTT in Groth16 prover
+- **Async H2D for MSM bases**: overlaps MSM base point transfer with proof assembly computation
+- **RT Core feasibility study**: evaluated BVH intersection hardware for bucket sorting, range queries, and proximity search. **All 3 candidates negative** — algebraic operations have no spatial/geometric structure for RT Cores to exploit
+
+---
+
+## v3.0.0 — Full Pairing Verification
+
+Complete BLS12-381 pairing pipeline enabling end-to-end Groth16 prove-then-verify:
+
+- **Fq6 cubic extension** (Fq2[v]/(v^3-beta)): Karatsuba multiplication (6 Fq2 muls), CH-SQR2 squaring, inverse via norm, sparse mul_by_01/mul_by_1 for Miller loop, Frobenius map
+- **Fq12 quadratic extension** (Fq6[w]/(w^2-v)): Karatsuba (3 Fq6 muls = 54 Fq muls per Fq12 mul), complex-method squaring (36 Fq muls), sparse mul_by_014 for line functions, Frobenius map with precomputed gamma coefficients
+- **Miller loop**: optimal Ate pairing, |u|=0xd201000000010000 (63 iterations), affine G2 line functions, M-type twist -> sparse Fq12 via mul_by_014
+- **Final exponentiation**: Hayashida-Hayasaka-Teruya (eprint 2020/875), easy part (q^6-1)(q^2+1) + hard part via 4x exp_by_u + 2 Frobenius maps
+- **Bilinearity verified**: e(2P,Q) = e(P,Q)^2, e(P,2Q) = e(P,Q)^2
+- **Groth16 verification**: `groth16_verify()` via multi-Miller loop — e(pi_A, pi_B) = e(alpha, beta) * e(L_pub, gamma) * e(pi_C, delta)
+- **VerifyingKey** with gamma, delta G2 points and IC public input commitments
+- End-to-end setup-prove-verify for toy circuit (x=3,5,10,100) and Fibonacci (nc=8)
+
+---
+
+## v2.2.0 — Fibonacci Circuit + Batch Pipeline
+
+- **Sparse R1CS** (COO format): `SparseEntry` struct, `SparseR1CS` with `make_fibonacci_r1cs()` generating a_{i+2}=a_i+a_{i+1} circuits up to 2^18 constraints
+- **Lagrange basis trusted setup**: `generate_proving_key_sparse()` using O(n) batch inversion (Montgomery's trick) instead of O(nv * n log n) INTTs
+- **GPU MSM proof assembly**: `groth16_prove_sparse()` with GPU NTT + GPU MSM for pi_A, pi_C
+- **GPU wins 55-139x over CPU** at n=256-1024 constraint sizes
+- **2-stream batch pipeline**: pre-allocated device memory (2 slots), reusable host scalar buffers. Batch speedup 1.03x at nc=256 (cooperative NTT blocks all SMs, MSM internal sync limits overlap)
+
+---
+
 ## v2.1.0 — Production MSM
 
 Signed-digit window recoding halves bucket count, CUB radix sort replaces single-thread sort,
@@ -235,11 +273,14 @@ cuda-zkp-ntt/
 │   ├── ff_babybear.cuh        # BabyBear field (31-bit, RISC Zero)
 │   ├── ff_fq.cuh              # BLS12-381 Fq base field (381-bit, 12×u32 Montgomery)
 │   ├── ff_fq2.cuh             # Fq2 quadratic extension (Karatsuba, 3 Fq muls)
+│   ├── ff_fq6.cuh             # Fq6 cubic extension (Karatsuba, CH-SQR2, Frobenius)
+│   ├── ff_fq12.cuh            # Fq12 quadratic extension (sparse mul_by_014, Frobenius)
 │   ├── ec_g1.cuh              # G1 elliptic curve ops (Jacobian projective)
 │   ├── ec_g2.cuh              # G2 elliptic curve ops (over Fq2)
 │   ├── msm.cuh                # GPU MSM (Pippenger, signed-digit, parallel reduce)
+│   ├── pairing.cuh            # BLS12-381 pairing types (Miller loop, final exp)
 │   ├── poly_ops.cuh           # Polynomial ops (coset NTT, pointwise mul/sub)
-│   ├── groth16.cuh            # Groth16 prover API (R1CS, ProvingKey, Proof)
+│   ├── groth16.cuh            # Groth16 prover + verifier API (R1CS, ProvingKey, VerifyingKey, Proof)
 │   ├── ntt.cuh                # BLS12-381 NTT (single + batched + graph, 5 modes)
 │   ├── ntt_goldilocks.cuh     # Goldilocks NTT (forward/inverse, single/batched)
 │   ├── ntt_babybear.cuh       # BabyBear NTT (forward/inverse, single/batched)
@@ -250,19 +291,21 @@ cuda-zkp-ntt/
 │   ├── ff_multi_field.cu      # Goldilocks + BabyBear GPU throughput kernels
 │   ├── ff_fq_kernels.cu       # Fq/Fq2 GPU throughput kernels
 │   ├── ec_kernels.cu          # G1/G2 GPU test kernels
+│   ├── pairing_kernels.cu     # Miller loop + final exponentiation GPU kernels (no RDC)
 │   ├── msm.cu                 # Pippenger MSM (separate TU, no RDC)
 │   ├── poly_ops.cu            # Coset NTT, pointwise mul/sub/scale kernels
-│   ├── groth16.cu             # Groth16 prover: trusted setup + proof generation
+│   ├── groth16.cu             # Groth16 prover + verifier: setup, prove, verify
 │   ├── ntt_naive.cu           # Baseline radix-2 NTT + API dispatch + twiddle caches
 │   ├── ntt_optimized.cu       # BLS12-381 NTT: K selection + cooperative outer fusion
 │   ├── ntt_fused_kernels.cu   # Fused warp-shuffle + shmem kernel (K=8/9/10, no-RDC)
 │   ├── ntt_4step.cu           # 4-Step NTT: transpose, twiddle multiply, Bailey's algorithm
 │   ├── ntt_goldilocks.cu      # Goldilocks NTT: fused K=8-11 + cooperative outer
 │   ├── ntt_babybear.cu        # BabyBear NTT: fused K=8-11 + cooperative outer
+│   ├── ntt_babybear_tc.cu     # Tensor Core BabyBear NTT: INT8 WMMA DFT-16 (evaluation)
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   ├── test_correctness.cu    # Validation against CPU reference (701 tests)
+│   ├── test_correctness.cu    # Validation against CPU reference (1025 tests)
 │   └── ff_reference.h         # CPU-only finite field + NTT + EC reference oracle
 ├── benchmarks/
 │   ├── bench_ntt.cu           # Google Benchmark: BLS12-381 NTT latency vs scale
@@ -288,7 +331,7 @@ cuda-zkp-ntt/
 ├── CMakeLists.txt
 ├── CLAUDE.md                  # Dev environment, conventions, file map
 ├── GUIDE.md                   # Deep-dive: ZKP, NTT, finite fields, GPU optimization
-├── NTT_OPTIMIZATION_ROADMAP.md # Full optimization roadmap (v1.0-v2.2)
+├── NTT_OPTIMIZATION_ROADMAP.md # Full optimization roadmap (v1.0-v4.0)
 ├── LICENSE                    # MIT License
 └── README.md
 ```
@@ -375,7 +418,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes — confirming that the ZKP ecosystem's move to smaller fields yields concrete GPU performance benefits. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields; viable only for word-size moduli). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover with GPU proof matching CPU bitwise. v2.1.0 delivers production MSM with signed-digit recoding, CUB radix sort, parallel bucket reduction (Hillis-Steele suffix scan), and stream-ordered memory pools — achieving 35.8x speedup at n=2^18. See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover. v2.1.0 delivers production MSM with signed-digit recoding, CUB radix sort, and parallel bucket reduction — 35.8x speedup at n=2^18. v2.2.0 adds Fibonacci circuits with sparse R1CS (COO format), Lagrange basis trusted setup via batch inversion, and a 2-stream batch pipeline — GPU wins 55-139x over CPU. v3.0.0 completes the full BLS12-381 pairing pipeline (Fq6/Fq12 tower, Miller loop, final exponentiation) and Groth16 verification via multi-Miller loop, enabling end-to-end setup-prove-verify. v4.0.0 systematically evaluates hardware acceleration paths: L2 cache residency for twiddle factors, read-only cache loads, software prefetch for MSM, INT8 Tensor Core NTT (negative: 2-12x slower for 31-bit field), multi-stream H2D overlap, and RT Core feasibility (all negative). See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
 
 ---
 
