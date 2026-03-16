@@ -363,9 +363,8 @@ __global__ void bb_gemm_ntt_kernel(
     const uint32_t lane = threadIdx.x % 32;
     const uint32_t local_warp = threadIdx.x / 32;
 
-    if (warp_id * 16 >= num_groups) return;
-
     uint32_t group_base = warp_id * 16;
+    bool active = (group_base < num_groups);
 
     // Shared memory: Z slices (block-wide) + per-warp regions
     extern __shared__ char s_raw[];
@@ -377,9 +376,12 @@ __global__ void bb_gemm_ntt_kernel(
 
     // Copy DFT-16 matrix slices from constant memory to shared memory
     // (WMMA load_matrix_sync requires global or shared memory, not constant)
+    // All threads participate to satisfy __syncthreads() contract
     for (uint32_t t = threadIdx.x; t < 4 * 256; t += blockDim.x)
         s_Z_slices[t] = c_Z_slices[t];
-    __syncthreads();  // All warps must see Z slices before proceeding
+    __syncthreads();  // All threads in block must reach this
+
+    if (!active) return;  // Safe to return AFTER __syncthreads()
 
     // Load data into shared memory as unsigned byte slices
     // X[row][col] where row = element within group (0..15), col = which group (0..15)
