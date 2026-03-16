@@ -11333,53 +11333,66 @@ int main() {
             }
         }
 
-        // Test 3: TC DFT-16 timing comparison vs scalar (evaluation)
+        // Test 3: TC DFT-16 timing comparison vs scalar across sizes (evaluation)
         {
-            const size_t n = 1u << 16;  // 65536 elements
-            printf("test_tc_dft16_timing (n=%zu)...\n", n);
+            printf("test_tc_dft16_timing_matrix...\n");
             extern uint32_t ntt_babybear_tc_dft16_stage(BabyBearElement*, size_t, cudaStream_t);
 
-            std::vector<BabyBearElement> h_data(n);
-            for (size_t i = 0; i < n; ++i)
-                h_data[i] = {static_cast<uint32_t>((i * 31337u + 42u) % BABYBEAR_P)};
-
-            BabyBearElement* d_data;
-            CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
-
-            // Warm up
-            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
-            ntt_babybear_tc_dft16_stage(d_data, n, 0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-
-            // Time TC DFT-16
             cudaEvent_t start, stop;
             CUDA_CHECK(cudaEventCreate(&start));
             CUDA_CHECK(cudaEventCreate(&stop));
 
-            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaEventRecord(start));
-            ntt_babybear_tc_dft16_stage(d_data, n, 0);
-            CUDA_CHECK(cudaEventRecord(stop));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            float tc_ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&tc_ms, start, stop));
+            int sizes[] = {12, 14, 16, 18, 20};
+            for (int si = 0; si < 5; ++si) {
+                int log_n = sizes[si];
+                size_t n = 1u << log_n;
 
-            // Time scalar BabyBear NTT for comparison
-            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaEventRecord(start));
-            ntt_forward_babybear(d_data, n);
-            CUDA_CHECK(cudaEventRecord(stop));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            float scalar_ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&scalar_ms, start, stop));
+                std::vector<BabyBearElement> h_data(n);
+                for (size_t i = 0; i < n; ++i)
+                    h_data[i] = {static_cast<uint32_t>((i * 31337u + 42u) % BABYBEAR_P)};
 
-            printf("  TC DFT-16 (n=2^16): %.3f ms | Scalar NTT: %.3f ms | ratio: %.2fx\n",
-                   tc_ms, scalar_ms, tc_ms / (scalar_ms > 0 ? scalar_ms : 1.0f));
-            tests_run++; tests_passed++;  // informational test
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+
+                // Warm up both paths
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                ntt_babybear_tc_dft16_stage(d_data, n, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                ntt_forward_babybear(d_data, n);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                // Time TC DFT-16 (single stage)
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_babybear_tc_dft16_stage(d_data, n, 0);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float tc_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&tc_ms, start, stop));
+
+                // Extrapolate full TC NTT: log_16(n) = log_n/4 stages
+                float tc_full_ms = tc_ms * (log_n / 4.0f);
+
+                // Time scalar BabyBear NTT
+                CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_forward_babybear(d_data, n);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float scalar_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&scalar_ms, start, stop));
+
+                float ratio = tc_full_ms / (scalar_ms > 0 ? scalar_ms : 1.0f);
+                printf("  n=2^%-2d: TC stage=%.3fms (full~%.3fms) | Scalar=%.3fms | TC/Scalar=%.2fx\n",
+                       log_n, tc_ms, tc_full_ms, scalar_ms, ratio);
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
+            tests_run++; tests_passed++;  // informational benchmark test
 
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
-            CUDA_CHECK(cudaFree(d_data));
         }
     }
 
