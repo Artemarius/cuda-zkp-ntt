@@ -6,6 +6,14 @@ GPU-accelerated ZKP primitives library for BLS12-381 on NVIDIA GPUs.
 Includes NTT (3 fields), elliptic curve arithmetic (G1/G2), MSM (Pippenger),
 polynomial operations, end-to-end Groth16 prover, and pairing-based verification.
 
+- **v5.0.0** (S45-S49 complete): GEMM-NTT sprint — ConvKyber approach: DFT-16 matrix
+  Z[i][j]=ω₁₆^(i·j) replaces 4 butterfly stages with one WMMA matrix multiply (unsigned
+  char INT8, m16n16k16). Constant-memory DFT matrix, shared-memory staging for WMMA.
+  DFT-16 stage: 0.05-0.85x of full scalar NTT across all batch sizes (B=8..256,
+  n=2^12..2^18). Batched throughput: 0.2-0.5 ns/element. Full hierarchical NTT
+  (DFT-16 + twiddle + scalar sub-NTTs) incomplete — decomposition has algorithmic error
+  in twiddle phase, timing illustrative only (0.10-0.23x scalar). v4.0.0 signed INT8 bug
+  fixed: unsigned char WMMA required for correct byte arithmetic. 1065 tests.
 - **v4.0.0** (S36-S44 complete): Hardware-accelerated sprint — L2 cache residency controls
   for twiddle persistence (Ampere accessPolicyWindow, 3 MB pinned), fp_ldg() read-only cache
   for all outer-stage twiddle loads, software prefetch (prefetch.global.L1) for MSM bucket
@@ -485,9 +493,13 @@ LICENSE                — MIT License
 See PROJECT.md (gitignored) for full phase roadmap and strategic context.
 See `NTT_OPTIMIZATION_ROADMAP.md` for release plans (v1.0.0-v3.0.0 complete).
 
-Phases 1-8 complete. Current version: **v4.0.0** (Session 44 complete, 1025 tests).
+Phases 1-8 complete. Current version: **v5.0.0** (Session 49 complete, 1065 tests).
 
 ### Completed Releases
+- **v5.0.0** — GEMM-NTT sprint. ConvKyber-inspired DFT-16 via unsigned char WMMA matrix
+  multiply (m16n16k16). DFT-16 stage 0.05-0.85x of full scalar BabyBear NTT across batch
+  sizes B=8..256. Batched throughput 0.2-0.5 ns/element. Full hierarchical NTT incomplete
+  (decomposition error in twiddle phase). Sessions 45-49. 1065 tests (40 new over v4.0.0).
 - **v4.0.0** — Hardware-accelerated sprint. L2 cache persistence for twiddle factors
   (Ampere accessPolicyWindow), fp_ldg() read-only cache for outer-stage twiddle loads,
   software prefetch for MSM bucket accumulation, INT8 Tensor Core BabyBear NTT (WMMA

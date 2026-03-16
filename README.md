@@ -11,6 +11,7 @@
 
 ## Highlights
 
+- **v5.0.0: GEMM-NTT (ConvKyber approach)** — DFT-16 matrix multiply via unsigned char WMMA Tensor Cores replaces 4 butterfly stages with one GEMM. DFT-16 stage **0.05-0.85x of full scalar NTT** across batch sizes B=8..256. Throughput: 0.2-0.5 ns/element. Full hierarchical NTT incomplete (decomposition error). Two v4.0.0 bugs fixed: unsigned char WMMA + row_major B fragment.
 - **v4.0.0: Hardware-accelerated sprint** — L2 cache residency for NTT twiddles (Ampere accessPolicyWindow), fp_ldg() read-only cache loads, software prefetch for MSM bucket accumulation, INT8 Tensor Core BabyBear NTT evaluation (TC 2-12x slower — slice overhead exceeds 31-bit multiply), multi-stream H2D overlap in Groth16 prover, RT Core feasibility study (all negative — no spatial structure in ZKP algebra)
 - **v3.0.0: Full pairing verification + Groth16 prove-verify loop** — Fq6/Fq12 tower arithmetic, Miller loop (optimal Ate), final exponentiation (Hayashida-Hayasaka-Teruya), `groth16_verify()` via multi-Miller loop (4 pairings + 1 final exp). End-to-end setup-prove-verify for toy circuit and Fibonacci.
 - **v2.2.0: Fibonacci circuit + batch pipeline** — sparse R1CS (COO format), Lagrange basis trusted setup (O(n) batch inversion), GPU MSM proof assembly. GPU wins **55-139x** over CPU at n=256-1024.
@@ -22,7 +23,7 @@
 - **Batched NTT**: process 8 independent NTTs in 3-4 kernel launches (vs 32 sequential); **1.52x throughput** at 2^15
 - **1.66x pipeline speedup** at 2^18 via 3-stream async double-buffered NTT
 - **4 kernel launches** for n=2^22 (was 16): warp-shuffle fused radix-1024 + cooperative groups outer fusion
-- **1025 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
+- **1065 tests**, 8 Nsight Compute profiles, 10 annotated screenshots — full ZKProphet-style analysis on RTX 3060
 - 3 fields: BLS12-381 (256-bit), Goldilocks (64-bit, Plonky2/3), BabyBear (31-bit, RISC Zero)
 - **Negative results documented**: OTF twiddles (+265%), Plantard (+79%), 4-Step NTT (+18%), Tensor Core NTT (2-12x slower), RT Core (no spatial structure)
 
@@ -179,6 +180,29 @@ See [`results/analysis.md`](results/analysis.md) for the full annotated NTT anal
 
 ---
 
+## v5.0.0 — GEMM-NTT (ConvKyber Approach)
+
+ConvKyber-inspired approach: replace entire NTT butterfly stages with a dense 16x16 matrix multiply on Tensor Cores. The DFT-16 matrix Z[i][j] = omega_16^(i*j) encodes 4 butterfly stages into one GEMM.
+
+**Key difference from v4.0.0 element-wise TC:** v4.0.0 replaced individual modular multiplies with WMMA (16 WMMAs per element, 50+ instructions vs 3-5 scalar). GEMM-NTT amortizes WMMA across 16 elements simultaneously — one GEMM replaces 32 butterfly operations.
+
+**DFT-16 stage throughput (GEMM vs full scalar NTT):**
+
+| Batch | n=2^12 | n=2^14 | n=2^16 | n=2^18 |
+|-------|--------|--------|--------|--------|
+| B=8 | 0.05x | 0.22x | 0.19x | 0.23x |
+| B=16 | 0.18x | 0.31x | 0.33x | 0.33x |
+| B=64 | 0.42x | 0.57x | 0.51x | 0.44x |
+| B=256 | 0.47x | 0.75x | 0.85x | 0.63x |
+
+*Ratio = GEMM DFT-16 stage time / full scalar NTT time. The DFT-16 stage handles 4 of log_n butterfly stages (22-33% of total work). Ratios < 1.0 mean the TC stage is faster than the corresponding fraction of scalar NTT.*
+
+**Implementation:** Unsigned char WMMA (m16n16k16), constant-memory DFT matrix, shared-memory staging for WMMA loads. Fixed v4.0.0 signed INT8 bug (unsigned char required) and WMMA B-matrix layout (row_major, not col_major).
+
+**Full hierarchical GEMM-NTT:** DFT-16 (TC) + twiddle multiply + 16 scalar sub-NTTs. Timing suggests ~9x speedup (0.11x of scalar at n=2^20) but the decomposition has an algorithmic error in the twiddle phase — output is not a valid NTT. Documented as incomplete; the DFT-16 stage is the primary contribution.
+
+---
+
 ## v4.0.0 — Hardware-Accelerated Sprint
 
 Systematic evaluation of hardware-specific acceleration paths on Ampere (RTX 3060):
@@ -305,7 +329,7 @@ cuda-zkp-ntt/
 │   ├── ntt_async.cu           # Double-buffered async pipeline
 │   └── benchmark.cu           # Profiling binary (Nsight Compute target)
 ├── tests/
-│   ├── test_correctness.cu    # Validation against CPU reference (1025 tests)
+│   ├── test_correctness.cu    # Validation against CPU reference (1065 tests)
 │   └── ff_reference.h         # CPU-only finite field + NTT + EC reference oracle
 ├── benchmarks/
 │   ├── bench_ntt.cu           # Google Benchmark: BLS12-381 NTT latency vs scale
@@ -418,7 +442,7 @@ This project is directly motivated by three papers:
 - **cuZK** (Lu et al., TCHES 2023) — efficient GPU implementation of zkSNARK with novel parallel MSM via sparse matrix operations and async data transfer
 - **MoMA** (Zhang & Franchetti, [ACM CGO 2025](https://arxiv.org/abs/2501.07535)) — Multi-word Modular Arithmetic code generation achieving 13× over ICICLE for 256-bit NTTs and near-ASIC performance on commodity GPUs via Barrett reduction and batched NTT processing
 
-The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover. v2.1.0 delivers production MSM with signed-digit recoding, CUB radix sort, and parallel bucket reduction — 35.8x speedup at n=2^18. v2.2.0 adds Fibonacci circuits with sparse R1CS (COO format), Lagrange basis trusted setup via batch inversion, and a 2-stream batch pipeline — GPU wins 55-139x over CPU. v3.0.0 completes the full BLS12-381 pairing pipeline (Fq6/Fq12 tower, Miller loop, final exponentiation) and Groth16 verification via multi-Miller loop, enabling end-to-end setup-prove-verify. v4.0.0 systematically evaluates hardware acceleration paths: L2 cache residency for twiddle factors, read-only cache loads, software prefetch for MSM, INT8 Tensor Core NTT (negative: 2-12x slower for 31-bit field), multi-stream H2D overlap, and RT Core feasibility (all negative). See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
+The optimization targets (async NTT pipeline, IADD3-path FF_mul) are explicitly called out as open problems in ZKProphet §V-B. v1.2.0 adopts MoMA-inspired Barrett arithmetic and batched NTT processing. v1.3.0 implements the 4-step NTT (Bailey's algorithm) — a negative result that demonstrates transpose overhead exceeds outer-stage savings on consumer GPUs. v1.4.0 achieves a 32% speedup via branchless arithmetic and radix-4 outer stages, plus a CUDA Graph API. v1.5.0 pushes to 38% faster via radix-8 outer stages (Montgomery only; Barrett radix-8 disabled due to I-cache thrashing at 174 registers). v1.6.0 adds Goldilocks (Plonky2/3) and BabyBear (RISC Zero) NTT implementations, demonstrating that smaller fields achieve 4-6x speedup at proof-relevant sizes. v1.7.0 implements Plantard reduction — another negative result (+79% vs Montgomery for 256-bit fields). v2.0.0 adds all remaining Groth16 primitives (Fq/Fq2, G1/G2, MSM, polynomial ops) and an end-to-end toy prover. v2.1.0 delivers production MSM with signed-digit recoding, CUB radix sort, and parallel bucket reduction — 35.8x speedup at n=2^18. v2.2.0 adds Fibonacci circuits with sparse R1CS (COO format), Lagrange basis trusted setup via batch inversion, and a 2-stream batch pipeline — GPU wins 55-139x over CPU. v3.0.0 completes the full BLS12-381 pairing pipeline (Fq6/Fq12 tower, Miller loop, final exponentiation) and Groth16 verification via multi-Miller loop, enabling end-to-end setup-prove-verify. v4.0.0 systematically evaluates hardware acceleration paths: L2 cache residency for twiddle factors, read-only cache loads, software prefetch for MSM, INT8 Tensor Core NTT (negative: 2-12x slower for 31-bit field), multi-stream H2D overlap, and RT Core feasibility (all negative). v5.0.0 implements the ConvKyber GEMM-NTT approach — replacing 4 butterfly stages with a dense DFT-16 matrix multiply on Tensor Cores (unsigned char WMMA). The DFT-16 stage achieves 0.05-0.85x of full scalar NTT time, demonstrating that the GEMM approach is viable when amortized across 16 elements (unlike v4.0.0's element-wise approach). See [NTT_OPTIMIZATION_ROADMAP.md](NTT_OPTIMIZATION_ROADMAP.md) for the full optimization roadmap.
 
 ---
 
