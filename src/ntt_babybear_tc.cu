@@ -481,3 +481,135 @@ uint32_t ntt_babybear_gemm_dft16(
 
     return static_cast<uint32_t>(n);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v5.0.0 Session 47: Full NTT via hierarchical GEMM decomposition
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Decompose n-point NTT as:
+//   Phase 1: n/16 independent DFT-16 sub-NTTs via GEMM (Tensor Cores)
+//   Phase 2: Twiddle multiply (inter-phase twiddle factors, CUDA cores)
+//   Phase 3: 16 independent (n/16)-point sub-NTTs via scalar BabyBear NTT
+//
+// Data layout: input in natural order, d_data[i] for i=0..n-1.
+// Phase 1 operates on consecutive groups of 16: d_data[g*16..g*16+15]
+// Phase 2 multiplies element d_data[g*16+j] by omega_n^(g*j)
+// Phase 3 operates on strided sub-arrays: 16 sub-NTTs each of size n/16
+
+// ─── Twiddle multiply kernel ────────────────────────────────────────────────
+__global__ void bb_gemm_twiddle_kernel(
+    BabyBearElement* __restrict__ d_data,
+    const BabyBearElement* __restrict__ d_twiddles,
+    uint32_t n,
+    uint32_t stride
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    uint32_t g = idx / stride;
+    uint32_t j = idx % stride;
+    uint32_t tw_idx = (static_cast<uint64_t>(g) * j) % n;
+
+    uint64_t prod = static_cast<uint64_t>(d_data[idx].val) *
+                    static_cast<uint64_t>(d_twiddles[tw_idx].val);
+    d_data[idx].val = static_cast<uint32_t>(prod % BABYBEAR_P);
+}
+
+// ─── Transpose kernels: consecutive ↔ strided layout ────────────────────────
+__global__ void bb_gemm_transpose_kernel(
+    const BabyBearElement* __restrict__ d_in,
+    BabyBearElement* __restrict__ d_out,
+    uint32_t n, uint32_t num_groups
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint32_t g = idx / 16;
+    uint32_t j = idx % 16;
+    d_out[j * num_groups + g] = d_in[idx];
+}
+
+__global__ void bb_gemm_transpose_inv_kernel(
+    const BabyBearElement* __restrict__ d_in,
+    BabyBearElement* __restrict__ d_out,
+    uint32_t n, uint32_t num_groups
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint32_t j = idx / num_groups;
+    uint32_t g = idx % num_groups;
+    d_out[g * 16 + j] = d_in[idx];
+}
+
+// ─── Host: precompute twiddle factors ───────────────────────────────────────
+static BabyBearElement* s_gemm_twiddles = nullptr;
+static size_t s_gemm_twiddle_n = 0;
+
+static void ensure_gemm_twiddles(size_t n, cudaStream_t stream) {
+    if (s_gemm_twiddles && s_gemm_twiddle_n == n) return;
+    if (s_gemm_twiddles) { CUDA_CHECK(cudaFree(s_gemm_twiddles)); s_gemm_twiddles = nullptr; }
+
+    uint32_t exp = static_cast<uint32_t>((static_cast<uint64_t>(BABYBEAR_P) - 1) / n);
+    uint32_t omega_n = bb_pow_host(BABYBEAR_GENERATOR, exp);
+
+    std::vector<BabyBearElement> h_tw(n);
+    uint64_t w = 1;
+    for (size_t k = 0; k < n; ++k) {
+        h_tw[k] = {static_cast<uint32_t>(w)};
+        w = (w * omega_n) % BABYBEAR_P;
+    }
+
+    CUDA_CHECK(cudaMalloc(&s_gemm_twiddles, n * sizeof(BabyBearElement)));
+    CUDA_CHECK(cudaMemcpy(s_gemm_twiddles, h_tw.data(),
+                          n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+    s_gemm_twiddle_n = n;
+}
+
+// ─── Public API: Full hierarchical GEMM-NTT ─────────────────────────────────
+// Forward NTT on n BabyBear elements using:
+//   Phase 1: DFT-16 via WMMA Tensor Cores
+//   Phase 2: Twiddle multiply (CUDA cores)
+//   Phase 3: 16 × (n/16)-point scalar NTTs (batched)
+// Requires: n >= 256, n power of 2. Returns n on success, 0 on failure.
+
+uint32_t ntt_babybear_gemm_full(
+    BabyBearElement* d_data, size_t n, cudaStream_t stream
+) {
+    if (n < 256 || (n & (n - 1)) != 0 || (n % 16) != 0) return 0;
+
+    uint32_t num_groups = static_cast<uint32_t>(n) / 16;
+
+    // Phase 1: DFT-16 on consecutive groups via Tensor Cores
+    ntt_babybear_gemm_dft16(d_data, n, stream);
+
+    // Phase 2: Twiddle multiply
+    ensure_gemm_twiddles(n, stream);
+    {
+        uint32_t threads = 256;
+        uint32_t blocks = (static_cast<uint32_t>(n) + threads - 1) / threads;
+        bb_gemm_twiddle_kernel<<<blocks, threads, 0, stream>>>(
+            d_data, s_gemm_twiddles, static_cast<uint32_t>(n), 16);
+    }
+
+    // Phase 3: Transpose + 16 scalar sub-NTTs + transpose back
+    BabyBearElement* d_tmp;
+    CUDA_CHECK(cudaMallocAsync(&d_tmp, n * sizeof(BabyBearElement), stream));
+
+    {
+        uint32_t threads = 256;
+        uint32_t blocks = (static_cast<uint32_t>(n) + threads - 1) / threads;
+        bb_gemm_transpose_kernel<<<blocks, threads, 0, stream>>>(
+            d_data, d_tmp, static_cast<uint32_t>(n), num_groups);
+    }
+
+    ntt_forward_batch_babybear(d_tmp, 16, num_groups, stream);
+
+    {
+        uint32_t threads = 256;
+        uint32_t blocks = (static_cast<uint32_t>(n) + threads - 1) / threads;
+        bb_gemm_transpose_inv_kernel<<<blocks, threads, 0, stream>>>(
+            d_tmp, d_data, static_cast<uint32_t>(n), num_groups);
+    }
+
+    CUDA_CHECK(cudaFreeAsync(d_tmp, stream));
+    return static_cast<uint32_t>(n);
+}

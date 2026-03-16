@@ -11790,6 +11790,111 @@ int main() {
         }
     }
 
+    // v5.0.0 Session 47: Full hierarchical GEMM-NTT
+    {
+        printf("\n--- v5.0.0 S47: Full Hierarchical GEMM-NTT ---\n");
+        extern uint32_t ntt_babybear_gemm_full(BabyBearElement*, size_t, cudaStream_t);
+
+        // Test 1: Full GEMM-NTT correctness vs scalar NTT
+        {
+            printf("test_gemm_full_vs_scalar...\n");
+            for (int log_n = 8; log_n <= 18; ++log_n) {
+                size_t n = 1u << log_n;
+
+                std::vector<BabyBearElement> h_data(n);
+                for (size_t i = 0; i < n; ++i)
+                    h_data[i] = {static_cast<uint32_t>(
+                        (i * 31337ull + log_n * 42ull) % BABYBEAR_P)};
+
+                // Scalar NTT
+                BabyBearElement* d_scalar;
+                CUDA_CHECK(cudaMalloc(&d_scalar, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemcpy(d_scalar, h_data.data(),
+                    n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                ntt_forward_babybear(d_scalar, n);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                std::vector<BabyBearElement> scalar_result(n);
+                CUDA_CHECK(cudaMemcpy(scalar_result.data(), d_scalar,
+                    n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+                // GEMM-NTT
+                BabyBearElement* d_gemm;
+                CUDA_CHECK(cudaMalloc(&d_gemm, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemcpy(d_gemm, h_data.data(),
+                    n * sizeof(BabyBearElement), cudaMemcpyHostToDevice));
+                uint32_t processed = ntt_babybear_gemm_full(d_gemm, n, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                std::vector<BabyBearElement> gemm_result(n);
+                CUDA_CHECK(cudaMemcpy(gemm_result.data(), d_gemm,
+                    n * sizeof(BabyBearElement), cudaMemcpyDeviceToHost));
+
+                int match = 0;
+                for (size_t i = 0; i < n; ++i)
+                    if (gemm_result[i].val == scalar_result[i].val) ++match;
+
+                bool ok = (processed == n && match == static_cast<int>(n));
+                TEST_ASSERT(ok, "GEMM full NTT != scalar NTT");
+                printf("  GEMM full vs scalar n=2^%d: %d/%zu matched\n",
+                    log_n, match, n);
+
+                CUDA_CHECK(cudaFree(d_scalar));
+                CUDA_CHECK(cudaFree(d_gemm));
+            }
+        }
+
+        // Test 2: Timing — full GEMM-NTT vs scalar NTT
+        {
+            printf("test_gemm_full_timing...\n");
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+
+            int sizes[] = {12, 14, 16, 18, 20};
+            for (int si = 0; si < 5; ++si) {
+                int log_n = sizes[si];
+                size_t n = 1u << log_n;
+
+                BabyBearElement* d_data;
+                CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaMemset(d_data, 1, n * sizeof(BabyBearElement)));
+
+                // Warm up
+                ntt_babybear_gemm_full(d_data, n, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                // Time GEMM full NTT
+                CUDA_CHECK(cudaMemset(d_data, 1, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_babybear_gemm_full(d_data, n, 0);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float gemm_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&gemm_ms, start, stop));
+
+                // Time scalar NTT
+                CUDA_CHECK(cudaMemset(d_data, 1, n * sizeof(BabyBearElement)));
+                CUDA_CHECK(cudaEventRecord(start));
+                ntt_forward_babybear(d_data, n);
+                CUDA_CHECK(cudaEventRecord(stop));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float scalar_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&scalar_ms, start, stop));
+
+                float ratio = gemm_ms / (scalar_ms > 0 ? scalar_ms : 1.0f);
+                printf("  n=2^%-2d: GEMM-full=%.3fms | Scalar=%.3fms | Ratio=%.2fx\n",
+                    log_n, gemm_ms, scalar_ms, ratio);
+
+                CUDA_CHECK(cudaFree(d_data));
+            }
+            tests_run++; tests_passed++;
+
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+        }
+    }
+
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }
